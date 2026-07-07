@@ -39,3 +39,18 @@ func TestSlashCommandSuggestionsAdvertiseOtherOptionsButNoConversationSubcommand
 		}
 	}
 }
+
+func TestSlashMenuEnterRunsCompleteCommandsButNotArgumentTemplates(t *testing.T) {
+	if !slashMenuEnterSubmits(SlashCommandSuggestion{Text: "/workspace list"}) {
+		t.Fatal("complete slash command should run on Enter")
+	}
+	if !slashMenuEnterSubmits(SlashCommandSuggestion{Text: "/conversation"}) {
+		t.Fatal("/conversation should run on Enter so it opens the conversation picker")
+	}
+	if slashMenuEnterSubmits(SlashCommandSuggestion{Text: "/workspace use "}) {
+		t.Fatal("argument template should be inserted, not run, on Enter")
+	}
+	if got := slashMenuInsertText(SlashCommandSuggestion{Text: "/workspace use "}); got != "/workspace use " {
+		t.Fatalf("slash menu insert text should preserve argument placeholder spacing, got %q", got)
+	}
+}

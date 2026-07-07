@@ -209,10 +209,20 @@ func promptCommandLine(prompt string, status *statusBarState) (string, error) {
 		switch b := buf[0]; b {
 		case '\r', '\n':
 			if menuOpen && len(menu) > 0 {
-				line = []rune(menu[selected].Text)
+				line = []rune(slashMenuInsertText(menu[selected]))
 				cursor = len(line)
 				menuOpen = false
 				refreshMenu()
+				if slashMenuEnterSubmits(menu[selected]) {
+					result := strings.TrimSpace(string(line))
+					if layout.enabled {
+						layout.submit(prompt, result)
+					} else {
+						fmt.Fprint(os.Stderr, "\r\n")
+					}
+					rememberCommand(result)
+					return result, nil
+				}
 				redraw()
 				continue
 			}
@@ -226,7 +236,7 @@ func promptCommandLine(prompt string, status *statusBarState) (string, error) {
 			return result, nil
 		case '\t':
 			if menuOpen && len(menu) > 0 {
-				line = []rune(menu[selected].Text)
+				line = []rune(slashMenuInsertText(menu[selected]))
 				cursor = len(line)
 				menuOpen = false
 				refreshMenu()
@@ -739,7 +749,7 @@ func slashMenuLines(open bool, suggestions []SlashCommandSuggestion, selected in
 		return []string{"  no matching commands"}
 	}
 	lines := make([]string, 0, len(suggestions)+1)
-	lines = append(lines, "  ↑/↓ choose · Enter/Tab insert")
+	lines = append(lines, "  ↑/↓ choose · Enter run · Tab insert")
 	for i, s := range suggestions {
 		marker := " "
 		if i == selected {
@@ -748,6 +758,14 @@ func slashMenuLines(open bool, suggestions []SlashCommandSuggestion, selected in
 		lines = append(lines, fmt.Sprintf("%s %-24s %s", marker, strings.TrimRight(s.Text, " "), s.Description))
 	}
 	return lines
+}
+
+func slashMenuInsertText(s SlashCommandSuggestion) string {
+	return s.Text
+}
+
+func slashMenuEnterSubmits(s SlashCommandSuggestion) bool {
+	return !strings.HasSuffix(s.Text, " ")
 }
 
 func rememberCommand(line string) {
