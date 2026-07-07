@@ -224,7 +224,7 @@ func (c *Client) SwitchWorkspace(name string, create bool) error {
 	if err := saveActiveWorkspaceName(c.opts.Profile, name); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "workspace: %s\n", name)
+	slashCommandPrintf("workspace: %s\n", name)
 	return nil
 }
 
@@ -242,7 +242,7 @@ func (c *Client) ResetWorkspace() error {
 	if err := c.saveCurrentState(); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "workspace reset: %s\n", c.workspaceName)
+	slashCommandPrintf("workspace reset: %s\n", c.workspaceName)
 	return nil
 }
 

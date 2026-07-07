@@ -41,11 +41,11 @@ ldd build-agent-go-cli-linux-arm64
 sha256sum build-agent-go-cli-linux-arm64
 ```
 
-Latest known rebuilt binary after fixing slash command output visibility:
+Latest known rebuilt binary after adding visible workspace reset confirmation:
 
 ```text
 build-agent-go-cli-linux-arm64
-sha256 cf145b14ed8c9d223328a8c225a1bad5b4a7f7c75a4ccaeefc114d71248ad190
+sha256 0f821eec9dfcfbfe8aada1e2bc87d263f668eae2a4939ce7e2c6ba7b76e4944d
 ```
 
 ## 3. Command-line flags

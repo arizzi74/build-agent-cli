@@ -113,6 +113,31 @@ func TestSlashCommandOutputCanBeCapturedForWorkspaceList(t *testing.T) {
 	}
 }
 
+func TestWorkspaceResetSlashCommandPrintsConfirmation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c, err := NewClient(CLIConfig{InstanceURL: "https://example.service-now.com"}, Options{Profile: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.conversationID = "old-conversation"
+	var output strings.Builder
+	handled, err := withSlashCommandOutput(&output, func() (bool, error) {
+		return handleSlashCommand(context.Background(), c, "/workspace reset")
+	})
+	if err != nil {
+		t.Fatalf("/workspace reset returned error: %v", err)
+	}
+	if !handled {
+		t.Fatal("/workspace reset was not handled")
+	}
+	if c.conversationID != "" {
+		t.Fatalf("workspace reset did not clear conversation id: %q", c.conversationID)
+	}
+	if got := output.String(); !strings.Contains(got, "workspace reset: default") {
+		t.Fatalf("captured workspace reset confirmation mismatch: %q", got)
+	}
+}
+
 func TestSlashCommandOutputCapturePolicy(t *testing.T) {
 	if !slashCommandOutputCanBeCaptured("/workspace list") {
 		t.Fatal("workspace command output should be captured for managed terminal replay")
