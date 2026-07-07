@@ -1,0 +1,9 @@
+# Local secrets
+.secrets
+.secrets.*
+
+# Build outputs
+build-agent-go-cli
+build-agent-go-cli-linux-arm64
+build-agent-go-cli-linux-arm64.sha256
+*.test

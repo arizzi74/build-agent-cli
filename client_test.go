@@ -1,0 +1,375 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestNirvanaCapabilitiesMatchStreamingWebClient(t *testing.T) {
+	c := &Client{opts: Options{Nirvana: true}}
+	caps := c.clientCapabilities()
+
+	streaming := asMap(caps["streaming"])
+	if streaming == nil || streaming["receive"] != true {
+		t.Fatalf("streaming capability = %#v, want receive=true", caps["streaming"])
+	}
+	tools := asMap(caps["tools"])
+	if tools == nil || tools["execute"] != true {
+		t.Fatalf("tools capability = %#v, want execute=true", caps["tools"])
+	}
+	keywordSearch := asMap(caps["keyword_search"])
+	if keywordSearch == nil || keywordSearch["preview_available"] != true {
+		t.Fatalf("keyword_search capability = %#v, want preview_available=true", caps["keyword_search"])
+	}
+	for _, key := range []string{"client_ide", "elicitation", "fluent_docs", "glob_and_grep", "server_tools", "sub_agents"} {
+		if _, ok := caps[key]; !ok {
+			t.Fatalf("missing Nirvana web-client capability %q in %#v", key, caps)
+		}
+	}
+
+	defaultCaps := (&Client{}).clientCapabilities()
+	if _, ok := defaultCaps["tools"]; ok {
+		t.Fatalf("default web gateway capabilities should not advertise tools.execute: %#v", defaultCaps["tools"])
+	}
+}
+
+func TestGatewayStreamUpdateKeepsWorkingStatusActive(t *testing.T) {
+	c := &Client{webStreamText: "hello", turnStatusActive: true}
+	out := captureStdout(t, func() {
+		c.printGatewayStreamUpdate("hello")
+	})
+	if !c.turnStatusActive {
+		t.Fatalf("stream update should keep Working status active until turn_end")
+	}
+	if out != "hello" {
+		t.Fatalf("stdout = %q, want streamed chunk", out)
+	}
+}
+
+func TestStreamingTableCommitsOnlyStablePrefixUntilFinal(t *testing.T) {
+	partial := "Intro before table.\n\n| # | Message |\n| --- | --- |\n| 1 | short |\n| 2 | much wider table cell still streaming"
+	if !streamContainsMarkdownTable(partial) {
+		t.Fatalf("expected table detection")
+	}
+	if got := stableAssistantStreamPrefix(partial); got != "Intro before table." {
+		t.Fatalf("stable prefix while table streams = %q", got)
+	}
+	complete := partial + " |\n\nAfter table."
+	if got := stableAssistantStreamPrefix(complete); !strings.Contains(got, "much wider table cell") || strings.Contains(got, "After table") {
+		t.Fatalf("stable prefix after table completion = %q", got)
+	}
+}
+
+func TestNirvanaStreamDeltaOnlyPrintsAssistantText(t *testing.T) {
+	c := &Client{streamTypes: map[string]string{}, debug: false}
+	out := captureStdout(t, func() {
+		_ = c.handleEvent([]byte(`{"type":"stream_start","stream_id":"p1","content_type":"pending"}`))
+		_ = c.handleEvent([]byte(`{"type":"stream_delta","stream_id":"p1","delta":"Looking..."}`))
+		_ = c.handleEvent([]byte(`{"type":"stream_start","stream_id":"t1","content_type":"thinking"}`))
+		_ = c.handleEvent([]byte(`{"type":"stream_delta","stream_id":"t1","delta":"private reasoning"}`))
+		_ = c.handleEvent([]byte(`{"type":"stream_start","stream_id":"x1","content_type":"text"}`))
+		_ = c.handleEvent([]byte(`{"type":"stream_delta","stream_id":"x1","delta":"Hello "}`))
+		_ = c.handleEvent([]byte(`{"type":"stream_delta","stream_id":"x1","delta":"**42**"}`))
+	})
+	if out != "Hello **42**" {
+		t.Fatalf("stdout = %q, want only assistant text deltas", out)
+	}
+	if c.webStreamText != "Hello **42**" {
+		t.Fatalf("webStreamText = %q", c.webStreamText)
+	}
+}
+
+func TestNirvanaRoutineEventsStayQuietInNormalUI(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c := &Client{streamTypes: map[string]string{}, opts: Options{Profile: "default", Nirvana: true}}
+	stderr := captureStderr(t, func() {
+		_ = c.handleEvent([]byte(`{"type":"turn_start"}`))
+		_ = c.handleEvent([]byte(`{"type":"tool_call","name":"MCP_Script_Runner__run_script","call_id":"abc"}`))
+		_ = c.handleEvent([]byte(`{"type":"tool_result","call_id":"abc","success":true}`))
+		_ = c.handleEvent([]byte(`{"type":"stream_start","stream_id":"thinking","content_type":"thinking"}`))
+		_ = c.handleEvent([]byte(`{"type":"stream_delta","stream_id":"thinking","delta":"private"}`))
+		_ = c.handleEvent([]byte(`{"type":"stream_end","stream_id":"thinking"}`))
+		_ = c.handleEvent([]byte(`{"type":"turn_end"}`))
+	})
+	for _, noisy := range []string{"turn started", "turn ended", "tool call", "tool result", "Finished thinking"} {
+		if strings.Contains(stderr, noisy) {
+			t.Fatalf("normal UI leaked %q in stderr: %q", noisy, stderr)
+		}
+	}
+	if !strings.Contains(stderr, "✓ MCP_Script_Runner__run_script") {
+		t.Fatalf("normal UI should show concise successful tool result, stderr=%q", stderr)
+	}
+}
+
+func TestNirvanaToolResultUsesStoredNameAndFailureMarker(t *testing.T) {
+	c := &Client{toolCallNames: map[string]string{}}
+	name, callID := c.recordToolCall(map[string]interface{}{
+		"type":    "tool_call",
+		"name":    "run_script",
+		"call_id": "abc",
+		"server":  "MCP Script Runner",
+	})
+	if name != "MCP Script Runner/run_script" || callID != "abc" {
+		t.Fatalf("unexpected tool call tracking: name=%q callID=%q", name, callID)
+	}
+	name, callID, success := c.recordToolResult(map[string]interface{}{
+		"type":    "tool_result",
+		"call_id": "abc",
+		"success": false,
+	})
+	if name != "MCP Script Runner/run_script" || callID != "abc" || success {
+		t.Fatalf("unexpected tool result tracking: name=%q callID=%q success=%v", name, callID, success)
+	}
+	if got := formatToolResultTerminal(name, success, false); got != "✗ MCP Script Runner/run_script" {
+		t.Fatalf("unexpected tool result line: %q", got)
+	}
+}
+
+func TestStatusBarStateCountsInputsAndCumulativeUsage(t *testing.T) {
+	c := &Client{
+		cfg:     CLIConfig{InstanceURL: "https://demo.example.com"},
+		runtime: RuntimeModelConfig{LargeModel: "claude-opus-4-6"},
+		history: []interface{}{
+			map[string]interface{}{"role": "user", "content": "first"},
+			map[string]interface{}{"role": "assistant", "content": "answer"},
+			map[string]interface{}{"role": "assistant-tool", "content": "hidden"},
+			map[string]interface{}{"sender": "user", "text": "second"},
+		},
+	}
+	stderr := captureStderr(t, func() {
+		c.recordUsage(map[string]interface{}{"input_tokens": float64(4007), "output_tokens": "81"})
+		c.recordUsage(map[string]interface{}{"input_tokens": json.Number("3"), "output_tokens": 4})
+	})
+	if !strings.Contains(stderr, "input_tokens=4007 output_tokens=81") {
+		t.Fatalf("non-interactive usage line missing first usage: %q", stderr)
+	}
+	state := c.statusBarState()
+	if state.Model != "claude-opus-4-6" || state.InputMessages != 2 || state.InputTokens != 4010 || state.OutputTokens != 85 || state.Instance != "https://demo.example.com" {
+		t.Fatalf("unexpected status state: %#v", state)
+	}
+}
+
+func TestNirvanaSafeClientToolStubs(t *testing.T) {
+	c := &Client{}
+	result, status := c.answerFSReadDirectory(map[string]interface{}{"path": "."})
+	if status != "error" {
+		t.Fatalf("status = %q, want error", status)
+	}
+	msg := stringify(result["content"])
+	if !strings.Contains(msg, "create_new_servicenow_app") || stringify(result["code"]) != "TOOL_ERROR" {
+		t.Fatalf("unexpected fs_read_directory stub result: %#v", result)
+	}
+	if ctx := asMap(result["ideContext"]); ctx == nil || stringify(ctx["currentFile"]) != "" {
+		t.Fatalf("missing empty ideContext: %#v", result["ideContext"])
+	}
+}
+
+func TestNirvanaHARShapeHelpers(t *testing.T) {
+	ctx := emptyIDEContext()
+	for _, key := range []string{"currentFile", "currentDir", "selectedText"} {
+		if stringify(ctx[key]) != "" {
+			t.Fatalf("%s = %q, want empty", key, ctx[key])
+		}
+	}
+	if _, ok := ctx["workspaceFolders"].([]interface{}); !ok {
+		t.Fatalf("workspaceFolders = %#v, want []interface{}", ctx["workspaceFolders"])
+	}
+	if got := instanceNameFromURL("https://demoalectriallwfze140800.service-now.com/"); got != "demoalectriallwfze140800" {
+		t.Fatalf("instanceNameFromURL = %q", got)
+	}
+	if defaultLLMProxyURL != "https://llmproxy-prod-gateway" {
+		t.Fatalf("defaultLLMProxyURL = %q", defaultLLMProxyURL)
+	}
+}
+
+func TestParseWDFMCPServersMatchesHARShape(t *testing.T) {
+	body := []byte(`{"result":{"result":{"servers":[{"server_id":"90db06d43b3147505d77b80f23e45ad9","name":"MCP Script Runner","transport":"SSE","governance":{"aict_status":"approved"}}],"meta":{"total":1}}}}`)
+	servers := parseWDFMCPServers(body)
+	if len(servers) != 1 {
+		t.Fatalf("servers len = %d, want 1: %#v", len(servers), servers)
+	}
+	server := servers[0]
+	if server.ServerID != "90db06d43b3147505d77b80f23e45ad9" || server.Name != "MCP Script Runner" || server.Transport != "sse" || server.Source != "wdf" {
+		t.Fatalf("unexpected WDF MCP server: %#v", server)
+	}
+}
+
+func TestNirvanaMCPServerPayloadDiscoversWDFAndAddsGliderStaticATF(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var requestedPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPath = r.URL.String()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":{"result":{"servers":[{"server_id":"90db06d43b3147505d77b80f23e45ad9","name":"MCP Script Runner","transport":"SSE","governance":{"aict_status":"approved"}}]}}}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{cfg: CLIConfig{InstanceURL: srv.URL}, opts: Options{Profile: "default", Nirvana: true}, httpClient: srv.Client(), debug: true}
+	servers := c.nirvanaMCPServerPayload(context.Background())
+	if requestedPath != "/api/sn_wdf_mcp_client/mcp/servers?limit=50&offset=0&connected=true" {
+		t.Fatalf("WDF endpoint = %q", requestedPath)
+	}
+	if len(servers) != 2 {
+		t.Fatalf("mcpServers len = %d, want WDF + static ATF: %#v", len(servers), servers)
+	}
+	if servers[0].ServerID != "90db06d43b3147505d77b80f23e45ad9" || servers[0].Name != "MCP Script Runner" || servers[0].Transport != "sse" || servers[0].Source != "wdf" {
+		t.Fatalf("unexpected WDF server payload: %#v", servers[0])
+	}
+	if servers[1].ServerID != "atf-cloud-runner" || servers[1].Name != "ATF Cloud runner" || servers[1].Transport != "streamable-http" || servers[1].URL != "https://atf-rel-boq/mcp" || servers[1].Source != "static" {
+		t.Fatalf("unexpected static ATF server payload: %#v", servers[1])
+	}
+}
+
+func TestNirvanaMCPServerPayloadPaginatesAndFiltersLikeGliderWDF(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	requestedPaths := []string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPaths = append(requestedPaths, r.URL.String())
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.RawQuery, "offset=0"):
+			_, _ = w.Write([]byte(`{"result":{"result":{"servers":[{"server_id":"script-runner","name":"MCP Script Runner","transport":"SSE"},{"server_id":"github","name":"GitHub MCP","transport":"SSE"},{"server_id":"git","name":"Git Tools","transport":"SSE"}],"meta":{"total":51}}}}`))
+		case strings.Contains(r.URL.RawQuery, "offset=50"):
+			_, _ = w.Write([]byte(`{"result":{"result":{"servers":[{"server_id":"bad-transport","name":"Bad Transport","transport":"websocket"},{"server_id":"second","name":"Second MCP","transport":"HTTP"}],"meta":{"total":51}}}}`))
+		default:
+			t.Fatalf("unexpected WDF request: %s", r.URL.String())
+		}
+	}))
+	defer srv.Close()
+
+	c := &Client{cfg: CLIConfig{InstanceURL: srv.URL}, opts: Options{Profile: "default", Nirvana: true}, httpClient: srv.Client()}
+	servers := c.nirvanaMCPServerPayload(context.Background())
+	if len(requestedPaths) != 2 || !strings.Contains(requestedPaths[0], "offset=0") || !strings.Contains(requestedPaths[1], "offset=50") {
+		t.Fatalf("WDF pagination requests = %#v", requestedPaths)
+	}
+	ids := []string{}
+	for _, server := range servers {
+		ids = append(ids, server.ServerID)
+		if server.ServerID == "github" || server.ServerID == "git" || server.ServerID == "bad-transport" {
+			t.Fatalf("Glider-excluded/unsupported WDF server leaked into payload: %#v", servers)
+		}
+	}
+	want := []string{"script-runner", "second", "atf-cloud-runner"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Fatalf("server ids = %#v, want %#v", ids, want)
+	}
+}
+
+func TestNirvanaConversationIDUsesGliderCompactShape(t *testing.T) {
+	c := &Client{conversationID: "6987b1ac-eba8-0750-998e-fcf000d0cdf9"}
+	c.ensureNirvanaConversationID()
+	if c.conversationID != "6987b1aceba80750998efcf000d0cdf9" {
+		t.Fatalf("Nirvana Glider conversation id = %q, want compact 32-hex", c.conversationID)
+	}
+}
+
+func TestNirvanaConversationHistorySanitizesUnsupportedRoles(t *testing.T) {
+	history := []interface{}{
+		map[string]interface{}{"role": "user", "content": "hello"},
+		map[string]interface{}{"role": "assistant", "content": "hi"},
+		map[string]interface{}{"role": "stop", "content": "Processing was stopped. You can send a new message to continue."},
+		map[string]interface{}{"role": "assistant-thinking", "content": "hidden"},
+		map[string]interface{}{"role": "tool", "content": "tool output"},
+	}
+	got := nirvanaConversationHistory(history)
+	if len(got) != 3 {
+		t.Fatalf("sanitized len = %d, want 3: %#v", len(got), got)
+	}
+	last := asMap(got[2])
+	if last["role"] != "user" || !strings.Contains(stringify(last["content"]), "Processing was stopped") || !strings.HasPrefix(stringify(last["content"]), "[System:") {
+		t.Fatalf("unexpected stop conversion: %#v", last)
+	}
+	for _, raw := range got {
+		role := stringify(asMap(raw)["role"])
+		if role != "user" && role != "assistant" {
+			t.Fatalf("unsupported role leaked to Nirvana history: %#v", raw)
+		}
+	}
+}
+
+func TestNirvanaDialHeadersReuseSavedWebSession(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	instanceURL := "https://demoalectriallwfze140800.service-now.com"
+	if err := saveWebSession("default", WebSession{
+		InstanceURL:  instanceURL,
+		AuthMode:     authModeForm,
+		CookieHeader: "JSESSIONID=fake; glide_user=alsofake",
+		UserToken:    "fake-user-token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{cfg: CLIConfig{InstanceURL: instanceURL}, opts: Options{Profile: "default", Nirvana: true}}
+	headers := c.nirvanaDialHeaders()
+	if headers.Get("Cookie") != "JSESSIONID=fake; glide_user=alsofake" {
+		t.Fatalf("Cookie header = %q", headers.Get("Cookie"))
+	}
+	if headers.Get("X-UserToken") != "fake-user-token" {
+		t.Fatalf("X-UserToken header = %q", headers.Get("X-UserToken"))
+	}
+	if !strings.HasSuffix(headers.Get("Referer"), "/sn_glider_app/ide.do") {
+		t.Fatalf("Referer header = %q", headers.Get("Referer"))
+	}
+}
+
+func TestNirvanaRESTHeadersUseOAuthBearer(t *testing.T) {
+	c := &Client{cfg: CLIConfig{InstanceURL: "https://demo.example.com"}, opts: Options{Nirvana: true}, oauthAccessToken: "oauth-token", sessionCookieHeader: "JSESSIONID=stale", userToken: "stale-gck"}
+	req, err := http.NewRequest(http.MethodGet, "https://demo.example.com/api/now/table/sys_user", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.setGatewayHeaders(req)
+	if req.Header.Get("Authorization") != "Bearer oauth-token" {
+		t.Fatalf("Authorization = %q", req.Header.Get("Authorization"))
+	}
+	if req.Header.Get("Origin") != "https://demo.example.com" {
+		t.Fatalf("Origin = %q", req.Header.Get("Origin"))
+	}
+	if req.Header.Get("Referer") != "https://demo.example.com/sn_glider_app/ide.do" {
+		t.Fatalf("Referer = %q", req.Header.Get("Referer"))
+	}
+	if req.Header.Get("Cookie") != "" || req.Header.Get("X-UserToken") != "" {
+		t.Fatalf("stale web session headers should be suppressed when Nirvana bearer is available: Cookie=%q X-UserToken=%q", req.Header.Get("Cookie"), req.Header.Get("X-UserToken"))
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+	fn()
+	_ = w.Close()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+	fn()
+	_ = w.Close()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
