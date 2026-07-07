@@ -41,11 +41,11 @@ ldd build-agent-go-cli-linux-arm64
 sha256sum build-agent-go-cli-linux-arm64
 ```
 
-Latest known rebuilt binary after fixing slash picker selected-command execution:
+Latest known rebuilt binary after fixing slash command output visibility:
 
 ```text
 build-agent-go-cli-linux-arm64
-sha256 17bfeddd28f719d41f271e11f5ab1df782096832d0d83510f651ff447d00e16b
+sha256 cf145b14ed8c9d223328a8c225a1bad5b4a7f7c75a4ccaeefc114d71248ad190
 ```
 
 ## 3. Command-line flags
@@ -509,6 +509,7 @@ Implemented REPL input features:
 - The slash-command picker is rendered in the managed footer/viewport area, and inserting/canceling it replays the visible transcript tail before redrawing the footer so rows behind the menu are restored.
 - Pressing Esc closes the slash-command picker immediately, clears the typed slash-filter text, and restores the original terminal contents; arrow-key escape sequences still navigate the picker/history.
 - Enter runs a selected complete slash command immediately, so `/workspace list` or `/conversation` execute from the picker; Tab inserts without running.
+- Non-modal slash command output (`/workspace list`, `/help`, `/mcp list`, `/app current`, etc.) is captured and appended as a managed transcript system block, keeping output visible above the fixed footer instead of printing into the prompt/footer row.
 - Slash suggestions that require an argument and end with a trailing space, such as `/workspace use ` or `/app use `, are inserted on Enter instead of executed so the argument can be completed.
 - Ctrl-C aborts current prompt input.
 - Ctrl-D uses a two-step exit guard: the first press shows `Press Ctrl-D again to exit ....` in the temporary message row below the status bar; the message clears automatically after 2 seconds, and a second Ctrl-D within that window exits.

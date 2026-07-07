@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -87,5 +88,39 @@ func TestWorkspaceListSlashCommandIsHandled(t *testing.T) {
 	}
 	if !handled {
 		t.Fatal("/workspace list was not handled")
+	}
+}
+
+func TestSlashCommandOutputCanBeCapturedForWorkspaceList(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c, err := NewClient(CLIConfig{InstanceURL: "https://example.service-now.com"}, Options{Profile: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	handled, err := withSlashCommandOutput(&output, func() (bool, error) {
+		return handleSlashCommand(context.Background(), c, "/workspace list")
+	})
+	if err != nil {
+		t.Fatalf("/workspace list returned error: %v", err)
+	}
+	if !handled {
+		t.Fatal("/workspace list was not handled")
+	}
+	got := output.String()
+	if !strings.Contains(got, "workspaces:") || !strings.Contains(got, "default") {
+		t.Fatalf("captured workspace list output mismatch: %q", got)
+	}
+}
+
+func TestSlashCommandOutputCapturePolicy(t *testing.T) {
+	if !slashCommandOutputCanBeCaptured("/workspace list") {
+		t.Fatal("workspace command output should be captured for managed terminal replay")
+	}
+	if slashCommandOutputCanBeCaptured("/conversation") {
+		t.Fatal("bare /conversation opens terminal UI and should not be captured")
+	}
+	if slashCommandOutputCanBeCaptured("/conversation list") {
+		t.Fatal("/conversation list opens terminal UI in TTY and should not be captured")
 	}
 }

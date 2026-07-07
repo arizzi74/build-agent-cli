@@ -151,9 +151,12 @@ func main() {
 			return
 		}
 		if strings.HasPrefix(line, "/") {
-			handled, err := handleSlashCommand(ctx, client, line)
+			handled, err := handleSlashCommandForTerminal(ctx, client, line, status)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				message := fmt.Sprintf("error: %v", err)
+				if !terminalRecordSystemTextAndAppend("Command", message, status) {
+					fmt.Fprintln(os.Stderr, message)
+				}
 			}
 			if handled {
 				continue

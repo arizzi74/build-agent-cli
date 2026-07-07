@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -13,6 +14,60 @@ import (
 type SlashCommandSuggestion struct {
 	Text        string
 	Description string
+}
+
+var slashCommandOutputWriter io.Writer = os.Stderr
+
+func withSlashCommandOutput(w io.Writer, fn func() (bool, error)) (bool, error) {
+	if w == nil {
+		w = os.Stderr
+	}
+	previous := slashCommandOutputWriter
+	slashCommandOutputWriter = w
+	defer func() { slashCommandOutputWriter = previous }()
+	return fn()
+}
+
+func slashCommandPrintln(args ...interface{}) {
+	fmt.Fprintln(slashCommandOutputWriter, args...)
+}
+
+func slashCommandPrintf(format string, args ...interface{}) {
+	fmt.Fprintf(slashCommandOutputWriter, format, args...)
+}
+
+func handleSlashCommandForTerminal(ctx context.Context, c *Client, line string, status statusBarState) (bool, error) {
+	if !slashCommandOutputCanBeCaptured(line) {
+		return handleSlashCommand(ctx, c, line)
+	}
+	var output strings.Builder
+	handled, err := withSlashCommandOutput(&output, func() (bool, error) {
+		return handleSlashCommand(ctx, c, line)
+	})
+	if text := strings.TrimSpace(output.String()); text != "" {
+		if !terminalRecordSystemTextAndAppend("Command", text, status) {
+			fmt.Fprintln(os.Stderr, text)
+		}
+	}
+	return handled, err
+}
+
+func slashCommandOutputCanBeCaptured(line string) bool {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return false
+	}
+	switch strings.ToLower(fields[0]) {
+	case "/conversation", "/conv":
+		if len(fields) == 1 {
+			return false
+		}
+		switch strings.ToLower(fields[1]) {
+		case "select", "choose", "list", "ls":
+			return false
+		}
+	}
+	return true
 }
 
 func slashCommandSuggestions() []SlashCommandSuggestion {
@@ -56,31 +111,31 @@ func handleSlashCommand(ctx context.Context, c *Client, line string) (bool, erro
 	case "/exit", "/quit":
 		return false, nil
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %s; type /help\n", fields[0])
+		slashCommandPrintf("unknown command %s; type /help\n", fields[0])
 		return true, nil
 	}
 }
 
 func printSlashHelp() {
-	fmt.Fprintln(os.Stderr, "commands:")
-	fmt.Fprintln(os.Stderr, "  /help")
-	fmt.Fprintln(os.Stderr, "  /exit | /quit")
-	fmt.Fprintln(os.Stderr, "  /conversation              (interactive selector; choose existing or New conversation)")
-	fmt.Fprintln(os.Stderr, "  /mcp list                  (Nirvana: show advertised MCP servers)")
-	fmt.Fprintln(os.Stderr, "  /workspace current")
-	fmt.Fprintln(os.Stderr, "  /workspace list")
-	fmt.Fprintln(os.Stderr, "  /workspace new <name>")
-	fmt.Fprintln(os.Stderr, "  /workspace use <name>")
-	fmt.Fprintln(os.Stderr, "  /workspace reset [name]")
-	fmt.Fprintln(os.Stderr, "  /workspace delete <name>")
-	fmt.Fprintln(os.Stderr, "  /app current")
-	fmt.Fprintln(os.Stderr, "  /app use <scopeId> [scopeName]")
-	fmt.Fprintln(os.Stderr, "  /app clear")
+	slashCommandPrintln("commands:")
+	slashCommandPrintln("  /help")
+	slashCommandPrintln("  /exit | /quit")
+	slashCommandPrintln("  /conversation              (interactive selector; choose existing or New conversation)")
+	slashCommandPrintln("  /mcp list                  (Nirvana: show advertised MCP servers)")
+	slashCommandPrintln("  /workspace current")
+	slashCommandPrintln("  /workspace list")
+	slashCommandPrintln("  /workspace new <name>")
+	slashCommandPrintln("  /workspace use <name>")
+	slashCommandPrintln("  /workspace reset [name]")
+	slashCommandPrintln("  /workspace delete <name>")
+	slashCommandPrintln("  /app current")
+	slashCommandPrintln("  /app use <scopeId> [scopeName]")
+	slashCommandPrintln("  /app clear")
 }
 
 func handleMCPCommand(ctx context.Context, c *Client, args []string) error {
 	if len(args) == 0 || strings.EqualFold(args[0], "help") {
-		fmt.Fprintln(os.Stderr, "usage: /mcp list")
+		slashCommandPrintln("usage: /mcp list")
 		return nil
 	}
 	if !c.opts.Nirvana {
@@ -91,18 +146,18 @@ func handleMCPCommand(ctx context.Context, c *Client, args []string) error {
 	case "list", "ls", "servers":
 		servers := c.nirvanaMCPServerPayload(ctx)
 		if len(servers) == 0 {
-			fmt.Fprintln(os.Stderr, "mcp servers: none")
+			slashCommandPrintln("mcp servers: none")
 			return nil
 		}
-		fmt.Fprintln(os.Stderr, "mcp servers advertised to Nirvana/Forge:")
+		slashCommandPrintln("mcp servers advertised to Nirvana/Forge:")
 		for _, server := range servers {
 			urlSuffix := ""
 			if server.URL != "" {
 				urlSuffix = " url=" + server.URL
 			}
-			fmt.Fprintf(os.Stderr, "* %s  id=%s transport=%s source=%s%s\n", server.Name, server.ServerID, server.Transport, server.Source, urlSuffix)
+			slashCommandPrintf("* %s  id=%s transport=%s source=%s%s\n", server.Name, server.ServerID, server.Transport, server.Source, urlSuffix)
 		}
-		fmt.Fprintln(os.Stderr, "tools: WDF pass-through servers do not expose client-side tool schemas; Forge loads them after the Nirvana handshake, matching the Glider web client.")
+		slashCommandPrintln("tools: WDF pass-through servers do not expose client-side tool schemas; Forge loads them after the Nirvana handshake, matching the Glider web client.")
 		return nil
 	default:
 		return fmt.Errorf("unknown /mcp command %q", args[0])
@@ -122,8 +177,8 @@ func handleConversationCommand(parent context.Context, c *Client, args []string)
 
 	switch strings.ToLower(args[0]) {
 	case "help":
-		fmt.Fprintln(os.Stderr, "usage: /conversation")
-		fmt.Fprintln(os.Stderr, "opens the conversation picker; choose an existing conversation or New conversation")
+		slashCommandPrintln("usage: /conversation")
+		slashCommandPrintln("opens the conversation picker; choose an existing conversation or New conversation")
 		return nil
 	case "current", "show":
 		printCurrentConversation(c)
@@ -152,23 +207,23 @@ func handleConversationCommand(parent context.Context, c *Client, args []string)
 
 func handleWorkspaceCommand(c *Client, args []string) error {
 	if len(args) == 0 || strings.EqualFold(args[0], "help") {
-		fmt.Fprintln(os.Stderr, "usage: /workspace current|list|new <name>|use <name>|reset [name]|delete <name>")
+		slashCommandPrintln("usage: /workspace current|list|new <name>|use <name>|reset [name]|delete <name>")
 		return nil
 	}
 
 	switch strings.ToLower(args[0]) {
 	case "current", "show":
 		ws := c.WorkspaceState()
-		fmt.Fprintf(os.Stderr, "workspace: %s\n", ws.Name)
+		slashCommandPrintf("workspace: %s\n", ws.Name)
 		if ws.ConversationID != "" {
-			fmt.Fprintf(os.Stderr, "conversation: %s\n", ws.ConversationID)
+			slashCommandPrintf("conversation: %s\n", ws.ConversationID)
 		} else {
-			fmt.Fprintln(os.Stderr, "conversation: <new>")
+			slashCommandPrintln("conversation: <new>")
 		}
 		if ws.App != nil {
 			printApp(ws.App)
 		} else {
-			fmt.Fprintln(os.Stderr, "app: <none>")
+			slashCommandPrintln("app: <none>")
 		}
 		return nil
 	case "list":
@@ -177,10 +232,10 @@ func handleWorkspaceCommand(c *Client, args []string) error {
 			return err
 		}
 		if len(workspaces) == 0 {
-			fmt.Fprintln(os.Stderr, "no workspaces yet")
+			slashCommandPrintln("no workspaces yet")
 			return nil
 		}
-		fmt.Fprintln(os.Stderr, "workspaces:")
+		slashCommandPrintln("workspaces:")
 		for _, ws := range workspaces {
 			marker := " "
 			if ws.Name == c.workspaceName {
@@ -194,7 +249,7 @@ func handleWorkspaceCommand(c *Client, args []string) error {
 			if ws.App != nil && ws.App.ScopeID != "" {
 				app = " app=" + ws.App.ScopeID
 			}
-			fmt.Fprintf(os.Stderr, "%s %s  conversation=%s%s\n", marker, ws.Name, conversation, app)
+			slashCommandPrintf("%s %s  conversation=%s%s\n", marker, ws.Name, conversation, app)
 		}
 		return nil
 	case "new":
@@ -229,7 +284,7 @@ func handleWorkspaceCommand(c *Client, args []string) error {
 		if err := deleteWorkspace(c.opts.Profile, c.workspaceName, args[1]); err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "deleted workspace %q\n", args[1])
+		slashCommandPrintf("deleted workspace %q\n", args[1])
 		return nil
 	default:
 		return fmt.Errorf("unknown /workspace command %q", args[0])
@@ -238,7 +293,7 @@ func handleWorkspaceCommand(c *Client, args []string) error {
 
 func handleAppCommand(c *Client, args []string) error {
 	if len(args) == 0 || strings.EqualFold(args[0], "help") {
-		fmt.Fprintln(os.Stderr, "usage: /app current|use <scopeId> [scopeName]|clear")
+		slashCommandPrintln("usage: /app current|use <scopeId> [scopeName]|clear")
 		return nil
 	}
 
@@ -246,7 +301,7 @@ func handleAppCommand(c *Client, args []string) error {
 	case "current", "show":
 		app := c.CurrentApp()
 		if app == nil {
-			fmt.Fprintln(os.Stderr, "app: <none>")
+			slashCommandPrintln("app: <none>")
 			return nil
 		}
 		printApp(app)
@@ -262,13 +317,13 @@ func handleAppCommand(c *Client, args []string) error {
 		if err := c.SetApp(app); err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "app set: %s\n", app.ScopeID)
+		slashCommandPrintf("app set: %s\n", app.ScopeID)
 		return nil
 	case "clear", "unset":
 		if err := c.ClearApp(); err != nil {
 			return err
 		}
-		fmt.Fprintln(os.Stderr, "app cleared")
+		slashCommandPrintln("app cleared")
 		return nil
 	default:
 		return fmt.Errorf("unknown /app command %q", args[0])
@@ -276,11 +331,11 @@ func handleAppCommand(c *Client, args []string) error {
 }
 
 func printApp(app *AppScope) {
-	fmt.Fprintf(os.Stderr, "app scope: %s\n", app.ScopeID)
+	slashCommandPrintf("app scope: %s\n", app.ScopeID)
 	if app.ScopeName != "" {
-		fmt.Fprintf(os.Stderr, "app name: %s\n", app.ScopeName)
+		slashCommandPrintf("app name: %s\n", app.ScopeName)
 	}
 	if app.AppSysID != "" {
-		fmt.Fprintf(os.Stderr, "app sys_id: %s\n", app.AppSysID)
+		slashCommandPrintf("app sys_id: %s\n", app.AppSysID)
 	}
 }

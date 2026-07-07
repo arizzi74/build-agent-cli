@@ -61,6 +61,10 @@ func terminalRecordSystemText(title, text string) {
 	terminalRecordEntry(terminalTranscriptEntry{Role: "system", Title: title, Text: text})
 }
 
+func terminalRecordSystemTextAndAppend(title, text string, status statusBarState) bool {
+	return terminalRecordEntryAndAppend(terminalTranscriptEntry{Role: "system", Title: title, Text: text}, status)
+}
+
 func terminalRecordToolResult(name string, success bool) {
 	name = strings.TrimSpace(name)
 	if name == "" {
