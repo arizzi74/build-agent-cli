@@ -209,11 +209,12 @@ func promptCommandLine(prompt string, status *statusBarState) (string, error) {
 		switch b := buf[0]; b {
 		case '\r', '\n':
 			if menuOpen && len(menu) > 0 {
-				line = []rune(slashMenuInsertText(menu[selected]))
+				choice := slashMenuChoice(menu, selected)
+				line = []rune(slashMenuInsertText(choice))
 				cursor = len(line)
 				menuOpen = false
 				refreshMenu()
-				if slashMenuEnterSubmits(menu[selected]) {
+				if slashMenuEnterSubmits(choice) {
 					result := strings.TrimSpace(string(line))
 					if layout.enabled {
 						layout.submit(prompt, result)
@@ -236,7 +237,8 @@ func promptCommandLine(prompt string, status *statusBarState) (string, error) {
 			return result, nil
 		case '\t':
 			if menuOpen && len(menu) > 0 {
-				line = []rune(slashMenuInsertText(menu[selected]))
+				choice := slashMenuChoice(menu, selected)
+				line = []rune(slashMenuInsertText(choice))
 				cursor = len(line)
 				menuOpen = false
 				refreshMenu()
@@ -758,6 +760,19 @@ func slashMenuLines(open bool, suggestions []SlashCommandSuggestion, selected in
 		lines = append(lines, fmt.Sprintf("%s %-24s %s", marker, strings.TrimRight(s.Text, " "), s.Description))
 	}
 	return lines
+}
+
+func slashMenuChoice(suggestions []SlashCommandSuggestion, selected int) SlashCommandSuggestion {
+	if len(suggestions) == 0 {
+		return SlashCommandSuggestion{}
+	}
+	if selected < 0 {
+		selected = 0
+	}
+	if selected >= len(suggestions) {
+		selected = len(suggestions) - 1
+	}
+	return suggestions[selected]
 }
 
 func slashMenuInsertText(s SlashCommandSuggestion) string {

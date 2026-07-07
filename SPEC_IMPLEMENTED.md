@@ -41,11 +41,11 @@ ldd build-agent-go-cli-linux-arm64
 sha256sum build-agent-go-cli-linux-arm64
 ```
 
-Latest known rebuilt binary after fixing slash picker Enter execution:
+Latest known rebuilt binary after fixing slash picker selected-command execution:
 
 ```text
 build-agent-go-cli-linux-arm64
-sha256 533e8ce4ed7ada4bdf32b016cf88a33dbe7eea94ed42dacb77fe10c29f4bfdb2
+sha256 17bfeddd28f719d41f271e11f5ab1df782096832d0d83510f651ff447d00e16b
 ```
 
 ## 3. Command-line flags
