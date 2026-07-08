@@ -56,6 +56,10 @@ type Client struct {
 	currentApp             *AppScope
 	workingSet             interface{}
 	workspaceName          string
+	workspaceURI           string
+	workspaceChecksum      string
+	workspaceDescription   string
+	workspaceFolders       []WebWorkspaceFolder
 	streamTypes            map[string]string
 	webAgentConfig         WebAgentConfig
 	webStreamID            string
@@ -157,6 +161,10 @@ func (c *Client) applyWorkspace(ws WorkspaceState) {
 	c.usageOutputTokens = ws.UsageOutputTokens
 	c.usageThinkingTokens = ws.UsageThinkingTokens
 	c.workingSet = ws.WorkingSet
+	c.workspaceURI = ws.WebWorkspaceURI
+	c.workspaceChecksum = ws.WebWorkspaceChecksum
+	c.workspaceDescription = ws.WebWorkspaceDescription
+	c.workspaceFolders = append([]WebWorkspaceFolder(nil), ws.WebWorkspaceFolders...)
 	c.appScope = ws.AppScope
 	c.currentApp = ws.App
 	if c.currentApp != nil && c.currentApp.ScopeID != "" {
@@ -175,18 +183,22 @@ func (c *Client) WorkspaceState() WorkspaceState {
 		name = defaultWorkspaceName
 	}
 	return WorkspaceState{
-		Name:                name,
-		ConversationID:      c.conversationID,
-		ConversationTitle:   c.conversationTitle,
-		ConversationState:   c.conversationState,
-		ServerConversation:  c.serverConversation,
-		ConversationHistory: c.history,
-		UsageInputTokens:    c.usageInputTokens,
-		UsageOutputTokens:   c.usageOutputTokens,
-		UsageThinkingTokens: c.usageThinkingTokens,
-		WorkingSet:          c.workingSet,
-		AppScope:            c.appScope,
-		App:                 c.currentApp,
+		Name:                    name,
+		WebWorkspaceURI:         c.workspaceURI,
+		WebWorkspaceChecksum:    c.workspaceChecksum,
+		WebWorkspaceDescription: c.workspaceDescription,
+		WebWorkspaceFolders:     append([]WebWorkspaceFolder(nil), c.workspaceFolders...),
+		ConversationID:          c.conversationID,
+		ConversationTitle:       c.conversationTitle,
+		ConversationState:       c.conversationState,
+		ServerConversation:      c.serverConversation,
+		ConversationHistory:     c.history,
+		UsageInputTokens:        c.usageInputTokens,
+		UsageOutputTokens:       c.usageOutputTokens,
+		UsageThinkingTokens:     c.usageThinkingTokens,
+		WorkingSet:              c.workingSet,
+		AppScope:                c.appScope,
+		App:                     c.currentApp,
 	}
 }
 
@@ -199,7 +211,7 @@ func (c *Client) SwitchWorkspace(name string, create bool) error {
 		return errors.New("cannot switch workspace while a turn is processing")
 	}
 	if !isValidWorkspaceName(name) {
-		return fmt.Errorf("invalid workspace %q: use letters, numbers, dash or underscore", name)
+		return fmt.Errorf("invalid workspace %q: use a non-empty name without path separators or control characters", name)
 	}
 	if c.workspaceName != "" {
 		if err := c.saveCurrentState(); err != nil {
@@ -224,6 +236,7 @@ func (c *Client) SwitchWorkspace(name string, create bool) error {
 	if err := saveActiveWorkspaceName(c.opts.Profile, name); err != nil {
 		return err
 	}
+	c.drawPersistentStatus()
 	slashCommandPrintf("workspace: %s\n", name)
 	return nil
 }
@@ -263,7 +276,11 @@ func (c *Client) SetApp(app AppScope) error {
 	if err := saveActiveApp(c.opts.Profile, app); err != nil {
 		return err
 	}
-	return c.saveCurrentState()
+	if err := c.saveCurrentState(); err != nil {
+		return err
+	}
+	c.drawPersistentStatus()
+	return nil
 }
 
 func (c *Client) ClearApp() error {
@@ -272,7 +289,11 @@ func (c *Client) ClearApp() error {
 	if err := deleteActiveApp(c.opts.Profile); err != nil {
 		return err
 	}
-	return c.saveCurrentState()
+	if err := c.saveCurrentState(); err != nil {
+		return err
+	}
+	c.drawPersistentStatus()
+	return nil
 }
 
 func (c *Client) absorbAppScope(v interface{}) {
@@ -313,6 +334,12 @@ func (c *Client) Connect(ctx context.Context) error {
 		_ = c.Close()
 		return err
 	}
+	if c.opts.Conversation == "" {
+		c.restoreSavedWebConversation(ctx)
+		if attrs := asMap(invokeOptions["attributes"]); attrs != nil {
+			attrs["conversationId"] = c.conversationID
+		}
+	}
 	mcpServers := c.nirvanaMCPServerPayload(ctx)
 	payload := map[string]interface{}{
 		"type":             "connect",
@@ -340,7 +367,7 @@ func (c *Client) Connect(ctx context.Context) error {
 }
 
 func (c *Client) prepareNirvanaConversationSelection(ctx context.Context) error {
-	if c.opts.CodeAssistWS || (c.opts.Conversation == "" && !c.shouldPromptStartupConversation()) {
+	if c.opts.CodeAssistWS || c.opts.Conversation == "" {
 		return nil
 	}
 	tok, err := getAccessToken(ctx, oauthConfig(c.cfg), c.opts.Profile, c.cfg.InstanceURL, c.opts.NoOpen, false)
@@ -351,7 +378,7 @@ func (c *Client) prepareNirvanaConversationSelection(ctx context.Context) error 
 	if c.opts.Conversation != "" {
 		return c.SelectConversationByArg(ctx, c.opts.Conversation, true)
 	}
-	return c.PromptWebConversation(ctx, "startup")
+	return nil
 }
 
 func (c *Client) Close() error {
@@ -466,10 +493,8 @@ func (c *Client) connectGateway(ctx context.Context) error {
 		if err := c.SelectConversationByArg(ctx, c.opts.Conversation, true); err != nil {
 			return err
 		}
-	} else if c.shouldPromptStartupConversation() {
-		if err := c.PromptWebConversation(ctx, "startup"); err != nil {
-			return err
-		}
+	} else {
+		c.restoreSavedWebConversation(ctx)
 	}
 	normalizedConversationID := normalizeGatewayConversationID(c.conversationID)
 	if normalizedConversationID == "" {
@@ -3165,8 +3190,22 @@ func (c *Client) statusBarState() statusBarState {
 		InputMessages: conversationInputMessageCount(c.history),
 		InputTokens:   c.usageInputTokens,
 		OutputTokens:  c.usageOutputTokens,
+		Workspace:     c.workspaceName,
+		App:           c.statusBarAppName(),
 		Instance:      c.cfg.InstanceURL,
 	}
+}
+
+func (c *Client) statusBarAppName() string {
+	if c.currentApp == nil {
+		return ""
+	}
+	for _, value := range []string{c.currentApp.ScopeName, c.currentApp.AppSysID, c.currentApp.ScopeID} {
+		if label := singleLineLabel(value); label != "" {
+			return label
+		}
+	}
+	return ""
 }
 
 func conversationInputMessageCount(history []interface{}) int {

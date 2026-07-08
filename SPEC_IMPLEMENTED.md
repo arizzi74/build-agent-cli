@@ -271,7 +271,7 @@ Implemented primary interactive conversation selector:
 Conversation behavior:
 
 - Works in both default Nirvana and legacy web-gateway mode.
-- Interactive default/Nirvana startup can prompt to continue an existing conversation or start a new local conversation before the first `ba>` prompt.
+- Interactive default/Nirvana startup restores the active profile's last workspace and last-opened conversation before the first `ba>` prompt, without showing a startup conversation picker. `--conversation latest|new|<id>|<id-prefix>|<number>` remains the explicit override path.
 - New conversations are deferred until the first prompt is sent; the server row is titled from that first prompt, matching the web UI and avoiding empty `New conversation` rows.
 - Scripted `--prompt` skips picker unless `--conversation` is supplied.
 - Existing conversations load server messages into local history before the next send.
@@ -296,8 +296,9 @@ Fallback handling includes:
 - missing API routes
 - empty intermediate APIs
 - `/api/sn_build_agent/build_agent_api/conversations` browser-HAR parity: list first through `?application_id_list=<appSysIds>&client=ide`, create payload `title/applicationId/applicationName/client`, adopt returned `sysId`, and message payload `content` only
-- when no local app/workspace ids are known, discover Glider IDE-created app sys_ids from `/api/sn_glider/applications/all` before listing conversations, matching the zaiagents HAR flow where the web UI sends those app ids as `application_id_list`
-- backing-table merge for any non-empty conversation API result, filtered to the active application id list when present, so out-of-workspace rows do not leak while missing in-scope `sn_build_agent_conversation` records can still appear; empty `sn_ba_core_conversation` responses do not stop fallback to `sn_build_agent_conversation`
+- app ids for conversation listing are scoped to the active workspace folders/working set first; explicit `--application-id-list` / environment overrides remain available, and current-app fallback is used only when there is no workspace scope
+- the conversation picker no longer discovers every IDE-created app from `/api/sn_glider/applications/all`; if an active workspace is known but no app ids are available, the CLI reads the unscoped IDE list but keeps only app-less/global rows instead of showing app-bound rows from other workspaces
+- API results and backing-table merge are filtered to the active application id list when present, excluding out-of-workspace app-bound rows while retaining app-less/global rows that the Web UI shows; missing in-scope `sn_build_agent_conversation` records can still appear; empty `sn_ba_core_conversation` responses do not stop fallback to `sn_build_agent_conversation`
 - some known old API 500s such as `fCSRFEvaluator/applyRotatedTokens`
 - selected 401/403 fallback cases where another table/API path may still work
 
@@ -443,20 +444,20 @@ Implemented status bar:
 - Pinned above the bottom temporary-message row.
 - Background-free, colorful segmented text.
 - Persists while typing, while `Working ...` animates, and while assistant output streams.
-- Updates in place as usage information arrives.
+- Updates in place as conversation/workspace state changes.
 
 Status bar fields:
 
 ```text
-model=<model> input_messages=<count> input_tokens=<n> output_tokens=<n> instance=<short-instance>
+model=<model> input_messages=<count> workspace=<workspace-name> app=<app-name> instance=<short-instance>
 ```
 
 Color mapping:
 
 - model: wasabi green
 - input message count: yellow
-- input tokens: blue
-- output tokens: magenta
+- workspace: blue
+- app: magenta
 - instance: green
 - labels: dim
 
@@ -504,13 +505,13 @@ Implemented REPL input features:
 - In-memory command history for current process.
 - Up/down arrows browse prompt and slash-command history.
 - Press `/` on an empty prompt to open the slash-command picker.
-- The slash-command picker advertises the regular helper commands but only one conversation command: bare `/conversation`.
-- Parameterized conversation suggestions (`/conversation current`, `/conversation list`, `/conversation new`, `/conversation use ...`) are intentionally hidden.
+- The slash-command picker advertises the regular helper commands but only the bare picker commands for conversations/workspaces/apps: `/conversation`, `/workspace`, and `/app`.
+- Parameterized conversation suggestions (`/conversation current`, `/conversation list`, `/conversation new`, `/conversation use ...`), workspace suggestions (`/workspace current`, `/workspace list`, `/workspace new`, `/workspace use ...`, `/workspace reset`, `/workspace delete`), and app suggestions (`/app current`, `/app use ...`, `/app clear`) are intentionally hidden.
 - The slash-command picker is rendered in the managed footer/viewport area, and inserting/canceling it replays the visible transcript tail before redrawing the footer so rows behind the menu are restored.
 - Pressing Esc closes the slash-command picker immediately, clears the typed slash-filter text, and restores the original terminal contents; arrow-key escape sequences still navigate the picker/history.
-- Enter runs a selected complete slash command immediately, so `/workspace list` or `/conversation` execute from the picker; Tab inserts without running.
-- Non-modal slash command output (`/workspace list`, `/help`, `/mcp list`, `/app current`, etc.) is captured and appended as a managed transcript system block, keeping output visible above the fixed footer instead of printing into the prompt/footer row.
-- Slash suggestions that require an argument and end with a trailing space, such as `/workspace use ` or `/app use `, are inserted on Enter instead of executed so the argument can be completed.
+- Enter runs a selected complete slash command immediately, so `/workspace` or `/conversation` execute from the picker; Tab inserts without running.
+- Non-modal slash command output (`/help`, `/mcp list`, etc.) is captured and appended as a managed transcript system block, keeping output visible above the fixed footer instead of printing into the prompt/footer row.
+- Slash suggestions that require an argument and end with a trailing space are inserted on Enter instead of executed so the argument can be completed; the advertised picker commands execute directly.
 - Ctrl-C aborts current prompt input.
 - Ctrl-D uses a two-step exit guard: the first press shows `Press Ctrl-D again to exit ....` in the temporary message row below the status bar; the message clears automatically after 2 seconds, and a second Ctrl-D within that window exits.
 - Esc cancels popup menus such as slash-command and conversation pickers.
@@ -522,17 +523,23 @@ Implemented interactive slash picker commands:
 /help
 /exit
 /quit
-/workspace current|list|new|use|reset|delete
+/workspace
 /conversation
 /mcp list
-/app current|use|clear
+/app
 ```
 
-`/conversation` opens the conversation picker and supports selecting an existing conversation or creating a new one. Older direct `/conversation current|list|new|use` handlers remain backward-compatible but are no longer advertised in the interactive picker/help.
+`/conversation` opens the conversation picker and supports selecting an existing conversation or creating a new one. `/workspace` opens the workspace picker and, after a workspace is selected, opens the workspace-scoped conversation picker with that workspace's last-used conversation preselected. `/app` opens an app picker for apps in the active workspace. Older direct `/conversation current|list|new|use`, `/workspace current|list|new|use|reset|delete`, and `/app current|use|clear` handlers remain backward-compatible but are no longer advertised in the interactive picker/help.
 
 ## 16. Workspace and app scope commands
 
-Implemented workspace commands:
+Implemented primary workspace command:
+
+```text
+/workspace
+```
+
+Backward-compatible workspace subcommands remain available for scripts/tests but are no longer advertised in the interactive slash picker:
 
 ```text
 /workspace current
@@ -543,7 +550,20 @@ Implemented workspace commands:
 /workspace delete <name>
 ```
 
-Implemented app scope commands:
+Workspace behavior:
+
+- When an authenticated ServiceNow web session is available, bare `/workspace` follows the Glider Web UI path: discover `window.sn_glider.user.userId` from `/sn_glider_app/ide.do`, call `POST /api/sn_glider/v2/sync/state` for `settings:/users/<userId>`, and show `workspaces/*.code-workspace` entries in a picker.
+- `/workspace` can switch to a Web UI workspace by picker selection; after picker-based switching, the CLI proposes the conversations in the newly active workspace and preselects that workspace's saved conversation when present. The backward-compatible `/workspace use <selector>` can still switch by number, exact name, URI, or unique prefix, and multi-word names are joined, so Web UI names like `Default - admin` work.
+- When `sync/files` returns the selected `.code-workspace` file, the CLI persists the Web UI workspace URI/checksum/description/folders and derives a current app scope from `now-file:/<app_sys_id>` folders.
+- Without web workspace auth or when the remote list is unavailable, the command falls back to local profile workspaces.
+
+Implemented primary app scope command:
+
+```text
+/app
+```
+
+Backward-compatible app subcommands remain available for scripts/tests but are no longer advertised in the interactive slash picker:
 
 ```text
 /app current
@@ -553,8 +573,10 @@ Implemented app scope commands:
 
 App scope behavior:
 
+- Bare `/app` opens a picker listing apps available in the active workspace. The list is sourced from active workspace `.code-workspace` folders whose URI is `now-file:/<app_sys_id>`; selecting an entry persists the app through the same `SetApp`/workspace state path as `/app use`.
 - Selected app metadata is cached locally.
 - Backend `set_app_scope` elicitations can update/persist app metadata.
+- Selecting a conversation updates/persists the active app too, matching the Web UI behavior: when conversation application metadata exists, the CLI prefers matching active-workspace app names and falls back to the conversation application name/id; when the conversation has no app, the CLI clears the active app so the status line shows `app=<none>`.
 - Subsequent Build Agent payloads include `appScope` when selected.
 
 ## 17. Debugging and redaction
@@ -585,7 +607,7 @@ Implemented non-interactive guarantees:
 
 - No alternate-screen REPL and no fixed footer/prompt band when stdin/stderr are not real TTYs.
 - Non-interactive legacy `/conversation list` prints plain list output rather than opening picker.
-- Scripted `--prompt` skips startup conversation picker unless `--conversation` is explicitly provided.
+- Scripted `--prompt` skips startup conversation selection unless `--conversation` is explicitly provided.
 - Status bar is not injected into pipe/CI output.
 - Usage lines remain available in non-interactive/debug output.
 - Terminal Markdown renderer avoids TTY-only ANSI decoration when not interactive.

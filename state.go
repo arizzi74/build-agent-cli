@@ -30,20 +30,24 @@ type AppScope struct {
 }
 
 type WorkspaceState struct {
-	Name                string        `json:"name"`
-	ConversationID      string        `json:"conversationId,omitempty"`
-	ConversationTitle   string        `json:"conversationTitle,omitempty"`
-	ConversationState   string        `json:"conversationState,omitempty"`
-	ServerConversation  bool          `json:"serverConversation,omitempty"`
-	ConversationHistory []interface{} `json:"conversationHistory,omitempty"`
-	UsageInputTokens    int64         `json:"usageInputTokens,omitempty"`
-	UsageOutputTokens   int64         `json:"usageOutputTokens,omitempty"`
-	UsageThinkingTokens int64         `json:"usageThinkingTokens,omitempty"`
-	WorkingSet          interface{}   `json:"workingSet,omitempty"`
-	AppScope            interface{}   `json:"appScope,omitempty"`
-	App                 *AppScope     `json:"app,omitempty"`
-	CreatedAt           string        `json:"createdAt"`
-	UpdatedAt           string        `json:"updatedAt"`
+	Name                    string               `json:"name"`
+	WebWorkspaceURI         string               `json:"webWorkspaceUri,omitempty"`
+	WebWorkspaceChecksum    string               `json:"webWorkspaceChecksum,omitempty"`
+	WebWorkspaceDescription string               `json:"webWorkspaceDescription,omitempty"`
+	WebWorkspaceFolders     []WebWorkspaceFolder `json:"webWorkspaceFolders,omitempty"`
+	ConversationID          string               `json:"conversationId,omitempty"`
+	ConversationTitle       string               `json:"conversationTitle,omitempty"`
+	ConversationState       string               `json:"conversationState,omitempty"`
+	ServerConversation      bool                 `json:"serverConversation,omitempty"`
+	ConversationHistory     []interface{}        `json:"conversationHistory,omitempty"`
+	UsageInputTokens        int64                `json:"usageInputTokens,omitempty"`
+	UsageOutputTokens       int64                `json:"usageOutputTokens,omitempty"`
+	UsageThinkingTokens     int64                `json:"usageThinkingTokens,omitempty"`
+	WorkingSet              interface{}          `json:"workingSet,omitempty"`
+	AppScope                interface{}          `json:"appScope,omitempty"`
+	App                     *AppScope            `json:"app,omitempty"`
+	CreatedAt               string               `json:"createdAt"`
+	UpdatedAt               string               `json:"updatedAt"`
 }
 
 func profileManagementRequested(opts Options) bool {
@@ -348,7 +352,7 @@ func readActiveWorkspaceName(profile string) string {
 
 func saveActiveWorkspaceName(profile, name string) error {
 	if !isValidWorkspaceName(name) {
-		return fmt.Errorf("invalid workspace %q: use letters, numbers, dash or underscore", name)
+		return fmt.Errorf("invalid workspace %q: use a non-empty name without path separators or control characters", name)
 	}
 	if err := os.MkdirAll(profileDir(profile), 0o700); err != nil {
 		return err
@@ -357,7 +361,19 @@ func saveActiveWorkspaceName(profile, name string) error {
 }
 
 func isValidWorkspaceName(name string) bool {
-	return isValidProfile(name)
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 240 {
+		return false
+	}
+	if strings.ContainsAny(name, `/\\`) {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func loadWorkspace(profile, name string) (WorkspaceState, bool) {
@@ -385,7 +401,7 @@ func newWorkspaceState(name string) WorkspaceState {
 
 func saveWorkspace(profile string, ws WorkspaceState) error {
 	if !isValidWorkspaceName(ws.Name) {
-		return fmt.Errorf("invalid workspace %q: use letters, numbers, dash or underscore", ws.Name)
+		return fmt.Errorf("invalid workspace %q: use a non-empty name without path separators or control characters", ws.Name)
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	if ws.CreatedAt == "" {
@@ -426,7 +442,7 @@ func listWorkspaces(profile string) ([]WorkspaceState, error) {
 
 func deleteWorkspace(profile, active, name string) error {
 	if !isValidWorkspaceName(name) {
-		return fmt.Errorf("invalid workspace %q: use letters, numbers, dash or underscore", name)
+		return fmt.Errorf("invalid workspace %q: use a non-empty name without path separators or control characters", name)
 	}
 	if name == active {
 		return fmt.Errorf("refusing to delete active workspace %q; switch or reset it instead", name)

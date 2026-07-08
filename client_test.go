@@ -133,8 +133,10 @@ func TestNirvanaToolResultUsesStoredNameAndFailureMarker(t *testing.T) {
 
 func TestStatusBarStateCountsInputsAndCumulativeUsage(t *testing.T) {
 	c := &Client{
-		cfg:     CLIConfig{InstanceURL: "https://demo.example.com"},
-		runtime: RuntimeModelConfig{LargeModel: "claude-opus-4-6"},
+		cfg:           CLIConfig{InstanceURL: "https://demo.example.com"},
+		runtime:       RuntimeModelConfig{LargeModel: "claude-opus-4-6"},
+		workspaceName: "Default - admin",
+		currentApp:    &AppScope{ScopeID: "x_demo", ScopeName: "Demo App", AppSysID: "appsysid123"},
 		history: []interface{}{
 			map[string]interface{}{"role": "user", "content": "first"},
 			map[string]interface{}{"role": "assistant", "content": "answer"},
@@ -150,7 +152,7 @@ func TestStatusBarStateCountsInputsAndCumulativeUsage(t *testing.T) {
 		t.Fatalf("non-interactive usage line missing first usage: %q", stderr)
 	}
 	state := c.statusBarState()
-	if state.Model != "claude-opus-4-6" || state.InputMessages != 2 || state.InputTokens != 4010 || state.OutputTokens != 85 || state.Instance != "https://demo.example.com" {
+	if state.Model != "claude-opus-4-6" || state.InputMessages != 2 || state.InputTokens != 4010 || state.OutputTokens != 85 || state.Workspace != "Default - admin" || state.App != "Demo App" || state.Instance != "https://demo.example.com" {
 		t.Fatalf("unexpected status state: %#v", state)
 	}
 }

@@ -475,7 +475,7 @@ func (l *fixedPromptLayout) redraw(prompt, line string, cursor int, menuLines []
 	for i, menuLine := range menuLines {
 		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K%s", menuTop+i, fitPromptLine(menuLine, l.width))
 	}
-	l.drawPrompt(prompt, line, cursor)
+	l.drawPromptWithSeparator(prompt, line, cursor, len(menuLines) == 0)
 	l.drawnMenuRows = len(menuLines)
 }
 
@@ -502,10 +502,16 @@ func (l *fixedPromptLayout) clearResizedFooterRows(oldTurnTop, oldTempRow int) {
 }
 
 func (l *fixedPromptLayout) drawPrompt(prompt, line string, cursor int) {
+	l.drawPromptWithSeparator(prompt, line, cursor, true)
+}
+
+func (l *fixedPromptLayout) drawPromptWithSeparator(prompt, line string, cursor int, clearSeparator bool) {
 	// Keep one guaranteed blank separator between the transcript/last startup
 	// output and the gray input band. Without this, text printed before the
 	// footer is activated can sit directly against the prompt on first launch.
-	if l.promptTop > 1 {
+	// When a slash menu is open, that row belongs to the menu; clearing it here
+	// would erase the only matching command for filtered menus such as `/w`.
+	if clearSeparator && l.promptTop > 1 {
 		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K", l.promptTop-1)
 	}
 	rows := commandInputBandRows(prompt, line, l.width)
@@ -1089,28 +1095,7 @@ func promptConversationSelection(conversations []WebConversation, currentID stri
 		return promptLine("Select conversation number/id, or n for new [n]: ")
 	}
 
-	options := make([]conversationPickerOption, 0, len(conversations)+2)
-	selected := 0
-	for _, conv := range conversations {
-		if conv.ID != "" && conv.ID == currentID {
-			selected = len(options)
-		}
-		options = append(options, conversationPickerOption{
-			Value:   conv.ID,
-			Label:   conversationLabel(conv),
-			Current: conv.ID != "" && conv.ID == currentID,
-		})
-	}
-	if allowNew {
-		if len(options) == 0 {
-			selected = len(options)
-		}
-		options = append(options, conversationPickerOption{Value: "__new__", Label: "New conversation"})
-	}
-	options = append(options, conversationPickerOption{Value: "__cancel__", Label: "Cancel"})
-	if selected >= len(options) {
-		selected = 0
-	}
+	options, selected := conversationPickerOptions(conversations, currentID, allowNew)
 
 	stdinState.Lock()
 	defer stdinState.Unlock()
@@ -1180,6 +1165,256 @@ func promptConversationSelection(conversations []WebConversation, currentID stri
 				continue
 			}
 			if len(seq) < 2 {
+				continue
+			}
+			switch seq[1] {
+			case 'A': // Up
+				selected--
+				if selected < 0 {
+					selected = len(options) - 1
+				}
+				redraw()
+			case 'B': // Down
+				selected++
+				if selected >= len(options) {
+					selected = 0
+				}
+				redraw()
+			}
+		}
+	}
+}
+
+func conversationPickerOptions(conversations []WebConversation, currentID string, allowNew bool) ([]conversationPickerOption, int) {
+	options := make([]conversationPickerOption, 0, len(conversations)+2)
+	selected := 0
+	currentTrimmed := strings.TrimSpace(currentID)
+	currentNormalized := normalizeGatewayConversationID(currentID)
+	isCurrentConversation := func(id string) bool {
+		id = strings.TrimSpace(id)
+		if id == "" || currentTrimmed == "" {
+			return false
+		}
+		if id == currentTrimmed {
+			return true
+		}
+		if currentNormalized == "" {
+			return false
+		}
+		return normalizeGatewayConversationID(id) == currentNormalized
+	}
+	for _, conv := range conversations {
+		current := isCurrentConversation(conv.ID)
+		if current {
+			selected = len(options)
+		}
+		options = append(options, conversationPickerOption{
+			Value:   conv.ID,
+			Label:   conversationLabel(conv),
+			Current: current,
+		})
+	}
+	if allowNew {
+		if len(options) == 0 {
+			selected = len(options)
+		}
+		options = append(options, conversationPickerOption{Value: "__new__", Label: "New conversation"})
+	}
+	options = append(options, conversationPickerOption{Value: "__cancel__", Label: "Cancel"})
+	if selected >= len(options) {
+		selected = 0
+	}
+	return options, selected
+}
+
+func promptWorkspaceSelection(choices []WorkspaceChoice) (string, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+		printWorkspacePicker(choices)
+		return promptLine("Select workspace number/name, or q to cancel: ")
+	}
+
+	options := make([]conversationPickerOption, 0, len(choices)+1)
+	selected := 0
+	for _, choice := range choices {
+		if choice.Current {
+			selected = len(options)
+		}
+		options = append(options, conversationPickerOption{
+			Value:   choice.Value,
+			Label:   choice.Label,
+			Current: choice.Current,
+		})
+	}
+	options = append(options, conversationPickerOption{Value: "__cancel__", Label: "Cancel"})
+	if selected >= len(options) {
+		selected = 0
+	}
+
+	stdinState.Lock()
+	defer stdinState.Unlock()
+
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		printWorkspacePicker(choices)
+		fmt.Fprint(os.Stderr, "Select workspace number/name, or q to cancel: ")
+		line, readErr := stdinState.reader.ReadString('\n')
+		if readErr != nil && len(line) == 0 {
+			return "", readErr
+		}
+		return strings.TrimSpace(line), nil
+	}
+	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
+	enterAlternatePickerScreen()
+	defer leaveAlternatePickerScreen()
+
+	redraw := func() {
+		fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
+		lines := workspacePickerLines(options, selected)
+		_, height, sizeErr := term.GetSize(int(os.Stderr.Fd()))
+		maxLines := len(lines)
+		if sizeErr == nil && height > 2 && maxLines > height-1 {
+			maxLines = height - 1
+		}
+		for _, line := range lines[:maxLines] {
+			fmt.Fprintf(os.Stderr, "%s\r\n", line)
+		}
+		if maxLines < len(lines) {
+			fmt.Fprintf(os.Stderr, "  … %d more workspaces not shown\r\n", len(lines)-maxLines)
+		}
+	}
+
+	redraw()
+	buf := make([]byte, 1)
+	for {
+		if _, err := os.Stdin.Read(buf); err != nil {
+			return "", err
+		}
+		switch b := buf[0]; b {
+		case '\r', '\n':
+			return options[selected].Value, nil
+		case '\t':
+			selected++
+			if selected >= len(options) {
+				selected = 0
+			}
+			redraw()
+		case 'q', 'Q':
+			return "__cancel__", nil
+		case 3: // Ctrl-C
+			fmt.Fprint(os.Stderr, "^C\r\n")
+			return "", errors.New("interrupted")
+		case 4: // Ctrl-D
+			return "__cancel__", nil
+		case 27: // Escape closes; escape sequences handle arrows.
+			seq := readPendingEscapeSequence()
+			if len(seq) == 0 {
+				return "__cancel__", nil
+			}
+			if seq[0] != '[' || len(seq) < 2 {
+				continue
+			}
+			switch seq[1] {
+			case 'A': // Up
+				selected--
+				if selected < 0 {
+					selected = len(options) - 1
+				}
+				redraw()
+			case 'B': // Down
+				selected++
+				if selected >= len(options) {
+					selected = 0
+				}
+				redraw()
+			}
+		}
+	}
+}
+
+func promptAppSelection(choices []AppChoice) (string, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+		printAppPicker(choices)
+		return promptLine("Select app number/name, or q to cancel: ")
+	}
+
+	options := make([]conversationPickerOption, 0, len(choices)+1)
+	selected := 0
+	for _, choice := range choices {
+		if choice.Current {
+			selected = len(options)
+		}
+		options = append(options, conversationPickerOption{
+			Value:   choice.Value,
+			Label:   choice.Label,
+			Current: choice.Current,
+		})
+	}
+	options = append(options, conversationPickerOption{Value: "__cancel__", Label: "Cancel"})
+	if selected >= len(options) {
+		selected = 0
+	}
+
+	stdinState.Lock()
+	defer stdinState.Unlock()
+
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		printAppPicker(choices)
+		fmt.Fprint(os.Stderr, "Select app number/name, or q to cancel: ")
+		line, readErr := stdinState.reader.ReadString('\n')
+		if readErr != nil && len(line) == 0 {
+			return "", readErr
+		}
+		return strings.TrimSpace(line), nil
+	}
+	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
+	enterAlternatePickerScreen()
+	defer leaveAlternatePickerScreen()
+
+	redraw := func() {
+		fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
+		lines := appPickerLines(options, selected)
+		_, height, sizeErr := term.GetSize(int(os.Stderr.Fd()))
+		maxLines := len(lines)
+		if sizeErr == nil && height > 2 && maxLines > height-1 {
+			maxLines = height - 1
+		}
+		for _, line := range lines[:maxLines] {
+			fmt.Fprintf(os.Stderr, "%s\r\n", line)
+		}
+		if maxLines < len(lines) {
+			fmt.Fprintf(os.Stderr, "  … %d more apps not shown\r\n", len(lines)-maxLines)
+		}
+	}
+
+	redraw()
+	buf := make([]byte, 1)
+	for {
+		if _, err := os.Stdin.Read(buf); err != nil {
+			return "", err
+		}
+		switch b := buf[0]; b {
+		case '\r', '\n':
+			return options[selected].Value, nil
+		case '\t':
+			selected++
+			if selected >= len(options) {
+				selected = 0
+			}
+			redraw()
+		case 'q', 'Q':
+			return "__cancel__", nil
+		case 3: // Ctrl-C
+			fmt.Fprint(os.Stderr, "^C\r\n")
+			return "", errors.New("interrupted")
+		case 4: // Ctrl-D
+			return "__cancel__", nil
+		case 27: // Escape closes; escape sequences handle arrows.
+			seq := readPendingEscapeSequence()
+			if len(seq) == 0 {
+				return "__cancel__", nil
+			}
+			if seq[0] != '[' || len(seq) < 2 {
 				continue
 			}
 			switch seq[1] {
@@ -1292,6 +1527,60 @@ func readPendingEscapeSequence() []byte {
 func conversationPickerLines(options []conversationPickerOption, selected int) []string {
 	color := pickerColorEnabled()
 	lines := []string{pickerHeader("Build Agent conversations", "↑/↓ choose · Enter open · n new · q cancel", color)}
+	if len(options) == 0 {
+		return append(lines, style("  <none found>", ansiDim, color))
+	}
+	for i, option := range options {
+		lines = append(lines, pickerOptionLine(option, i == selected, color))
+	}
+	return lines
+}
+
+func printWorkspacePicker(choices []WorkspaceChoice) {
+	fmt.Fprintln(os.Stderr, "Build Agent workspaces:")
+	if len(choices) == 0 {
+		fmt.Fprintln(os.Stderr, "  <none found>")
+		return
+	}
+	for i, choice := range choices {
+		marker := " "
+		if choice.Current {
+			marker = "*"
+		}
+		fmt.Fprintf(os.Stderr, "%s %2d) %s\n", marker, i+1, choice.Label)
+	}
+}
+
+func workspacePickerLines(options []conversationPickerOption, selected int) []string {
+	color := pickerColorEnabled()
+	lines := []string{pickerHeader("Build Agent workspaces", "↑/↓ choose · Enter open · q cancel", color)}
+	if len(options) == 0 {
+		return append(lines, style("  <none found>", ansiDim, color))
+	}
+	for i, option := range options {
+		lines = append(lines, pickerOptionLine(option, i == selected, color))
+	}
+	return lines
+}
+
+func printAppPicker(choices []AppChoice) {
+	fmt.Fprintln(os.Stderr, "Build Agent workspace apps:")
+	if len(choices) == 0 {
+		fmt.Fprintln(os.Stderr, "  <none found>")
+		return
+	}
+	for i, choice := range choices {
+		marker := " "
+		if choice.Current {
+			marker = "*"
+		}
+		fmt.Fprintf(os.Stderr, "%s %2d) %s\n", marker, i+1, choice.Label)
+	}
+}
+
+func appPickerLines(options []conversationPickerOption, selected int) []string {
+	color := pickerColorEnabled()
+	lines := []string{pickerHeader("Build Agent workspace apps", "↑/↓ choose · Enter select · q cancel", color)}
 	if len(options) == 0 {
 		return append(lines, style("  <none found>", ansiDim, color))
 	}

@@ -110,16 +110,23 @@ func TestStatusBarFormattingIncludesRequestedFieldsAndFitsWidth(t *testing.T) {
 		InputMessages: 7,
 		InputTokens:   4007,
 		OutputTokens:  81,
+		Workspace:     "Default - admin",
+		App:           "Demo App",
 		Instance:      "https://demoalectriallwfze140800.service-now.com/",
 	}
 	plain := formatStatusBar(state, false, 80)
-	for _, check := range []string{"model=claude-opus-4-6", "input_messages=7", "input_tokens=4007", "output_tokens=81", "instance=demoalectriallwfze140800.service-now.com"} {
+	for _, check := range []string{"model=claude-opus-4-6", "input_messages=7", "workspace=Default - admin", "app=Demo App", "instance=demoalectriallwfze140800.service-now.com"} {
 		if !strings.Contains(plain, check) {
 			t.Fatalf("plain status missing %q: %q", check, plain)
 		}
 	}
+	for _, forbidden := range []string{"input_tokens=4007", "output_tokens=81", "input_tokens=0", "output_tokens=0"} {
+		if strings.Contains(plain, forbidden) {
+			t.Fatalf("plain status should not include token field %q: %q", forbidden, plain)
+		}
+	}
 	colored := formatStatusBar(state, true, 140)
-	if strings.Contains(colored, "48;5;") || !strings.Contains(colored, "38;5;118") || !strings.Contains(colored, "35") || runeLen(colored) != 140 {
+	if strings.Contains(colored, "48;5;") || !strings.Contains(colored, "38;5;118") || !strings.Contains(colored, "34") || !strings.Contains(colored, "35") || runeLen(colored) != 140 {
 		t.Fatalf("colored status should be colorful, background-free, and fit width, len=%d text=%q", runeLen(colored), colored)
 	}
 }
@@ -247,6 +254,20 @@ func TestConversationPickerLinesMarksSelectionAndCurrent(t *testing.T) {
 		if !strings.Contains(joined, check) {
 			t.Fatalf("picker output missing %q:\n%s", check, joined)
 		}
+	}
+}
+
+func TestConversationPickerOptionsPreselectCurrentConversation(t *testing.T) {
+	currentID := "506fe6bc3b91c350d6531d9c73e45acc"
+	options, selected := conversationPickerOptions([]WebConversation{
+		{ID: "fc5540513b1d4750d6531d9c73e45acd", Title: "Other workspace chat"},
+		{ID: currentID, Title: "Last workspace chat"},
+	}, normalizeCodeAssistConversationID(currentID), true)
+	if selected != 1 {
+		t.Fatalf("selected = %d, want 1; options=%#v", selected, options)
+	}
+	if !options[1].Current || options[selected].Value != currentID {
+		t.Fatalf("current conversation not marked/preselected: selected=%d options=%#v", selected, options)
 	}
 }
 

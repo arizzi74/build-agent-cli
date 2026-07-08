@@ -639,50 +639,28 @@ func TestBuildAgentAPIConversationListUsesWebUIApplicationIDList(t *testing.T) {
 	}
 	for _, conv := range conversations {
 		if conv.ID == appRefactorID {
-			t.Fatalf("out-of-workspace table row leaked into web UI parity list: %#v", conversations)
+			t.Fatalf("out-of-workspace conversation leaked into web UI parity list: %#v", conversations)
 		}
 	}
 }
 
-func TestBuildAgentAPIConversationListDiscoversIDEApplicationIDs(t *testing.T) {
+func TestBuildAgentAPIConversationListKeepsGlobalRowsWhenWorkspaceHasNoAppIDs(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	myExpApp := "9c6e6abc3b91c350d6531d9c73e45a99"
-	baAnalyticsApp := "16f4c0513b1d4750d6531d9c73e45a6d"
-	appRefactorApp := "2b13ea795f2f4b4991f19ebe67652891"
-	noAppID := "ab205dbd3bb7b250d6531d9c73e45a75"
-	baID := "fc5540513b1d4750d6531d9c73e45acd"
-	myExpID := "506fe6bc3b91c350d6531d9c73e45acc"
-	var conversationListApplicationIDs string
+	globalID := "aa6fe6bc3b91c350d6531d9c73e45aaa"
+	appID := "bb6fe6bc3b91c350d6531d9c73e45bbb"
+	appConversationID := "cc6fe6bc3b91c350d6531d9c73e45ccc"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/sn_glider/applications/all":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"result":[` +
-				`{"sys_id":"` + baAnalyticsApp + `","name":"BA Analytics","ide_created":"IDE","active":"1"},` +
-				`{"sys_id":"` + appRefactorApp + `","name":"App Refactor Studio","ide_created":null,"active":"1"},` +
-				`{"sys_id":"` + myExpApp + `","name":"My Exp Approval","ide_created":"IDE","active":"1"}` +
-				`]}`))
+			t.Fatalf("conversation list should not discover every IDE app as a workspace fallback")
 		case "/api/sn_build_agent/build_agent_api/conversations":
-			conversationListApplicationIDs = r.URL.Query().Get("application_id_list")
-			if conversationListApplicationIDs == "" {
-				t.Fatalf("conversation list did not include discovered application_id_list")
-			}
-			if strings.Contains(conversationListApplicationIDs, appRefactorApp) {
-				t.Fatalf("non-IDE app leaked into application_id_list: %q", conversationListApplicationIDs)
-			}
-			for _, want := range []string{myExpApp, baAnalyticsApp} {
-				if !strings.Contains(conversationListApplicationIDs, want) {
-					t.Fatalf("application_id_list %q missing %s", conversationListApplicationIDs, want)
-				}
-			}
-			if got := r.URL.Query().Get("client"); got != "ide" {
-				t.Fatalf("client = %q", got)
+			if got := r.URL.Query().Get("application_id_list"); got != "" {
+				t.Fatalf("application_id_list = %q, want empty for global-only workspace fallback", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"result":[` +
-				`{"application_id":null,"client":"ide","title":"can you list me all skills you have","sys_id":"` + noAppID + `","state":"open"},` +
-				`{"application_id":"` + baAnalyticsApp + `","client":"ide","title":"BA Analytics: Are you able to create a dashboard in platform analytics? just...","sys_id":"` + baID + `","state":"open"},` +
-				`{"application_id":"` + myExpApp + `","client":"ide","title":"My Exp Approval: execute Spect/implementation_plan.md","sys_id":"` + myExpID + `","state":"open"}` +
+				`{"application_id":null,"client":"ide","title":"List all custom apps in this instance","sys_id":"` + globalID + `","state":"open"},` +
+				`{"application_id":"` + appID + `","client":"ide","title":"Other workspace app chat","sys_id":"` + appConversationID + `","state":"open"}` +
 				`]}`))
 		case "/api/now/table/sn_ba_core_conversation", "/api/now/table/sn_build_agent_conversation":
 			w.Header().Set("Content-Type", "application/json")
@@ -699,15 +677,64 @@ func TestBuildAgentAPIConversationListDiscoversIDEApplicationIDs(t *testing.T) {
 	}
 	client.httpClient = server.Client()
 	client.gatewayAuth = authModeCookie
+	client.workingSet = []interface{}{}
 	conversations, err := client.ListWebConversations(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(conversations) != 3 || conversations[0].ID != noAppID || conversations[1].ID != baID || conversations[2].ID != myExpID {
-		t.Fatalf("discovered app conversation list parity failed: %#v", conversations)
+	if len(conversations) != 1 || conversations[0].ID != globalID {
+		t.Fatalf("workspace with no app ids should keep only app-less/global conversations: %#v", conversations)
 	}
-	if conversationListApplicationIDs == "" {
-		t.Fatalf("conversation list endpoint was not called")
+}
+
+func TestRestoreSavedWebConversationRefreshesWithoutListing(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	conversationID := "506fe6bc3b91c350d6531d9c73e45acc"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/sn_ba_core/conversations_api/conversation/" + conversationID,
+			"/api/sn_build_agent/conversations_api/conversation/" + conversationID,
+			"/api/sn_ba_core/conversations_api/conversation/" + conversationID + "/messages",
+			"/api/sn_build_agent/conversations_api/conversation/" + conversationID + "/messages":
+			http.Error(w, `{"error":{"message":"Requested URI does not represent any resource"},"status":"failure"}`, http.StatusBadRequest)
+		case "/api/sn_build_agent/build_agent_api/conversations/" + conversationID:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"result":{"sys_id":"` + conversationID + `","title":"Saved workspace chat","state":"open","application_id":null}}`))
+		case "/api/sn_build_agent/build_agent_api/conversations/" + conversationID + "/messages":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"result":[{"sequence":"1","content":"{\"sender\":\"user\",\"text\":\"old prompt\"}"},{"sequence":"2","content":"{\"sender\":\"assistant\",\"text\":\"old answer\"}"}]}`))
+		case "/api/sn_build_agent/build_agent_api/conversations":
+			t.Fatalf("startup restore should not list conversations")
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	ws := newWorkspaceState("default")
+	ws.ConversationID = conversationID
+	ws.ServerConversation = true
+	if err := saveWorkspace("default", ws); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveActiveWorkspaceName("default", "default"); err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewClient(CLIConfig{InstanceURL: server.URL}, Options{Profile: "default", AuthMode: authModeCookie})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.httpClient = server.Client()
+	client.gatewayAuth = authModeCookie
+	client.restoreSavedWebConversation(context.Background())
+	if client.conversationTitle != "Saved workspace chat" || client.conversationState != "open" {
+		t.Fatalf("conversation metadata not restored: title=%q state=%q", client.conversationTitle, client.conversationState)
+	}
+	if len(client.history) != 2 || asMap(client.history[0])["content"] != "old prompt" || asMap(client.history[1])["content"] != "old answer" {
+		t.Fatalf("conversation messages not restored: %#v", client.history)
+	}
+	if saved, ok := loadWorkspace("default", "default"); !ok || saved.ConversationTitle != "Saved workspace chat" || len(saved.ConversationHistory) != 2 {
+		t.Fatalf("restored conversation was not saved: %#v ok=%v", saved, ok)
 	}
 }
 

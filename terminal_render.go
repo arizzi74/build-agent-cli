@@ -703,6 +703,8 @@ type statusBarState struct {
 	InputMessages int
 	InputTokens   int64
 	OutputTokens  int64
+	Workspace     string
+	App           string
 	Instance      string
 }
 
@@ -715,7 +717,15 @@ func formatStatusBar(state statusBarState, color bool, width int) string {
 	if instance == "" {
 		instance = "unknown-instance"
 	}
-	text := fmt.Sprintf(" model=%s  input_messages=%d  input_tokens=%d  output_tokens=%d  instance=%s ", model, state.InputMessages, state.InputTokens, state.OutputTokens, instance)
+	workspace := singleLineLabel(state.Workspace)
+	if workspace == "" {
+		workspace = defaultWorkspaceName
+	}
+	app := singleLineLabel(state.App)
+	if app == "" {
+		app = "<none>"
+	}
+	text := fmt.Sprintf(" model=%s  input_messages=%d  workspace=%s  app=%s  instance=%s ", model, state.InputMessages, workspace, app, instance)
 	if !color {
 		return strings.TrimSpace(text)
 	}
@@ -725,8 +735,8 @@ func formatStatusBar(state statusBarState, color bool, width int) string {
 	segments := []statusBarSegment{
 		{" model=", ansiDim}, {model, ansiWasabiGreen},
 		{"  input_messages=", ansiDim}, {fmt.Sprintf("%d", state.InputMessages), ansiYellow + ansiBold},
-		{"  input_tokens=", ansiDim}, {fmt.Sprintf("%d", state.InputTokens), ansiBlue + ansiBold},
-		{"  output_tokens=", ansiDim}, {fmt.Sprintf("%d", state.OutputTokens), ansiMagenta + ansiBold},
+		{"  workspace=", ansiDim}, {workspace, ansiBlue + ansiBold},
+		{"  app=", ansiDim}, {app, ansiMagenta + ansiBold},
 		{"  instance=", ansiDim}, {instance, ansiGreen + ansiBold},
 		{" ", ""},
 	}

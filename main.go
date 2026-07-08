@@ -131,8 +131,10 @@ func main() {
 		return
 	}
 
+	startupStatus := client.statusBarState()
+	client.restoreStartupConversationTranscript(startupStatus)
 	defer restoreTerminalFooter()
-	if !showTerminalFooterTempMessage(client.statusBarState(), startupReadyFooterMessage(), 5*time.Second) {
+	if !showTerminalFooterTempMessage(startupStatus, startupReadyFooterMessage(), 5*time.Second) {
 		fmt.Fprintln(os.Stderr, "Type a message. Commands: /help, /conversation, /mcp, /workspace, /app, /exit, /quit")
 	}
 	for {

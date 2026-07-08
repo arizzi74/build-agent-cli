@@ -16,15 +16,8 @@ func TestSlashCommandSuggestionsAdvertiseOtherOptionsButNoConversationSubcommand
 		"/help",
 		"/conversation",
 		"/mcp list",
-		"/workspace current",
-		"/workspace list",
-		"/workspace new ",
-		"/workspace use ",
-		"/workspace reset",
-		"/workspace delete ",
-		"/app current",
-		"/app use ",
-		"/app clear",
+		"/workspace",
+		"/app",
 		"/exit",
 		"/quit",
 	} {
@@ -37,41 +30,54 @@ func TestSlashCommandSuggestionsAdvertiseOtherOptionsButNoConversationSubcommand
 		"/conversation list",
 		"/conversation new",
 		"/conversation use ",
+		"/workspace current",
+		"/workspace list",
+		"/workspace new ",
+		"/workspace use ",
+		"/workspace reset",
+		"/workspace delete ",
+		"/app current",
+		"/app use ",
+		"/app clear",
 	} {
 		if texts[forbidden] {
-			t.Fatalf("slash picker should not advertise parameterized conversation command %q", forbidden)
+			t.Fatalf("slash picker should not advertise parameterized picker command %q", forbidden)
 		}
 	}
 }
 
 func TestSlashMenuEnterRunsCompleteCommandsButNotArgumentTemplates(t *testing.T) {
-	if !slashMenuEnterSubmits(SlashCommandSuggestion{Text: "/workspace list"}) {
-		t.Fatal("complete slash command should run on Enter")
+	if !slashMenuEnterSubmits(SlashCommandSuggestion{Text: "/workspace"}) {
+		t.Fatal("/workspace should run on Enter so it opens the workspace picker")
 	}
 	if !slashMenuEnterSubmits(SlashCommandSuggestion{Text: "/conversation"}) {
 		t.Fatal("/conversation should run on Enter so it opens the conversation picker")
 	}
-	if slashMenuEnterSubmits(SlashCommandSuggestion{Text: "/workspace use "}) {
-		t.Fatal("argument template should be inserted, not run, on Enter")
+	if !slashMenuEnterSubmits(SlashCommandSuggestion{Text: "/app"}) {
+		t.Fatal("/app should run on Enter so it opens the app picker")
 	}
-	if got := slashMenuInsertText(SlashCommandSuggestion{Text: "/workspace use "}); got != "/workspace use " {
-		t.Fatalf("slash menu insert text should preserve argument placeholder spacing, got %q", got)
+}
+
+func TestSlashMenuFiltersSingleWorkspaceCommand(t *testing.T) {
+	suggestions := filterSlashSuggestions("/w")
+	if len(suggestions) != 1 || suggestions[0].Text != "/workspace" {
+		t.Fatalf("/w suggestions = %#v, want only /workspace", suggestions)
 	}
 }
 
 func TestSlashMenuChoiceIsStableAfterMenuClose(t *testing.T) {
 	suggestions := []SlashCommandSuggestion{
-		{Text: "/workspace current"},
-		{Text: "/workspace list"},
+		{Text: "/conversation"},
+		{Text: "/workspace"},
 	}
 	choice := slashMenuChoice(suggestions, 1)
-	if choice.Text != "/workspace list" {
+	if choice.Text != "/workspace" {
 		t.Fatalf("selected choice mismatch: %#v", choice)
 	}
 	if !slashMenuEnterSubmits(choice) {
 		t.Fatalf("selected complete command should submit after menu close: %#v", choice)
 	}
-	if got := slashMenuChoice(suggestions, 99).Text; got != "/workspace list" {
+	if got := slashMenuChoice(suggestions, 99).Text; got != "/workspace" {
 		t.Fatalf("out-of-range selected index should clamp to last suggestion, got %q", got)
 	}
 }
@@ -140,7 +146,19 @@ func TestWorkspaceResetSlashCommandPrintsConfirmation(t *testing.T) {
 
 func TestSlashCommandOutputCapturePolicy(t *testing.T) {
 	if !slashCommandOutputCanBeCaptured("/workspace list") {
-		t.Fatal("workspace command output should be captured for managed terminal replay")
+		t.Fatal("legacy workspace list output should still be captured for managed terminal replay")
+	}
+	if slashCommandOutputCanBeCaptured("/workspace") {
+		t.Fatal("bare /workspace opens terminal UI and should not be captured")
+	}
+	if slashCommandOutputCanBeCaptured("/workspace select") {
+		t.Fatal("/workspace select opens terminal UI and should not be captured")
+	}
+	if slashCommandOutputCanBeCaptured("/app") {
+		t.Fatal("bare /app opens terminal UI and should not be captured")
+	}
+	if slashCommandOutputCanBeCaptured("/app list") {
+		t.Fatal("/app list opens terminal UI and should not be captured")
 	}
 	if slashCommandOutputCanBeCaptured("/conversation") {
 		t.Fatal("bare /conversation opens terminal UI and should not be captured")

@@ -13,8 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"golang.org/x/term"
 )
 
 var errWebConversationNotFound = errors.New("web conversation not found")
@@ -45,13 +43,6 @@ type conversationListCandidate struct {
 	spec           conversationAPISpec
 	suffix         string
 	applicationIDs []string
-}
-
-func (c *Client) shouldPromptStartupConversation() bool {
-	if c.opts.CodeAssistWS || len(c.opts.Prompts) > 0 || c.opts.Conversation != "" {
-		return false
-	}
-	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd()))
 }
 
 func (c *Client) ensureConversationHTTPClient() error {
@@ -556,7 +547,7 @@ func (c *Client) conversationApplicationFields() (interface{}, string) {
 	return applicationID, strings.TrimSpace(c.currentApp.ScopeName)
 }
 
-func (c *Client) conversationListApplicationIDs() []string {
+func (c *Client) conversationListApplicationIDs(ctx context.Context) ([]string, bool) {
 	seen := map[string]struct{}{}
 	var ids []string
 	add := func(raw string) {
@@ -574,54 +565,34 @@ func (c *Client) conversationListApplicationIDs() []string {
 			ids = append(ids, id)
 		}
 	}
+	if err := c.ensureWorkspaceFoldersForAppPicker(ctx); err != nil && c.debug {
+		fmt.Fprintf(os.Stderr, "[conversation list] workspace app refresh skipped: %v\n", err)
+	}
+	workspaceScoped := strings.TrimSpace(c.workspaceURI) != "" || len(c.workspaceFolders) > 0 || c.workingSet != nil
+	for _, folder := range c.workspaceFolders {
+		if app, ok := appScopeFromWorkspaceFolder(folder); ok {
+			add(app.AppSysID)
+			add(app.ScopeID)
+		}
+	}
+	collectConversationApplicationIDs(c.workingSet, add)
+	if len(ids) > 0 {
+		return ids, true
+	}
 	add(c.opts.ApplicationIDList)
 	add(firstEnv("BA_APPLICATION_ID_LIST", "BA_APP_ID_LIST", "BA_CONVERSATION_APP_IDS"))
+	if len(ids) > 0 {
+		return ids, workspaceScoped
+	}
+	if workspaceScoped {
+		return nil, true
+	}
 	if c.currentApp != nil {
 		add(c.currentApp.AppSysID)
 		add(c.currentApp.ScopeID)
 	}
 	collectConversationApplicationIDs(c.appScope, add)
-	collectConversationApplicationIDs(c.workingSet, add)
-	return ids
-}
-
-func (c *Client) discoverConversationApplicationIDs(ctx context.Context) ([]string, error) {
-	body, status, err := c.getJSON(ctx, strings.TrimRight(c.cfg.InstanceURL, "/")+"/api/sn_glider/applications/all")
-	if err != nil {
-		return nil, err
-	}
-	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("applications/all returned status %d", status)
-	}
-	apps := findConversationArray(jsonAny(body))
-	seen := map[string]struct{}{}
-	ids := make([]string, 0, len(apps))
-	for _, item := range apps {
-		m := asMap(item)
-		if m == nil || !isGliderIDEApplication(m) {
-			continue
-		}
-		id := normalizeGatewayConversationID(firstString(m, "sys_id", "sysId", "id"))
-		if id == "" {
-			continue
-		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		ids = append(ids, id)
-	}
-	return ids, nil
-}
-
-func isGliderIDEApplication(app map[string]interface{}) bool {
-	if !strings.EqualFold(strings.TrimSpace(stringify(app["ide_created"])), "IDE") {
-		return false
-	}
-	if active := strings.TrimSpace(stringify(app["active"])); active != "" && active != "1" && !strings.EqualFold(active, "true") {
-		return false
-	}
-	return true
+	return ids, false
 }
 
 func collectConversationApplicationIDs(v interface{}, add func(string)) {
@@ -660,6 +631,19 @@ func buildAgentConversationListSuffix(applicationIDs []string) string {
 }
 
 func filterWebConversationsForApplications(conversations []WebConversation, applicationIDs []string) []WebConversation {
+	return filterWebConversationsForWorkspaceApplications(conversations, applicationIDs, false)
+}
+
+func filterWebConversationsForWorkspaceApplications(conversations []WebConversation, applicationIDs []string, workspaceScoped bool) []WebConversation {
+	if workspaceScoped && len(applicationIDs) == 0 {
+		out := make([]WebConversation, 0, len(conversations))
+		for _, conv := range conversations {
+			if normalizeGatewayConversationID(conv.ApplicationID) == "" {
+				out = append(out, conv)
+			}
+		}
+		return out
+	}
 	if len(applicationIDs) == 0 || len(conversations) == 0 {
 		return conversations
 	}
@@ -735,15 +719,10 @@ func (c *Client) ListWebConversations(ctx context.Context) ([]WebConversation, e
 	}
 	var lastErr error
 	sawEmptyAPI := false
-	applicationIDs := c.conversationListApplicationIDs()
-	if len(applicationIDs) == 0 {
-		if discovered, err := c.discoverConversationApplicationIDs(ctx); err == nil && len(discovered) > 0 {
-			applicationIDs = discovered
-			if c.debug {
-				fmt.Fprintf(os.Stderr, "[conversation list] discovered %d IDE application ids from /api/sn_glider/applications/all\n", len(applicationIDs))
-			}
-		} else if err != nil && c.debug {
-			fmt.Fprintf(os.Stderr, "[conversation list] application id discovery skipped: %v\n", err)
+	applicationIDs, workspaceScoped := c.conversationListApplicationIDs(ctx)
+	if workspaceScoped && len(applicationIDs) == 0 {
+		if c.debug {
+			fmt.Fprintln(os.Stderr, "[conversation list] active workspace has no application ids; listing app-less/global conversations only")
 		}
 	}
 	for _, candidate := range c.conversationListCandidates(applicationIDs) {
@@ -759,13 +738,13 @@ func (c *Client) ListWebConversations(ctx context.Context) ([]WebConversation, e
 			}
 			return nil, err
 		}
-		conversations := parseWebConversations(body)
+		conversations := filterWebConversationsForWorkspaceApplications(parseWebConversations(body), candidate.applicationIDs, workspaceScoped)
 		if c.debug {
 			fmt.Fprintf(os.Stderr, "[conversation list] %s status=%d count=%d\n", endpoint, status, len(conversations))
 		}
 		if len(conversations) > 0 {
 			if tableConversations, err := c.listTableConversations(ctx); err == nil && len(tableConversations) > 0 {
-				tableConversations = filterWebConversationsForApplications(tableConversations, candidate.applicationIDs)
+				tableConversations = filterWebConversationsForWorkspaceApplications(tableConversations, candidate.applicationIDs, workspaceScoped)
 				conversations = mergeWebConversations(conversations, tableConversations)
 			} else if err != nil && c.debug {
 				fmt.Fprintf(os.Stderr, "[conversation list] table merge skipped: %v\n", err)
@@ -775,7 +754,7 @@ func (c *Client) ListWebConversations(ctx context.Context) ([]WebConversation, e
 		sawEmptyAPI = true
 	}
 	if conversations, err := c.listTableConversations(ctx); err == nil && len(conversations) > 0 {
-		conversations = filterWebConversationsForApplications(conversations, applicationIDs)
+		conversations = filterWebConversationsForWorkspaceApplications(conversations, applicationIDs, workspaceScoped)
 		return conversations, nil
 	} else if err != nil {
 		lastErr = err
@@ -998,6 +977,9 @@ func (c *Client) UseWebConversation(ctx context.Context, conv WebConversation) e
 		c.resetUsageTotals()
 	}
 	c.applyWebConversation(conv, true)
+	if err := c.applyWebConversationApp(ctx, conv); err != nil {
+		return err
+	}
 	if messages, err := c.fetchWebConversationMessages(ctx, c.conversationID); err == nil {
 		c.history = messages
 	} else if c.debug && !errors.Is(err, errWebConversationNotFound) {
@@ -1009,6 +991,90 @@ func (c *Client) UseWebConversation(ctx context.Context, conv WebConversation) e
 	printCurrentConversation(c)
 	printConversationHistoryScrollbackWithStatus(c.conversationTitle, c.history, c.statusBarState())
 	return nil
+}
+
+func (c *Client) applyWebConversationApp(ctx context.Context, conv WebConversation) error {
+	applicationID := strings.TrimSpace(conv.ApplicationID)
+	if applicationID == "" {
+		c.currentApp = nil
+		c.appScope = nil
+		return deleteActiveApp(c.opts.Profile)
+	}
+	app := AppScope{
+		ScopeID:   applicationID,
+		ScopeName: strings.TrimSpace(conv.ApplicationName),
+		AppSysID:  applicationID,
+	}
+	if app.ScopeName == "" {
+		app.ScopeName = applicationID
+	}
+	if choices, err := c.ListWorkspaceAppChoices(ctx); err == nil {
+		for _, choice := range choices {
+			if sameAppScope(choice.App, app) {
+				app = choice.App
+				break
+			}
+		}
+	} else if c.debug {
+		fmt.Fprintf(os.Stderr, "warning: could not match conversation app to workspace apps: %v\n", err)
+	}
+	c.currentApp = &app
+	c.appScope = app.ScopeID
+	return saveActiveApp(c.opts.Profile, app)
+}
+
+func (c *Client) restoreSavedWebConversation(ctx context.Context) {
+	if c.opts.CodeAssistWS {
+		return
+	}
+	conversationID := strings.TrimSpace(c.conversationID)
+	if conversationID == "" {
+		return
+	}
+	if normalized := normalizeGatewayConversationID(conversationID); normalized != "" {
+		conversationID = normalized
+		c.conversationID = normalized
+	}
+	conv, err := c.getWebConversation(ctx, conversationID)
+	if err != nil {
+		if c.debug && !errors.Is(err, errWebConversationNotFound) {
+			fmt.Fprintf(os.Stderr, "warning: could not refresh saved conversation %s: %v\n", shortConversationID(conversationID), err)
+		}
+		return
+	}
+	c.applyWebConversation(conv, false)
+	if err := c.applyWebConversationApp(ctx, conv); err != nil && c.debug {
+		fmt.Fprintf(os.Stderr, "warning: could not restore saved conversation app: %v\n", err)
+	}
+	if messages, err := c.fetchWebConversationMessages(ctx, c.conversationID); err == nil {
+		c.history = messages
+	} else if c.debug && !errors.Is(err, errWebConversationNotFound) {
+		fmt.Fprintf(os.Stderr, "warning: could not refresh saved conversation messages: %v\n", err)
+	}
+	if err := c.saveCurrentState(); err != nil && c.debug {
+		fmt.Fprintf(os.Stderr, "warning: could not save restored conversation state: %v\n", err)
+	}
+}
+
+func (c *Client) restoreStartupConversationTranscript(status statusBarState) bool {
+	if strings.TrimSpace(c.conversationID) == "" && strings.TrimSpace(c.conversationTitle) == "" && len(c.history) == 0 {
+		return false
+	}
+	title := strings.TrimSpace(c.conversationTitle)
+	if title == "" && strings.TrimSpace(c.conversationID) != "" {
+		title = "Conversation " + shortConversationID(c.conversationID)
+	}
+	changed := terminalSetConversationHistory(title, c.history)
+	if !changed {
+		return false
+	}
+	if interactiveTerminalUIEnabled() {
+		if _, replayed := terminalReplayManagedViewportWithScrollback(status); replayed {
+			redrawPendingFooterPromptFromState()
+			return true
+		}
+	}
+	return changed
 }
 
 func (c *Client) StartNewWebConversation(ctx context.Context) error {

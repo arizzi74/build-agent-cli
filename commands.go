@@ -66,6 +66,22 @@ func slashCommandOutputCanBeCaptured(line string) bool {
 		case "select", "choose", "list", "ls":
 			return false
 		}
+	case "/workspace", "/ws":
+		if len(fields) == 1 {
+			return false
+		}
+		switch strings.ToLower(fields[1]) {
+		case "select", "choose":
+			return false
+		}
+	case "/app", "/application":
+		if len(fields) == 1 {
+			return false
+		}
+		switch strings.ToLower(fields[1]) {
+		case "select", "choose", "list", "ls":
+			return false
+		}
 	}
 	return true
 }
@@ -75,15 +91,8 @@ func slashCommandSuggestions() []SlashCommandSuggestion {
 		{Text: "/help", Description: "show available commands"},
 		{Text: "/conversation", Description: "choose an existing Build Agent conversation or create one"},
 		{Text: "/mcp list", Description: "show MCP servers advertised to Nirvana/Forge"},
-		{Text: "/workspace current", Description: "show active workspace"},
-		{Text: "/workspace list", Description: "list local workspaces"},
-		{Text: "/workspace new ", Description: "create and switch to a workspace"},
-		{Text: "/workspace use ", Description: "switch to an existing workspace"},
-		{Text: "/workspace reset", Description: "clear conversation/history for the active workspace"},
-		{Text: "/workspace delete ", Description: "delete an inactive workspace"},
-		{Text: "/app current", Description: "show selected app scope"},
-		{Text: "/app use ", Description: "set selected app scope"},
-		{Text: "/app clear", Description: "clear selected app scope"},
+		{Text: "/workspace", Description: "choose an existing Web UI/local workspace"},
+		{Text: "/app", Description: "choose an app from the active workspace"},
 		{Text: "/exit", Description: "quit"},
 		{Text: "/quit", Description: "quit"},
 	}
@@ -101,13 +110,13 @@ func handleSlashCommand(ctx context.Context, c *Client, line string) (bool, erro
 		printSlashHelp()
 		return true, nil
 	case "/workspace", "/ws":
-		return true, handleWorkspaceCommand(c, fields[1:])
+		return true, handleWorkspaceCommand(ctx, c, fields[1:])
 	case "/conversation", "/conv":
 		return true, handleConversationCommand(ctx, c, fields[1:])
 	case "/mcp":
 		return true, handleMCPCommand(ctx, c, fields[1:])
 	case "/app", "/application":
-		return true, handleAppCommand(c, fields[1:])
+		return true, handleAppCommand(ctx, c, fields[1:])
 	case "/exit", "/quit":
 		return false, nil
 	default:
@@ -122,15 +131,8 @@ func printSlashHelp() {
 	slashCommandPrintln("  /exit | /quit")
 	slashCommandPrintln("  /conversation              (interactive selector; choose existing or New conversation)")
 	slashCommandPrintln("  /mcp list                  (Nirvana: show advertised MCP servers)")
-	slashCommandPrintln("  /workspace current")
-	slashCommandPrintln("  /workspace list")
-	slashCommandPrintln("  /workspace new <name>")
-	slashCommandPrintln("  /workspace use <name>")
-	slashCommandPrintln("  /workspace reset [name]")
-	slashCommandPrintln("  /workspace delete <name>")
-	slashCommandPrintln("  /app current")
-	slashCommandPrintln("  /app use <scopeId> [scopeName]")
-	slashCommandPrintln("  /app clear")
+	slashCommandPrintln("  /workspace                 (interactive selector; choose active workspace)")
+	slashCommandPrintln("  /app                       (interactive selector; choose workspace app)")
 }
 
 func handleMCPCommand(ctx context.Context, c *Client, args []string) error {
@@ -205,16 +207,29 @@ func handleConversationCommand(parent context.Context, c *Client, args []string)
 	}
 }
 
-func handleWorkspaceCommand(c *Client, args []string) error {
-	if len(args) == 0 || strings.EqualFold(args[0], "help") {
-		slashCommandPrintln("usage: /workspace current|list|new <name>|use <name>|reset [name]|delete <name>")
+func handleWorkspaceCommand(parent context.Context, c *Client, args []string) error {
+	if len(args) == 0 {
+		ctx, cancel := conversationCommandContext(parent)
+		defer cancel()
+		return c.PromptWorkspaceSelection(ctx)
+	}
+	if strings.EqualFold(args[0], "help") {
+		slashCommandPrintln("usage: /workspace")
+		slashCommandPrintln("opens the workspace picker; choose an existing Web UI/local workspace")
 		return nil
 	}
+	ctx, cancel := conversationCommandContext(parent)
+	defer cancel()
 
 	switch strings.ToLower(args[0]) {
+	case "select", "choose":
+		return c.PromptWorkspaceSelection(ctx)
 	case "current", "show":
 		ws := c.WorkspaceState()
 		slashCommandPrintf("workspace: %s\n", ws.Name)
+		if ws.WebWorkspaceURI != "" {
+			slashCommandPrintf("workspace uri: %s\n", ws.WebWorkspaceURI)
+		}
 		if ws.ConversationID != "" {
 			slashCommandPrintf("conversation: %s\n", ws.ConversationID)
 		} else {
@@ -226,7 +241,17 @@ func handleWorkspaceCommand(c *Client, args []string) error {
 			slashCommandPrintln("app: <none>")
 		}
 		return nil
-	case "list":
+	case "list", "ls":
+		if c.canUseWebWorkspaceAPI() {
+			webWorkspaces, err := c.ListWebWorkspaces(ctx)
+			if err == nil {
+				printWebWorkspaceList(webWorkspaces, c.workspaceName, c.workspaceURI)
+				return nil
+			}
+			if c.debug {
+				slashCommandPrintf("warning: could not list web workspaces: %v\n", err)
+			}
+		}
 		workspaces, err := listWorkspaces(c.opts.Profile)
 		if err != nil {
 			return err
@@ -256,7 +281,7 @@ func handleWorkspaceCommand(c *Client, args []string) error {
 		if len(args) < 2 {
 			return fmt.Errorf("usage: /workspace new <name>")
 		}
-		name := args[1]
+		name := strings.Join(args[1:], " ")
 		if _, ok := loadWorkspace(c.opts.Profile, name); ok {
 			return fmt.Errorf("workspace %q already exists", name)
 		}
@@ -265,11 +290,24 @@ func handleWorkspaceCommand(c *Client, args []string) error {
 		if len(args) < 2 {
 			return fmt.Errorf("usage: /workspace use <name>")
 		}
-		return c.SwitchWorkspace(args[1], false)
+		selector := strings.Join(args[1:], " ")
+		if c.canUseWebWorkspaceAPI() {
+			webWorkspaces, err := c.ListWebWorkspaces(ctx)
+			if err == nil {
+				if ws, err := resolveWebWorkspaceSelector(webWorkspaces, selector); err == nil {
+					return c.SwitchWebWorkspace(ctx, ws)
+				} else if c.debug {
+					slashCommandPrintf("warning: could not resolve web workspace: %v\n", err)
+				}
+			} else if c.debug {
+				slashCommandPrintf("warning: could not list web workspaces: %v\n", err)
+			}
+		}
+		return c.SwitchWorkspace(selector, false)
 	case "reset":
 		name := c.workspaceName
 		if len(args) >= 2 {
-			name = args[1]
+			name = strings.Join(args[1:], " ")
 		}
 		if name != c.workspaceName {
 			if err := c.SwitchWorkspace(name, false); err != nil {
@@ -281,23 +319,34 @@ func handleWorkspaceCommand(c *Client, args []string) error {
 		if len(args) < 2 {
 			return fmt.Errorf("usage: /workspace delete <name>")
 		}
-		if err := deleteWorkspace(c.opts.Profile, c.workspaceName, args[1]); err != nil {
+		name := strings.Join(args[1:], " ")
+		if err := deleteWorkspace(c.opts.Profile, c.workspaceName, name); err != nil {
 			return err
 		}
-		slashCommandPrintf("deleted workspace %q\n", args[1])
+		slashCommandPrintf("deleted workspace %q\n", name)
 		return nil
 	default:
 		return fmt.Errorf("unknown /workspace command %q", args[0])
 	}
 }
 
-func handleAppCommand(c *Client, args []string) error {
-	if len(args) == 0 || strings.EqualFold(args[0], "help") {
-		slashCommandPrintln("usage: /app current|use <scopeId> [scopeName]|clear")
+func handleAppCommand(parent context.Context, c *Client, args []string) error {
+	if len(args) == 0 {
+		ctx, cancel := conversationCommandContext(parent)
+		defer cancel()
+		return c.PromptAppSelection(ctx)
+	}
+	if strings.EqualFold(args[0], "help") {
+		slashCommandPrintln("usage: /app")
+		slashCommandPrintln("opens the app picker; choose an app from the active workspace")
 		return nil
 	}
+	ctx, cancel := conversationCommandContext(parent)
+	defer cancel()
 
 	switch strings.ToLower(args[0]) {
+	case "select", "choose", "list", "ls":
+		return c.PromptAppSelection(ctx)
 	case "current", "show":
 		app := c.CurrentApp()
 		if app == nil {
