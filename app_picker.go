@@ -51,21 +51,21 @@ func (c *Client) SelectApp(ctx context.Context, choices []AppChoice) error {
 }
 
 func (c *Client) UseAppChoice(ctx context.Context, choice AppChoice) error {
-	_ = ctx
 	if strings.TrimSpace(choice.App.ScopeID) == "" {
 		return errors.New("selected app has no scope id")
 	}
 	if err := c.SetApp(choice.App); err != nil {
 		return err
 	}
+	_ = c.ensureActiveAppMetadata(ctx)
 	slashCommandPrintf("app set: %s\n", choice.App.ScopeID)
-	printApp(&choice.App)
+	printApp(c.currentApp)
 	return nil
 }
 
 func (c *Client) ListWorkspaceAppChoices(ctx context.Context) ([]AppChoice, error) {
 	if err := c.ensureWorkspaceFoldersForAppPicker(ctx); err != nil && c.debug {
-		slashCommandPrintf("warning: could not refresh workspace apps: %v\n", err)
+		c.debugf("warning: could not refresh workspace apps: %v\n", err)
 	}
 	folders := c.workspaceFolders
 	if len(folders) == 0 {
@@ -100,9 +100,7 @@ func (c *Client) ensureWorkspaceFoldersForAppPicker(ctx context.Context) error {
 	}
 	c.workspaceDescription = ws.Description
 	c.workspaceFolders = append([]WebWorkspaceFolder(nil), ws.Folders...)
-	if len(ws.Folders) > 0 {
-		c.workingSet = webWorkspaceWorkingSet(ws.Folders)
-	}
+	c.workingSet = nil
 	return c.saveCurrentState()
 }
 

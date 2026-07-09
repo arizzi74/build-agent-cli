@@ -32,7 +32,8 @@ var pendingCommandInput = struct {
 
 var processingInputState = struct {
 	sync.Mutex
-	active bool
+	active  bool
+	capture *processingInputCapture
 }{}
 
 var terminalAppScreenState = struct {
@@ -68,7 +69,7 @@ func promptPassword(prompt string) (string, error) {
 }
 
 func promptCommandLine(prompt string, status *statusBarState) (string, error) {
-	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) {
 		line, err := promptLine(prompt)
 		if err == nil {
 			rememberCommand(line)
@@ -598,7 +599,7 @@ func (l *fixedPromptLayout) submit(prompt, _ string) {
 	l.drawnMenuRows = 0
 	// The submitted text is copied into the managed transcript by the REPL
 	// immediately after Enter. Keep the footer prompt ready for the next input
-	// while `Working ...` and the assistant response render above it.
+	// while `Building...` and the assistant response render above it.
 	l.drawPrompt(prompt, "", 0)
 	placeTerminalFooterPromptCursor(prompt, 0)
 }
@@ -838,16 +839,172 @@ func promptYesNo(prompt string, defaultYes bool) (bool, error) {
 	}
 }
 
+func promptApprovalTable(rows [][2]string, message string, defaultYes bool) (bool, error) {
+	// During an active turn the terminal prompt runs a background typeahead
+	// capture that owns stdin until the turn finishes. Approval is itself part of
+	// the turn, so leaving that capture active deadlocks: the approval UI waits
+	// for stdin, while the turn waits for the approval response. Stop it first;
+	// Stop preserves any partially typed command in pendingCommandInput.
+	suspendProcessingInputCapture()
+	if strings.TrimSpace(message) != "" {
+		rows = append([][2]string{{"Question", singleLineLabel(message)}}, rows...)
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) {
+		printApprovalTable(rows, -1)
+		return promptYesNo("Approve", defaultYes)
+	}
+
+	selected := 1
+	if defaultYes {
+		selected = 0
+	}
+	stdinState.Lock()
+	defer stdinState.Unlock()
+
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		printApprovalTable(rows, -1)
+		return promptYesNo("Approve", defaultYes)
+	}
+	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
+	enterAlternatePickerScreen()
+	defer leaveAlternatePickerScreen()
+
+	redraw := func() {
+		fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
+		printApprovalTable(rows, selected)
+	}
+	redraw()
+	buf := make([]byte, 1)
+	for {
+		if _, err := os.Stdin.Read(buf); err != nil {
+			return false, err
+		}
+		switch b := buf[0]; b {
+		case '\r', '\n':
+			return selected == 0, nil
+		case 'y', 'Y':
+			return true, nil
+		case 'n', 'N':
+			return false, nil
+		case 'q', 'Q':
+			return false, nil
+		case 3: // Ctrl-C
+			fmt.Fprint(os.Stderr, "^C\r\n")
+			return false, errors.New("interrupted")
+		case 4: // Ctrl-D
+			return false, nil
+		case 9: // Tab
+			selected = 1 - selected
+			redraw()
+		case 27:
+			seq := readPendingEscapeSequence()
+			if len(seq) == 0 {
+				return false, nil
+			}
+			if seq[0] != '[' || len(seq) < 2 {
+				continue
+			}
+			switch seq[1] {
+			case 'A', 'B':
+				selected = 1 - selected
+				redraw()
+			}
+		}
+	}
+}
+
+func printApprovalTable(rows [][2]string, selected int) {
+	width, _, err := term.GetSize(terminalStderrFD())
+	if err != nil || width <= 0 {
+		width = 100
+	}
+	if width < 60 {
+		width = 60
+	}
+	color := pickerColorEnabled()
+	fmt.Fprintf(os.Stderr, "%s\r\n", pickerHeader("Approval required", "↑/↓ choose · Enter confirm · y/n shortcut · q reject", color))
+	fmt.Fprintf(os.Stderr, "%s\r\n", approvalRule(width, color))
+	keyWidth := 14
+	valueWidth := width - keyWidth - 7
+	for _, row := range rows {
+		key := approvalClip(singleLineLabel(row[0]), keyWidth)
+		value := singleLineLabel(row[1])
+		if value == "" {
+			value = "-"
+		}
+		wrapped := wrapReplayLine(value, valueWidth)
+		if len(wrapped) == 0 {
+			wrapped = []string{""}
+		}
+		for i, part := range wrapped {
+			left := ""
+			if i == 0 {
+				left = key
+			}
+			fmt.Fprintf(os.Stderr, "│ %-*s │ %-*s │\r\n", keyWidth, approvalClip(left, keyWidth), valueWidth, approvalClip(part, valueWidth))
+		}
+	}
+	fmt.Fprintf(os.Stderr, "%s\r\n\r\n", approvalRule(width, color))
+	choices := []struct {
+		label string
+		ok    bool
+	}{
+		{label: "Approve", ok: true},
+		{label: "Reject", ok: false},
+	}
+	for i, choice := range choices {
+		selector := " "
+		if selected == i {
+			selector = style("›", ansiWasabiGreen, color)
+		}
+		label := choice.label
+		if choice.ok {
+			label = "✓ " + label
+			label = style(label, ansiWasabiGreen+ansiBold, color)
+		} else {
+			label = "✗ " + label
+			label = style(label, ansiRed+ansiBold, color)
+		}
+		fmt.Fprintf(os.Stderr, "%s %s\r\n", selector, label)
+	}
+}
+
+func approvalRule(width int, color bool) string {
+	count := width - 1
+	if count < 0 {
+		count = 0
+	}
+	line := strings.Repeat("─", count)
+	return style(line, ansiDim, color)
+}
+
+func approvalClip(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	r := []rune(stripANSI(s))
+	if len(r) <= width {
+		return s
+	}
+	if width == 1 {
+		return "…"
+	}
+	return string(r[:width-1]) + "…"
+}
+
 type processingInputCapture struct {
-	stop chan struct{}
-	done chan struct{}
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 func startProcessingInputCapture(prompt string, status *statusBarState) *processingInputCapture {
-	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) || status == nil {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) || status == nil {
 		return nil
 	}
 	capture := &processingInputCapture{stop: make(chan struct{}), done: make(chan struct{})}
+	setProcessingInputCapture(capture)
 	go capture.run(prompt, *status)
 	return capture
 }
@@ -856,14 +1013,13 @@ func (c *processingInputCapture) Stop() {
 	if c == nil {
 		return
 	}
-	close(c.stop)
+	c.stopOnce.Do(func() { close(c.stop) })
 	<-c.done
 }
 
 func (c *processingInputCapture) run(prompt string, status statusBarState) {
 	defer close(c.done)
-	setProcessingInputCaptureActive(true)
-	defer setProcessingInputCaptureActive(false)
+	defer clearProcessingInputCapture(c)
 	stdinState.Lock()
 	defer stdinState.Unlock()
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
@@ -928,9 +1084,19 @@ func (c *processingInputCapture) run(prompt string, status statusBarState) {
 	}
 }
 
-func setProcessingInputCaptureActive(active bool) {
+func setProcessingInputCapture(capture *processingInputCapture) {
 	processingInputState.Lock()
-	processingInputState.active = active
+	processingInputState.active = capture != nil
+	processingInputState.capture = capture
+	processingInputState.Unlock()
+}
+
+func clearProcessingInputCapture(capture *processingInputCapture) {
+	processingInputState.Lock()
+	if processingInputState.capture == capture {
+		processingInputState.active = false
+		processingInputState.capture = nil
+	}
 	processingInputState.Unlock()
 }
 
@@ -938,6 +1104,17 @@ func processingInputCaptureActive() bool {
 	processingInputState.Lock()
 	defer processingInputState.Unlock()
 	return processingInputState.active
+}
+
+func suspendProcessingInputCapture() bool {
+	processingInputState.Lock()
+	capture := processingInputState.capture
+	processingInputState.Unlock()
+	if capture == nil {
+		return false
+	}
+	capture.Stop()
+	return true
 }
 
 func setPendingCommandInput(line string, submitted bool) {
@@ -969,7 +1146,7 @@ type conversationPickerOption struct {
 }
 
 func promptInstanceSelection(instances []ProfileInfo, currentProfile string) (string, error) {
-	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) {
 		if currentProfile != "" {
 			return currentProfile, nil
 		}
@@ -1026,7 +1203,7 @@ func promptInstanceSelection(instances []ProfileInfo, currentProfile string) (st
 	redraw := func() {
 		fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
 		lines := instancePickerLines(options, selected)
-		_, height, sizeErr := term.GetSize(int(os.Stderr.Fd()))
+		_, height, sizeErr := term.GetSize(terminalStderrFD())
 		maxLines := len(lines)
 		if sizeErr == nil && height > 2 && maxLines > height-1 {
 			maxLines = height - 1
@@ -1090,7 +1267,7 @@ func instancePickerLines(options []conversationPickerOption, selected int) []str
 }
 
 func promptConversationSelection(conversations []WebConversation, currentID string, allowNew bool) (string, error) {
-	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) {
 		printConversationPicker(conversations, currentID)
 		return promptLine("Select conversation number/id, or n for new [n]: ")
 	}
@@ -1117,7 +1294,7 @@ func promptConversationSelection(conversations []WebConversation, currentID stri
 	redraw := func() {
 		fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
 		lines := conversationPickerLines(options, selected)
-		_, height, sizeErr := term.GetSize(int(os.Stderr.Fd()))
+		_, height, sizeErr := term.GetSize(terminalStderrFD())
 		maxLines := len(lines)
 		if sizeErr == nil && height > 2 && maxLines > height-1 {
 			maxLines = height - 1
@@ -1228,7 +1405,7 @@ func conversationPickerOptions(conversations []WebConversation, currentID string
 }
 
 func promptWorkspaceSelection(choices []WorkspaceChoice) (string, error) {
-	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) {
 		printWorkspacePicker(choices)
 		return promptLine("Select workspace number/name, or q to cancel: ")
 	}
@@ -1270,7 +1447,7 @@ func promptWorkspaceSelection(choices []WorkspaceChoice) (string, error) {
 	redraw := func() {
 		fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
 		lines := workspacePickerLines(options, selected)
-		_, height, sizeErr := term.GetSize(int(os.Stderr.Fd()))
+		_, height, sizeErr := term.GetSize(terminalStderrFD())
 		maxLines := len(lines)
 		if sizeErr == nil && height > 2 && maxLines > height-1 {
 			maxLines = height - 1
@@ -1332,7 +1509,7 @@ func promptWorkspaceSelection(choices []WorkspaceChoice) (string, error) {
 }
 
 func promptAppSelection(choices []AppChoice) (string, error) {
-	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) {
 		printAppPicker(choices)
 		return promptLine("Select app number/name, or q to cancel: ")
 	}
@@ -1374,7 +1551,7 @@ func promptAppSelection(choices []AppChoice) (string, error) {
 	redraw := func() {
 		fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
 		lines := appPickerLines(options, selected)
-		_, height, sizeErr := term.GetSize(int(os.Stderr.Fd()))
+		_, height, sizeErr := term.GetSize(terminalStderrFD())
 		maxLines := len(lines)
 		if sizeErr == nil && height > 2 && maxLines > height-1 {
 			maxLines = height - 1

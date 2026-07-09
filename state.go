@@ -26,6 +26,7 @@ type ProfileInfo struct {
 type AppScope struct {
 	ScopeID   string `json:"scopeId"`
 	ScopeName string `json:"scopeName,omitempty"`
+	Scope     string `json:"scope,omitempty"`
 	AppSysID  string `json:"appSysId,omitempty"`
 }
 
@@ -502,10 +503,17 @@ func appFromPayload(payload map[string]interface{}) *AppScope {
 	app := &AppScope{
 		ScopeID:   scopeID,
 		ScopeName: stringify(payload["scopeName"]),
+		Scope:     stringify(payload["scope"]),
 		AppSysID:  stringify(payload["appSysId"]),
 	}
 	if app.ScopeName == "" {
 		app.ScopeName = stringify(payload["scope_name"])
+	}
+	if app.Scope == "" {
+		app.Scope = stringify(payload["scope_name_actual"])
+	}
+	if app.Scope == "" && looksLikeServiceNowScope(app.ScopeName) {
+		app.Scope = app.ScopeName
 	}
 	if app.AppSysID == "" {
 		app.AppSysID = stringify(payload["app_sys_id"])

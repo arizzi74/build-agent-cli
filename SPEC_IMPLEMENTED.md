@@ -1,6 +1,6 @@
 # Build Agent Go CLI — Implemented Specification
 
-Last updated: 2026-07-07
+Last updated: 2026-07-09
 
 This document describes what has been implemented so far in `/home/ubuntu/.openclaw/workspace/build-agent-go-cli`. It is a functional spec of the current Go CLI behavior, not a future roadmap.
 
@@ -19,33 +19,38 @@ Primary goals implemented:
 
 ## 2. Binary and build
 
-Implemented build outputs:
+Implemented build output:
 
 - Source directory: `build-agent-go-cli/`
-- Static Linux arm64 binary: `build-agent-go-cli-linux-arm64`
-- Checksum file: `build-agent-go-cli-linux-arm64.sha256`
+- Release binary: `build-agent-go-cli`
+- Target: Linux arm64/aarch64
+- Linkage: static, stripped symbols/debug info
+- Build instructions: `BUILD.md`
+
+Required release build command:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w -buildid=' -o build-agent-go-cli .
+```
 
 Standard verification commands used after changes:
 
 ```bash
-gofmt -w *.go
+gofmt -w .
 go test -count=1 ./...
-go build -o /tmp/build-agent-go-cli-check .
+go vet ./...
+file build-agent-go-cli
+ldd build-agent-go-cli
+sha256sum build-agent-go-cli
 ```
 
-Static binary verification has also been used:
+`ldd` is expected to report `not a dynamic executable`. Per the active build policy, do not produce `build-agent-go-cli-linux-arm64` or dynamic/non-stripped release binaries unless a temporary debugging exception is explicitly requested.
 
-```bash
-file build-agent-go-cli-linux-arm64
-ldd build-agent-go-cli-linux-arm64
-sha256sum build-agent-go-cli-linux-arm64
-```
-
-Latest known rebuilt binary after adding visible workspace reset confirmation:
+Latest known rebuilt binary after `fluent_topics_list` parity work:
 
 ```text
-build-agent-go-cli-linux-arm64
-sha256 0f821eec9dfcfbfe8aada1e2bc87d263f668eae2a4939ce7e2c6ba7b76e4944d
+build-agent-go-cli
+sha256 4889d90fafb9c622fdd51d109608d35f85968f998e206bcde516bae59792b478
 ```
 
 ## 3. Command-line flags
@@ -65,7 +70,9 @@ Implemented top-level flags include:
 --model <name>                   large model override
 --no-open                        do not open browser during OAuth
 --auto-approve                   safe-default approval mode
---debug                          raw redacted websocket/AMB JSON frames
+-debug <filename>                enable debug; tee regular output plus redacted debug trace to filename
+--debug <filename>               same as -debug <filename>
+--debug-file <filename>          explicit debug log file alias; also enables debug
 --nirvana                        use Glider/Nirvana websocket transport; default
 --web-gateway                    use legacy web gateway/AMB fallback transport
 --code-assist-ws                 experimental diagnostic websocket path
@@ -107,7 +114,7 @@ Workspace JSON persists:
 - `conversationId`
 - server conversation metadata/title/state
 - local `conversationHistory`
-- `workingSet`
+- validated server-shaped `workingSet` entries only; folder-shaped workspace data is not persisted as working set
 - selected app scope metadata
 - cumulative usage counters used by the terminal status bar
 
@@ -176,7 +183,7 @@ Implemented message payload fields include:
 - `ideContext`
 - `images: []`
 - `attachments: []`
-- `workingSet`
+- `workingSet` only when every item has `table`, `sysId`, and `scopeId`; folder-shaped workspace data is suppressed
 - `mcpServers`
 - `isGreeting: false`
 - `isMCPRetry: false`
@@ -184,12 +191,25 @@ Implemented message payload fields include:
 - `params`
 - optional `appScope`
 
+Outbound `workingSet` handling deliberately treats it as server record metadata only. Workspace folder records such as `{name, uri}` are not sent as `workingSet`, preventing Nirvana schema validation errors on `workingSet[*].table`, `workingSet[*].sysId`, and `workingSet[*].scopeId`.
+
 Conversation history sent to Nirvana is sanitized:
 
 - keeps only user/assistant-compatible history
 - drops tool/thinking/loading rows
 - converts unsupported system/stop style rows into user-visible notes where needed
 - avoids backend errors caused by invalid `tool` roles
+
+Implemented client-side app creation parity for the Web UI `create_new_servicenow_app` elicitation:
+
+- Handles the prior `approval` elicitation using the existing yes/no or `--auto-approve` path.
+- Accepts payload fields such as `appName` and `appDescription`.
+- Checks `sys_app` through `/api/sn_build_agent/build_agent_api/runQuery/table/sys_app/query/scopeLIKE<scope>`.
+- Creates the application with `POST /api/now/templates` using template sys_id `c305debeff236210c7c1ffffffffff03`.
+- Polls `/api/now/templates/status?template_instance_id=<id>` until completion.
+- Retries scope collisions using the Web UI-observed shape: base scope, numeric truncated suffixes, then random 4-character suffixes.
+- Refreshes Glider state, writes the new app seed project and active `.code-workspace` update with multipart `POST /api/sn_glider/v2/sync/changes/apply`, patches the Build Agent conversation with the new `applicationId`, updates the conversation title, and clears the conversation working set like the Web UI flow.
+- Returns a websocket response with `success`, JSON string `content.nowConfig`, and `ideContext` including `workspaceFolders`, `fluentVersion`, `scopeName`, and project structure, matching the Web UI response shape.
 
 ## 7. Streaming and turn handling
 
@@ -199,7 +219,7 @@ Implemented Nirvana stream handling:
 - Hides `pending` and routine thinking/tool plumbing in normal UI.
 - Streams only real assistant text to stdout in normal UI.
 - In interactive terminals, streams text through the Markdown formatter by repainting the current assistant block in place; this keeps tables, bullets, headings, inline code, and code fences formatted instead of leaving raw Markdown chunks in scrollback.
-- Non-TTY/debug output remains plain append-only.
+- Non-TTY output remains plain append-only.
 - Supports forcing the older append-only terminal path with:
 
 ```bash
@@ -208,8 +228,11 @@ BA_CLI_LIVE_REPAINT=0
 
 Debug mode behavior:
 
-- `--debug` prints redacted raw websocket frames to stderr.
-- In debug mode, the CLI avoids in-place repaint and streams plain chunks so stderr JSON and stdout text do not garble each other.
+- Debug mode is only available with a filename: `-debug <filename>`, `--debug <filename>`, `--debug=<filename>`, or `--debug-file <filename>`.
+- Bare `--debug` / `-debug` without a filename is invalid.
+- Regular terminal output remains visible on the terminal and is also copied to the debug file.
+- Redacted debug trace output is written only to the debug file, never to the terminal.
+- Debug mode keeps the normal terminal UI behavior; the file log receives whatever regular output the terminal receives, plus redacted debug trace lines.
 
 Turn lifecycle:
 
@@ -412,14 +435,14 @@ Implemented fixed footer layout for real TTYs:
 [normal scrollback/output region]
 
 [blank spacer row]
-[animated Working ... row]
+[animated Building... row]
 [blank spacer row]
 [3-row full-width gray prompt band]
 [colorful status bar]
 [blank temporary-message row]
 ```
 
-The footer reserves rows outside the terminal scroll region using terminal escape sequences. Output scrolls above the footer instead of overwriting it.
+The footer reserves rows outside the terminal scroll region using terminal escape sequences. Output scrolls above the footer instead of overwriting it. After instance/transport selection, startup shows an animated wasabi-green `Connecting...` status below the transport screen while `client.Connect()` establishes the websocket/session.
 
 Implemented prompt behavior:
 
@@ -428,22 +451,22 @@ Implemented prompt behavior:
 - `ba>` prompt text sits on the middle row.
 - Typed text appears in the middle row.
 - Slash-command suggestions open above the prompt band.
-- Pressing Enter immediately resets the footer to an empty `ba>` prompt while the request is processing, and after the submitted gray prompt block is written to scrollback the cursor is returned to the footer input row. During `Working ...`, stdin is kept in raw/no-echo capture mode and the buffered typeahead is redrawn through the footer prompt renderer, so typed characters preserve the gray prompt band and do not corrupt the transcript/output. Pressing Enter while the response is still running marks the buffered line as the next prompt. While this capture is active, assistant stream deltas are accumulated and the final answer is recorded and the whole managed viewport is replayed from transcript state, the same path used after resize, so output generation stays aligned and does not steal the input cursor.
-- The submitted text is copied into scrollback as a gray prompt block before send setup and before `Working ...`.
+- Pressing Enter immediately resets the footer to an empty `ba>` prompt while the request is processing, and after the submitted gray prompt block is written to scrollback the cursor is returned to the footer input row. During `Building...`, stdin is kept in raw/no-echo capture mode and the buffered typeahead is redrawn through the footer prompt renderer, so typed characters preserve the gray prompt band and do not corrupt the transcript/output. Pressing Enter while the response is still running marks the buffered line as the next prompt. While this capture is active, assistant stream deltas are accumulated and the final answer is recorded and the whole managed viewport is replayed from transcript state, the same path used after resize, so output generation stays aligned and does not steal the input cursor.
+- The submitted text is copied into scrollback as a gray prompt block before send setup and before `Building...`.
 
-Implemented `Working ...` behavior:
+Implemented `Building...` behavior:
 
 - Animated wasabi-green glow.
 - Sits above the 3-line prompt band.
 - Has one blank line above and below.
 - Remains compatible with pinned footer/status layout.
-- Clears before assistant text, errors, warnings, or real prompt redraws.
+- Remains visible while server/client elicitations and assistant output are in progress; blocking local prompts can temporarily own the terminal, after which the indicator is restored while the turn remains active. It clears on `turn_end`, `turn_error`, or finalization.
 
 Implemented status bar:
 
 - Pinned above the bottom temporary-message row.
 - Background-free, colorful segmented text.
-- Persists while typing, while `Working ...` animates, and while assistant output streams.
+- Persists while typing, while `Building...` animates, and while assistant output streams.
 - Updates in place as conversation/workspace state changes.
 
 Status bar fields:
@@ -576,10 +599,55 @@ App scope behavior:
 - Bare `/app` opens a picker listing apps available in the active workspace. The list is sourced from active workspace `.code-workspace` folders whose URI is `now-file:/<app_sys_id>`; selecting an entry persists the app through the same `SetApp`/workspace state path as `/app use`.
 - Selected app metadata is cached locally.
 - Backend `set_app_scope` elicitations can update/persist app metadata.
-- Selecting a conversation updates/persists the active app too, matching the Web UI behavior: when conversation application metadata exists, the CLI prefers matching active-workspace app names and falls back to the conversation application name/id; when the conversation has no app, the CLI clears the active app so the status line shows `app=<none>`.
+- Selecting a conversation updates/persists the active app too, matching the Web UI behavior: when conversation application metadata exists, the CLI prefers matching active-workspace app names and falls back to the conversation application name/id; when the conversation has no app, the CLI clears the active app so the status line shows `app=<none>`. Creating a new conversation also clears the selected app and persisted active-app state, so the new conversation starts app-less and the footer shows `app=<none>`.
 - Subsequent Build Agent payloads include `appScope` when selected.
 
-## 17. Debugging and redaction
+## 17. Client-side Build Agent elicitations and Glider VFS tools
+
+Implemented client-side elicitation handling includes:
+
+- `approval` and `plan_approval` through yes/no prompts or `--auto-approve`.
+- `interview` and `interview_choice_picker` local prompts.
+- `app_picker`, `set_app_scope`, and `create_new_servicenow_app` Web UI-style app creation/update flows.
+- `instance_skills_list`, currently returning an empty JSON list when no instance skill catalog is available.
+- Glider workspace filesystem actions against the active app's `now-file:/<app_sys_id>` workspace:
+  - `fs_read_directory`
+  - `fs_read_file`
+  - `fs_write_file`
+  - `fs_create_directory`
+  - `fs_tree`
+  - `fs_stat`
+  - `fs_glob`
+  - `local_search`
+- `build`, `install`, `install_dependencies`, and `build_install` acknowledgements for backend/server-mediated build/install paths; the Go CLI does not yet run the browser-side SDK build/install pipeline locally.
+
+Glider VFS behavior:
+
+- Uses `/api/sn_glider/v2/sync/state`, `/api/sn_glider/v2/sync/files`, and multipart `/api/sn_glider/v2/sync/changes/apply` for remote app workspace state/content.
+- Resolves relative paths inside the active app root and rejects paths escaping that root.
+- Blocks XML writes.
+- Normalizes multipart `create`, `update`, and `remove` change lists to JSON arrays (`[]`) instead of `null`, matching the backend's expected shape and avoiding the observed `sync/changes/apply` HTTP 500/null-list failure mode.
+- If `fs_write_file` or `fs_create_directory` receives a Glider apply error after the backend persisted the object, the CLI verifies remote content/state and returns success with a warning instead of reporting a false tool failure.
+
+Implemented `run_diagnostics` behavior:
+
+- Syncs the active Glider app/project into a temporary local directory.
+- Validates up to 10 requested `.ts`, `.tsx`, `.js`, or `.jsx` files.
+- Locates `node_modules/.bin/tsc` in the synced project or `tsc` on `PATH`.
+- Runs local TypeScript diagnostics with `tsc --noEmit --pretty false` and returns captured diagnostics.
+- If `tsc` is unavailable, prints `run_diagnostics: TypeScript compiler 'tsc' was not found in PATH or project node_modules/.bin; local diagnostics could not run.` on the terminal and returns code `TSC_NOT_FOUND`.
+
+Implemented `fluent_topics_list` parity path:
+
+- Resolves `payload.appId` or the active app id to `now-file:/<app_sys_id>`.
+- Checks for a Fluent project through `now.config.json`.
+- Scans Glider state under `node_modules/@servicenow/sdk/docs`.
+- Reads Markdown docs through Glider sync files.
+- Extracts a topic name from each Markdown basename and a summary from the first paragraph after the first heading.
+- Returns JSON `[{"name":"...","summary":"..."}]` in `content` for `fluent-overview` and `*-guide` topics.
+- Returns Web-extension-style errors such as `NO_FLUENT_PROJECT` and `SDK_VERSION_TOO_OLD` for missing project/old SDK docs cases.
+
+## 18. Debugging and redaction
 
 Implemented debug redaction:
 
@@ -601,7 +669,7 @@ Implemented non-redaction for safe metrics:
 
 `--session-status` reports saved session metadata without printing secret values.
 
-## 18. Script and pipe behavior
+## 19. Script and pipe behavior
 
 Implemented non-interactive guarantees:
 
@@ -609,20 +677,23 @@ Implemented non-interactive guarantees:
 - Non-interactive legacy `/conversation list` prints plain list output rather than opening picker.
 - Scripted `--prompt` skips startup conversation selection unless `--conversation` is explicitly provided.
 - Status bar is not injected into pipe/CI output.
-- Usage lines remain available in non-interactive/debug output.
+- Usage lines remain available in non-interactive output and are copied into debug logs when `-debug <filename>` is active.
 - Terminal Markdown renderer avoids TTY-only ANSI decoration when not interactive.
 
-## 19. Known intentionally limited areas
+## 20. Known intentionally limited areas
 
 Implemented but intentionally limited:
 
-- Local filesystem tools are guarded/safe stubs; the CLI does not expose broad local file access as Build Agent tools.
+- Glider filesystem actions operate on the remote ServiceNow app workspace (`now-file:/<app_sys_id>`), not arbitrary local host paths.
 - `--advertise-local-tools` remains experimental and should stay off for normal backend/MCP use.
+- `build`/`install` client elicitations are currently acknowledged for the backend/server-mediated flow; the Go CLI does not yet run the browser-side SDK build/install pipeline locally.
+- `run_diagnostics` depends on a locally available TypeScript compiler in the synced project or on `PATH`; missing `tsc` is reported visibly as `TSC_NOT_FOUND`.
+- `fluent_topics_list` depends on SDK docs being present in the Glider project tree. A current observed bug can falsely return `NO_FLUENT_PROJECT` when exact-file Glider state lookup misses `now.config.json` even though root state shows it; the fix direction is to verify `now.config.json` from root app state or direct file fetch.
 - Legacy `/send` streaming is not faked when the backend returns blocking JSON.
 - WDF tool schemas are not exposed client-side by `/mcp list`; Forge loads pass-through tools after the Nirvana handshake, matching the web client behavior.
 - Code Assist websocket mode is diagnostic/experimental, not the normal Build Agent path.
 
-## 20. Current validation coverage
+## 21. Current validation coverage
 
 Regression and smoke coverage implemented across the project includes:
 
@@ -646,18 +717,25 @@ Regression and smoke coverage implemented across the project includes:
 - submitted prompt transcript formatting
 - prompt submit/reset timing
 - non-interactive script-safe behavior
+- Web UI-style app creation REST/Glider orchestration
+- Glider `sync/changes/apply` nil-list normalization
+- Glider FS post-error persistence verification
+- local `run_diagnostics` missing-`tsc` and compiler-error behavior
+- two-line tool-result terminal rendering
+- `Building...` / `Connecting...` animations
+- `fluent_topics_list` catalog scanning/error cases
 
 Recent manual/PTYS smokes confirmed:
 
 - footer remains pinned while typing and streaming
-- `Working ...` appears above the 3-row prompt band
+- `Building...` appears above the 3-row prompt band
 - status row stays at bottom and updates usage
 - assistant output stays in scrollback, not row 1
 - submitted prompt appears immediately as a gray prompt block
 - footer prompt resets to empty while waiting
 
 
-Interactive Nirvana tool events: successful `tool_result` events render as a green `✓ <tool>` line in the managed transcript; failed results render as a red `✗ <tool>` line. Tool call IDs are tracked so result events can display the original tool name.
+Interactive Nirvana tool events: successful `tool_result` events render as a green `✓ <tool>` line in the managed transcript; failed results render as a red `✗ <tool>` line. Tool call IDs are tracked so result events can display the original tool name. When a short result summary is available, it is rendered on the row below the green/red tool name in neutral table-text color, not appended to the tool-name line.
 
 
 Committed transcript entries now use an opencode-inspired append model: submitted prompts, tool results, and final assistant rows are appended as new stable rows into the terminal scrollback instead of repainting the full transcript. Streaming assistant output commits newly stable rendered rows progressively and leaves the unstable tail until the next row/final completion. Resize remains the only path that rebuilds alternate-screen scrollback from the semantic transcript.
@@ -666,7 +744,7 @@ Committed transcript entries now use an opencode-inspired append model: submitte
 Markdown table blocks are held until stable while streaming: once a potential table is detected, the CLI commits only the blank-line-delimited stable prefix before the table; the completed table is appended after the block/final response is available so later rows cannot invalidate already-committed column widths.
 
 
-The animated `Working ...` indicator remains active while assistant output streams and is cleared only when the turn-end/finalization path runs.
+The animated `Building...` indicator remains active while assistant output streams and is cleared only when the turn-end/finalization path runs.
 
 ## Multi-instance profiles
 

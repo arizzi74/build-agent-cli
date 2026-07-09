@@ -190,7 +190,7 @@ func handleConversationCommand(parent context.Context, c *Client, args []string)
 		if err != nil {
 			return err
 		}
-		if term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd())) {
+		if term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(terminalStderrFD()) {
 			return c.SelectWebConversation(ctx, conversations, true)
 		}
 		printConversationList(conversations, c.conversationID)
@@ -248,9 +248,7 @@ func handleWorkspaceCommand(parent context.Context, c *Client, args []string) er
 				printWebWorkspaceList(webWorkspaces, c.workspaceName, c.workspaceURI)
 				return nil
 			}
-			if c.debug {
-				slashCommandPrintf("warning: could not list web workspaces: %v\n", err)
-			}
+			c.debugf("warning: could not list web workspaces: %v\n", err)
 		}
 		workspaces, err := listWorkspaces(c.opts.Profile)
 		if err != nil {
@@ -297,10 +295,10 @@ func handleWorkspaceCommand(parent context.Context, c *Client, args []string) er
 				if ws, err := resolveWebWorkspaceSelector(webWorkspaces, selector); err == nil {
 					return c.SwitchWebWorkspace(ctx, ws)
 				} else if c.debug {
-					slashCommandPrintf("warning: could not resolve web workspace: %v\n", err)
+					c.debugf("warning: could not resolve web workspace: %v\n", err)
 				}
 			} else if c.debug {
-				slashCommandPrintf("warning: could not list web workspaces: %v\n", err)
+				c.debugf("warning: could not list web workspaces: %v\n", err)
 			}
 		}
 		return c.SwitchWorkspace(selector, false)
@@ -366,6 +364,7 @@ func handleAppCommand(parent context.Context, c *Client, args []string) error {
 		if err := c.SetApp(app); err != nil {
 			return err
 		}
+		_ = c.ensureActiveAppMetadata(ctx)
 		slashCommandPrintf("app set: %s\n", app.ScopeID)
 		return nil
 	case "clear", "unset":
@@ -383,6 +382,9 @@ func printApp(app *AppScope) {
 	slashCommandPrintf("app scope: %s\n", app.ScopeID)
 	if app.ScopeName != "" {
 		slashCommandPrintf("app name: %s\n", app.ScopeName)
+	}
+	if app.Scope != "" {
+		slashCommandPrintf("service now scope: %s\n", app.Scope)
 	}
 	if app.AppSysID != "" {
 		slashCommandPrintf("app sys_id: %s\n", app.AppSysID)

@@ -340,14 +340,14 @@ func terminalANSIEnabled() bool {
 	if os.Getenv("NO_COLOR") != "" || strings.EqualFold(os.Getenv("TERM"), "dumb") {
 		return false
 	}
-	return term.IsTerminal(int(os.Stdout.Fd()))
+	return term.IsTerminal(terminalStdoutFD())
 }
 
 func terminalStatusANSIEnabled() bool {
 	if os.Getenv("NO_COLOR") != "" || strings.EqualFold(os.Getenv("TERM"), "dumb") {
 		return false
 	}
-	return term.IsTerminal(int(os.Stderr.Fd()))
+	return term.IsTerminal(terminalStderrFD())
 }
 
 func interactiveTerminalUIEnabled() bool {
@@ -355,7 +355,7 @@ func interactiveTerminalUIEnabled() bool {
 }
 
 func terminalStatusWidth() int {
-	width, _, err := term.GetSize(int(os.Stderr.Fd()))
+	width, _, err := term.GetSize(terminalStderrFD())
 	if err != nil || width < 50 {
 		return 100
 	}
@@ -402,7 +402,7 @@ func terminalFooterMetricsForTTY() (terminalFooterMetrics, bool) {
 	if !interactiveTerminalUIEnabled() {
 		return terminalFooterMetrics{}, false
 	}
-	width, height, err := term.GetSize(int(os.Stderr.Fd()))
+	width, height, err := term.GetSize(terminalStderrFD())
 	if err != nil || width < 20 || height < 9 {
 		return terminalFooterMetrics{}, false
 	}
@@ -799,11 +799,23 @@ func fitStatusBarText(text string, width int) string {
 }
 
 func workingStatusText(color bool) string {
-	return style("Working ...", ansiWasabiGreen, color)
+	return style("Building...", ansiWasabiGreen, color)
 }
 
 func animatedWorkingStatus(frame int) string {
-	text := []rune("Working ...")
+	return animatedBuildingStatus(frame)
+}
+
+func animatedBuildingStatus(frame int) string {
+	return animatedStatusText("Building...", frame)
+}
+
+func animatedConnectingStatus(frame int) string {
+	return animatedStatusText("Connecting...", frame)
+}
+
+func animatedStatusText(label string, frame int) string {
+	text := []rune(label)
 	if len(text) == 0 {
 		return ""
 	}
@@ -825,8 +837,43 @@ func animatedWorkingStatus(frame int) string {
 	return out.String()
 }
 
+func startTerminalConnectingStatus() func() {
+	return startTerminalInlineAnimatedStatus("Connecting...")
+}
+
+func startTerminalInlineAnimatedStatus(label string) func() {
+	if !terminalStatusANSIEnabled() {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(110 * time.Millisecond)
+		defer ticker.Stop()
+		frame := 0
+		for {
+			fmt.Fprintf(os.Stderr, "\r\x1b[2K%s", animatedStatusText(label, frame))
+			frame++
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+			fmt.Fprint(os.Stderr, "\r\x1b[2K")
+		})
+	}
+}
+
 func terminalOutputWidth() int {
-	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	width, _, err := term.GetSize(terminalStdoutFD())
 	if err != nil || width < 50 {
 		return 100
 	}

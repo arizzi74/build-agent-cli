@@ -50,6 +50,44 @@ func TestParseFlagsCodeAssistDisablesNirvana(t *testing.T) {
 	}
 }
 
+func TestParseFlagsDebugFileShortFormEnablesDebug(t *testing.T) {
+	opts := parseFlagsForTest(t, "-debug", "trace.log")
+	if !opts.Debug {
+		t.Fatalf("-debug <file> should enable debug")
+	}
+	if opts.DebugFile != "trace.log" {
+		t.Fatalf("DebugFile = %q, want trace.log", opts.DebugFile)
+	}
+}
+
+func TestParseFlagsDebugFileEqualsFormEnablesDebug(t *testing.T) {
+	opts := parseFlagsForTest(t, "--debug=/tmp/ba-trace.log")
+	if !opts.Debug {
+		t.Fatalf("--debug=<file> should enable debug")
+	}
+	if opts.DebugFile != "/tmp/ba-trace.log" {
+		t.Fatalf("DebugFile = %q, want /tmp/ba-trace.log", opts.DebugFile)
+	}
+}
+
+func TestParseFlagsDebugFileFlagEnablesDebug(t *testing.T) {
+	opts := parseFlagsForTest(t, "--debug-file", "trace.log")
+	if !opts.Debug {
+		t.Fatalf("--debug-file should enable debug")
+	}
+	if opts.DebugFile != "trace.log" {
+		t.Fatalf("DebugFile = %q, want trace.log", opts.DebugFile)
+	}
+}
+
+func TestExtractDebugFileArgRejectsBareDebug(t *testing.T) {
+	for _, args := range [][]string{{"--debug"}, {"--debug", "--profile-list"}, {"--debug=false"}} {
+		if _, _, err := extractDebugFileArg(args); err == nil {
+			t.Fatalf("extractDebugFileArg(%v) error = nil, want error", args)
+		}
+	}
+}
+
 func TestStartupReadyFooterMessageIsCompactAndInstanceFree(t *testing.T) {
 	message := startupReadyFooterMessage()
 	if strings.Contains(message, "service-now.com") || strings.Contains(message, "https://") || strings.Contains(message, "instance") {

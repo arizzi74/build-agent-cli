@@ -566,7 +566,7 @@ func (c *Client) conversationListApplicationIDs(ctx context.Context) ([]string, 
 		}
 	}
 	if err := c.ensureWorkspaceFoldersForAppPicker(ctx); err != nil && c.debug {
-		fmt.Fprintf(os.Stderr, "[conversation list] workspace app refresh skipped: %v\n", err)
+		c.debugf("[conversation list] workspace app refresh skipped: %v\n", err)
 	}
 	workspaceScoped := strings.TrimSpace(c.workspaceURI) != "" || len(c.workspaceFolders) > 0 || c.workingSet != nil
 	for _, folder := range c.workspaceFolders {
@@ -731,7 +731,7 @@ func (c *Client) ListWebConversations(ctx context.Context) ([]WebConversation, e
 		if err != nil {
 			lastErr = err
 			if c.debug {
-				fmt.Fprintf(os.Stderr, "[conversation list] %s failed status=%d fallback=%v\n", endpoint, status, shouldFallbackToConversationTables(status, body))
+				c.debugf("[conversation list] %s failed status=%d fallback=%v\n", endpoint, status, shouldFallbackToConversationTables(status, body))
 			}
 			if shouldFallbackToConversationTables(status, body) {
 				continue
@@ -740,14 +740,14 @@ func (c *Client) ListWebConversations(ctx context.Context) ([]WebConversation, e
 		}
 		conversations := filterWebConversationsForWorkspaceApplications(parseWebConversations(body), candidate.applicationIDs, workspaceScoped)
 		if c.debug {
-			fmt.Fprintf(os.Stderr, "[conversation list] %s status=%d count=%d\n", endpoint, status, len(conversations))
+			c.debugf("[conversation list] %s status=%d count=%d\n", endpoint, status, len(conversations))
 		}
 		if len(conversations) > 0 {
 			if tableConversations, err := c.listTableConversations(ctx); err == nil && len(tableConversations) > 0 {
 				tableConversations = filterWebConversationsForWorkspaceApplications(tableConversations, candidate.applicationIDs, workspaceScoped)
 				conversations = mergeWebConversations(conversations, tableConversations)
 			} else if err != nil && c.debug {
-				fmt.Fprintf(os.Stderr, "[conversation list] table merge skipped: %v\n", err)
+				c.debugf("[conversation list] table merge skipped: %v\n", err)
 			}
 			return conversations, nil
 		}
@@ -983,7 +983,7 @@ func (c *Client) UseWebConversation(ctx context.Context, conv WebConversation) e
 	if messages, err := c.fetchWebConversationMessages(ctx, c.conversationID); err == nil {
 		c.history = messages
 	} else if c.debug && !errors.Is(err, errWebConversationNotFound) {
-		fmt.Fprintf(os.Stderr, "warning: could not load conversation messages: %v\n", err)
+		c.debugf("warning: could not load conversation messages: %v\n", err)
 	}
 	if err := c.saveCurrentState(); err != nil {
 		return err
@@ -1016,11 +1016,12 @@ func (c *Client) applyWebConversationApp(ctx context.Context, conv WebConversati
 			}
 		}
 	} else if c.debug {
-		fmt.Fprintf(os.Stderr, "warning: could not match conversation app to workspace apps: %v\n", err)
+		c.debugf("warning: could not match conversation app to workspace apps: %v\n", err)
 	}
 	c.currentApp = &app
 	c.appScope = app.ScopeID
-	return saveActiveApp(c.opts.Profile, app)
+	_ = c.ensureActiveAppMetadata(ctx)
+	return saveActiveApp(c.opts.Profile, *c.currentApp)
 }
 
 func (c *Client) restoreSavedWebConversation(ctx context.Context) {
@@ -1038,21 +1039,21 @@ func (c *Client) restoreSavedWebConversation(ctx context.Context) {
 	conv, err := c.getWebConversation(ctx, conversationID)
 	if err != nil {
 		if c.debug && !errors.Is(err, errWebConversationNotFound) {
-			fmt.Fprintf(os.Stderr, "warning: could not refresh saved conversation %s: %v\n", shortConversationID(conversationID), err)
+			c.debugf("warning: could not refresh saved conversation %s: %v\n", shortConversationID(conversationID), err)
 		}
 		return
 	}
 	c.applyWebConversation(conv, false)
 	if err := c.applyWebConversationApp(ctx, conv); err != nil && c.debug {
-		fmt.Fprintf(os.Stderr, "warning: could not restore saved conversation app: %v\n", err)
+		c.debugf("warning: could not restore saved conversation app: %v\n", err)
 	}
 	if messages, err := c.fetchWebConversationMessages(ctx, c.conversationID); err == nil {
 		c.history = messages
 	} else if c.debug && !errors.Is(err, errWebConversationNotFound) {
-		fmt.Fprintf(os.Stderr, "warning: could not refresh saved conversation messages: %v\n", err)
+		c.debugf("warning: could not refresh saved conversation messages: %v\n", err)
 	}
 	if err := c.saveCurrentState(); err != nil && c.debug {
-		fmt.Fprintf(os.Stderr, "warning: could not save restored conversation state: %v\n", err)
+		c.debugf("warning: could not save restored conversation state: %v\n", err)
 	}
 }
 
@@ -1086,6 +1087,11 @@ func (c *Client) StartNewWebConversation(ctx context.Context) error {
 	c.conversationTitle = ""
 	c.conversationState = ""
 	c.serverConversation = false
+	c.currentApp = nil
+	c.appScope = nil
+	if err := deleteActiveApp(c.opts.Profile); err != nil {
+		return err
+	}
 	c.pendingUserContent = ""
 	c.resetWebStream()
 	c.updateAMBChannelForConversation()

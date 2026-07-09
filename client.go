@@ -160,7 +160,11 @@ func (c *Client) applyWorkspace(ws WorkspaceState) {
 	c.usageInputTokens = ws.UsageInputTokens
 	c.usageOutputTokens = ws.UsageOutputTokens
 	c.usageThinkingTokens = ws.UsageThinkingTokens
-	c.workingSet = ws.WorkingSet
+	if workingSet, ok := nirvanaOutboundWorkingSet(ws.WorkingSet); ok {
+		c.workingSet = workingSet
+	} else {
+		c.workingSet = nil
+	}
 	c.workspaceURI = ws.WebWorkspaceURI
 	c.workspaceChecksum = ws.WebWorkspaceChecksum
 	c.workspaceDescription = ws.WebWorkspaceDescription
@@ -196,7 +200,7 @@ func (c *Client) WorkspaceState() WorkspaceState {
 		UsageInputTokens:        c.usageInputTokens,
 		UsageOutputTokens:       c.usageOutputTokens,
 		UsageThinkingTokens:     c.usageThinkingTokens,
-		WorkingSet:              c.workingSet,
+		WorkingSet:              persistentNirvanaWorkingSet(c.workingSet),
 		AppScope:                c.appScope,
 		App:                     c.currentApp,
 	}
@@ -265,11 +269,16 @@ func (c *Client) CurrentApp() *AppScope {
 
 func (c *Client) SetApp(app AppScope) error {
 	app.ScopeID = strings.TrimSpace(app.ScopeID)
+	app.Scope = strings.TrimSpace(app.Scope)
+	app.AppSysID = strings.TrimSpace(app.AppSysID)
 	if app.ScopeID == "" {
 		return errors.New("scope id is required")
 	}
 	if app.ScopeName == "" {
 		app.ScopeName = app.ScopeID
+	}
+	if app.AppSysID == "" {
+		app.AppSysID = app.ScopeID
 	}
 	c.currentApp = &app
 	c.appScope = app.ScopeID
@@ -301,7 +310,7 @@ func (c *Client) absorbAppScope(v interface{}) {
 	switch typed := v.(type) {
 	case string:
 		if typed != "" && (c.currentApp == nil || c.currentApp.ScopeID != typed) {
-			c.currentApp = &AppScope{ScopeID: typed, ScopeName: typed}
+			c.currentApp = &AppScope{ScopeID: typed, ScopeName: typed, AppSysID: typed}
 			_ = saveActiveApp(c.opts.Profile, *c.currentApp)
 		}
 	case map[string]interface{}:
@@ -415,13 +424,16 @@ func (c *Client) SendMessage(ctx context.Context, content string) error {
 	if err != nil {
 		return err
 	}
+	if !c.opts.CodeAssistWS {
+		_ = c.ensureActiveAppMetadata(ctx)
+	}
 	mcpServers := c.nirvanaMCPServerPayload(ctx)
 	payload := map[string]interface{}{
 		"type":                "message",
 		"conversation_id":     c.conversationID,
 		"content":             content,
 		"conversationHistory": nirvanaConversationHistory(c.history),
-		"ideContext":          emptyIDEContext(),
+		"ideContext":          c.currentIDEContext(),
 		"images":              []interface{}{},
 		"attachments":         []interface{}{},
 		"isGreeting":          false,
@@ -431,11 +443,11 @@ func (c *Client) SendMessage(ctx context.Context, content string) error {
 		"invokeOptions":       invokeOptions,
 		"params":              params,
 	}
-	if c.appScope != nil {
-		payload["appScope"] = c.appScope
+	if appScope, ok := c.nirvanaOutboundAppScope(); ok {
+		payload["appScope"] = appScope
 	}
-	if c.workingSet != nil {
-		payload["workingSet"] = c.workingSet
+	if workingSet, ok := nirvanaOutboundWorkingSet(c.workingSet); ok {
+		payload["workingSet"] = workingSet
 	}
 
 	if err := c.ensureWebConversationWithTitle(ctx, content); err != nil {
@@ -618,9 +630,7 @@ func (c *Client) sendGatewayMessage(ctx context.Context, content string) error {
 	streamReady := false
 	if c.canUseAMB() {
 		if err := c.retryAMBSubscribe(ctx, 15*time.Second); err != nil {
-			if c.debug {
-				fmt.Fprintf(os.Stderr, "warning: AMB subscribe before send failed; will continue without live stream: %v\n", err)
-			}
+			c.debugf("warning: AMB subscribe before send failed; will continue without live stream: %v\n", err)
 		} else {
 			streamReady = true
 		}
@@ -688,7 +698,7 @@ func (c *Client) sendGatewayMessage(ctx context.Context, content string) error {
 		}
 	}
 	if c.debug && len(body) > 0 {
-		fmt.Fprintf(os.Stderr, "\n[gateway] %s\n", trimBody(body))
+		c.debugf("\n[gateway] %s\n", trimBody(body))
 	}
 	return nil
 }
@@ -739,7 +749,7 @@ func (c *Client) fetchWebAgentConfig(ctx context.Context) (WebAgentConfig, error
 	}
 	if fallback.Model != "" && fallback.ProviderURL != "" && fallback.SkillID != "" {
 		if c.debug && lastErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: using fallback agent config after config API failure: %v\n", lastErr)
+			c.debugf("warning: using fallback agent config after config API failure: %v\n", lastErr)
 		}
 		return fallback, nil
 	}
@@ -763,9 +773,7 @@ func (c *Client) tryLoadNirvanaWebAgentConfig(ctx context.Context) {
 	c.applyWebSession(session)
 	cfg, err := c.fetchWebAgentConfig(ctx)
 	if err != nil {
-		if c.debug {
-			fmt.Fprintf(os.Stderr, "warning: could not load web provider config for Nirvana websocket: %v\n", err)
-		}
+		c.debugf("warning: could not load web provider config for Nirvana websocket: %v\n", err)
 		return
 	}
 	c.webAgentConfig = cfg
@@ -829,12 +837,83 @@ func firstString(m map[string]interface{}, keys ...string) string {
 	return ""
 }
 
+func (c *Client) nirvanaOutboundAppScope() (map[string]interface{}, bool) {
+	if c.currentApp != nil {
+		return appScopeObject(*c.currentApp), true
+	}
+	if m := asMap(c.appScope); m != nil {
+		if app := appFromPayload(m); app != nil {
+			return appScopeObject(*app), true
+		}
+		return nil, false
+	}
+	if scopeID := strings.TrimSpace(stringify(c.appScope)); scopeID != "" {
+		return appScopeObject(AppScope{ScopeID: scopeID, ScopeName: scopeID, AppSysID: scopeID}), true
+	}
+	return nil, false
+}
+
+func appScopeObject(app AppScope) map[string]interface{} {
+	app.ScopeID = strings.TrimSpace(app.ScopeID)
+	app.ScopeName = strings.TrimSpace(app.ScopeName)
+	app.Scope = strings.TrimSpace(app.Scope)
+	app.AppSysID = strings.TrimSpace(app.AppSysID)
+	if app.AppSysID == "" {
+		app.AppSysID = app.ScopeID
+	}
+	out := map[string]interface{}{
+		"scopeId":  app.ScopeID,
+		"appSysId": app.AppSysID,
+	}
+	if scope := serviceNowScopeFromApp(app); scope != "" {
+		out["scopeName"] = scope
+		out["scope"] = scope
+	}
+	if app.ScopeName != "" && app.ScopeName != out["scopeName"] {
+		out["appName"] = app.ScopeName
+	}
+	if _, ok := out["scopeName"]; !ok && app.ScopeName != "" {
+		out["scopeName"] = app.ScopeName
+	}
+	return out
+}
+
+func nirvanaOutboundWorkingSet(v interface{}) ([]interface{}, bool) {
+	if v == nil {
+		return nil, false
+	}
+	items, ok := v.([]interface{})
+	if !ok {
+		return nil, false
+	}
+	out := make([]interface{}, 0, len(items))
+	for _, item := range items {
+		m := asMap(item)
+		if m == nil {
+			return nil, false
+		}
+		if firstString(m, "table") == "" || firstString(m, "sysId") == "" || firstString(m, "scopeId") == "" {
+			return nil, false
+		}
+		out = append(out, item)
+	}
+	return out, true
+}
+
+func persistentNirvanaWorkingSet(v interface{}) interface{} {
+	workingSet, ok := nirvanaOutboundWorkingSet(v)
+	if !ok || len(workingSet) == 0 {
+		return nil
+	}
+	return workingSet
+}
+
 func emptyIDEContext() map[string]interface{} {
 	return map[string]interface{}{
 		"currentFile":      "",
 		"currentDir":       "",
 		"selectedText":     "",
-		"workspaceFolders": []interface{}{},
+		"workspaceFolders": []string{},
 		"openEditors":      []interface{}{},
 	}
 }
@@ -876,7 +955,7 @@ func (c *Client) nirvanaMCPServerPayload(ctx context.Context) []MCPServer {
 	}
 	servers, err := c.fetchWDFMCPServers(ctx)
 	if err != nil && c.debug {
-		fmt.Fprintf(os.Stderr, "warning: could not discover WDF MCP servers; using static Glider MCP defaults: %v\n", err)
+		c.debugf("warning: could not discover WDF MCP servers; using static Glider MCP defaults: %v\n", err)
 	}
 	servers = mergeMCPServers(servers, gliderStaticMCPServers())
 	c.nirvanaMCPServers = cloneMCPServers(servers)
@@ -1301,7 +1380,7 @@ func (c *Client) printLegacyBuildAgentResponse(ctx context.Context, body []byte,
 		}
 	}
 	if !printed && c.debug {
-		fmt.Fprintf(os.Stderr, "\n[gateway] %s\n", trimBody(body))
+		c.debugf("\n[gateway] %s\n", trimBody(body))
 	}
 	if strings.TrimSpace(userContent) != "" {
 		c.history = append(c.history, map[string]interface{}{"role": "user", "content": userContent})
@@ -1349,12 +1428,20 @@ func (c *Client) postJSON(ctx context.Context, endpoint string, payload interfac
 	return body, res.StatusCode, nil
 }
 
+func (c *Client) putJSON(ctx context.Context, endpoint string, payload interface{}) ([]byte, int, error) {
+	return c.sendJSON(ctx, http.MethodPut, endpoint, payload, "gateway PUT")
+}
+
 func (c *Client) patchJSON(ctx context.Context, endpoint string, payload interface{}) ([]byte, int, error) {
+	return c.sendJSON(ctx, http.MethodPatch, endpoint, payload, "gateway PATCH")
+}
+
+func (c *Client) sendJSON(ctx context.Context, method, endpoint string, payload interface{}, label string) ([]byte, int, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return nil, 0, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, endpoint, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(raw))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1368,7 +1455,7 @@ func (c *Client) patchJSON(ctx context.Context, endpoint string, payload interfa
 	defer res.Body.Close()
 	body, _ := io.ReadAll(res.Body)
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return body, res.StatusCode, fmt.Errorf("gateway PATCH failed (%d): %s", res.StatusCode, trimBody(body))
+		return body, res.StatusCode, fmt.Errorf("%s failed (%d): %s", label, res.StatusCode, trimBody(body))
 	}
 	return body, res.StatusCode, nil
 }
@@ -1703,7 +1790,7 @@ func (c *Client) bayeuxPost(ctx context.Context, raw []byte, form bool) ([]map[s
 		}
 	}
 	if c.debug {
-		fmt.Fprintf(os.Stderr, "\n[amb] %s\n", redactDebugJSONBytes(respBody))
+		c.debugf("\n[amb] %s\n", redactDebugJSONBytes(respBody))
 	}
 	return arr, nil
 }
@@ -1820,14 +1907,6 @@ func (c *Client) printGatewayStreamUpdate(chunk string) {
 	if c.webStreamText == "" {
 		return
 	}
-	if c.debug {
-		// Debug mode prints raw websocket frames to stderr. In-place terminal
-		// repainting makes combined debug logs look duplicated/garbled, so stream
-		// plain chunks while debugging and keep the live renderer for normal use.
-		fmt.Print(chunk)
-		c.webStreamPlain = true
-		return
-	}
 	if terminalLiveStreamEnabled() {
 		// opencode-style streaming: commit only newly stable rendered rows to the
 		// terminal scrollback. Avoid repainting the whole transcript on every chunk.
@@ -1935,7 +2014,7 @@ func (c *Client) printAssistantStreamBullet() {
 }
 
 func (c *Client) showTurnStatus() {
-	if c.debug || !terminalStatusANSIEnabled() {
+	if !terminalStatusANSIEnabled() {
 		return
 	}
 	c.statusMu.Lock()
@@ -1952,11 +2031,11 @@ func (c *Client) showTurnStatus() {
 	go c.animateTurnStatus(stop, done)
 }
 
-func (c *Client) clearTurnStatus() {
+func (c *Client) clearTurnStatus() bool {
 	c.statusMu.Lock()
 	if !c.turnStatusActive {
 		c.statusMu.Unlock()
-		return
+		return false
 	}
 	stop := c.turnStatusStop
 	done := c.turnStatusDone
@@ -1979,6 +2058,15 @@ func (c *Client) clearTurnStatus() {
 		}
 	}
 	c.statusMu.Unlock()
+	return true
+}
+
+func (c *Client) ensureTurnStatusVisible() bool {
+	if !c.processing || c.turnDone == nil {
+		return false
+	}
+	c.showTurnStatus()
+	return true
 }
 
 func (c *Client) animateTurnStatus(stop <-chan struct{}, done chan<- struct{}) {
@@ -1990,9 +2078,9 @@ func (c *Client) animateTurnStatus(stop <-chan struct{}, done chan<- struct{}) {
 		c.statusMu.Lock()
 		if terminalStatusANSIEnabled() {
 			if interactiveTerminalUIEnabled() {
-				drawTerminalFooterWorkingLine(animatedWorkingStatus(frame), c.statusBarState())
+				drawTerminalFooterWorkingLine(animatedBuildingStatus(frame), c.statusBarState())
 			} else {
-				fmt.Fprintf(os.Stderr, "\r\x1b[2K%s", animatedWorkingStatus(frame))
+				fmt.Fprintf(os.Stderr, "\r\x1b[2K%s", animatedBuildingStatus(frame))
 			}
 		}
 		c.statusMu.Unlock()
@@ -2006,7 +2094,7 @@ func (c *Client) animateTurnStatus(stop <-chan struct{}, done chan<- struct{}) {
 }
 
 func (c *Client) finishGatewayStreamOutput() {
-	// Keep the animated Working indicator alive while text streams; clear it only
+	// Keep the animated Building indicator alive while text streams; clear it only
 	// when the server closes the turn and final output is committed.
 	c.clearTurnStatus()
 	assistantText := strings.TrimSpace(c.webStreamText)
@@ -2261,7 +2349,7 @@ func (c *Client) writeJSON(v interface{}) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if c.debug {
-		fmt.Fprintf(os.Stderr, "\n>>> %s\n", redactDebugJSON(v))
+		c.debugf("\n>>> %s\n", redactDebugJSON(v))
 	}
 	return c.conn.WriteJSON(v)
 }
@@ -2287,7 +2375,7 @@ func (c *Client) readGatewayWebSocketLoop() {
 			return
 		}
 		if c.debug {
-			fmt.Fprintf(os.Stderr, "\n<<< %s\n", redactDebugJSONBytes(data))
+			c.debugf("\n<<< %s\n", redactDebugJSONBytes(data))
 		}
 		if err := c.handleGatewayWebSocketEvent(data); err != nil {
 			fmt.Fprintf(os.Stderr, "event handling error: %v\n", err)
@@ -2346,7 +2434,7 @@ func (c *Client) handleGatewayWebSocketEvent(data []byte) error {
 			return c.handleGatewayCompleteMessage(event, typeName, body)
 		}
 		if c.debug {
-			fmt.Fprintf(os.Stderr, "\n[unhandled websocket message] status=%s type=%s\n", status, typeName)
+			c.debugf("\n[unhandled websocket message] status=%s type=%s\n", status, typeName)
 		}
 	}
 	return nil
@@ -2376,7 +2464,7 @@ func (c *Client) handleGatewayCompleteMessage(event map[string]interface{}, type
 		c.appendCodeAssistAssistantMessage(event)
 		name, inputs := codeAssistToolUse(body)
 		if name != "" && c.debug {
-			fmt.Fprintf(os.Stderr, "\n[client tool] %s\n", name)
+			c.debugf("\n[client tool] %s\n", name)
 		}
 		if name == "interview" {
 			c.clearTurnStatus()
@@ -2465,7 +2553,7 @@ func (c *Client) recordToolCall(event map[string]interface{}) (string, string) {
 	return name, callID
 }
 
-func (c *Client) recordToolResult(event map[string]interface{}) (string, string, bool) {
+func (c *Client) recordToolResult(event map[string]interface{}) (string, string, bool, string) {
 	callID := eventToolCallID(event)
 	name := eventToolName(event)
 	if name == "" && callID != "" && c.toolCallNames != nil {
@@ -2477,14 +2565,27 @@ func (c *Client) recordToolResult(event map[string]interface{}) (string, string,
 	if callID != "" && c.toolCallNames != nil {
 		delete(c.toolCallNames, callID)
 	}
-	return name, callID, eventToolSuccess(event)
+	return name, callID, eventToolSuccess(event), eventToolSummary(event)
 }
 
-func (c *Client) printToolResultStatus(name string, success bool) {
-	if terminalRecordToolResultAndAppend(name, success, c.statusBarState()) {
+func (c *Client) printToolResultStatus(name string, success bool, summary string) {
+	display := toolResultDisplay(name, summary)
+	if terminalRecordToolResultAndAppend(display, success, c.statusBarState()) {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\n%s\n", formatToolResultTerminal(name, success, terminalStatusANSIEnabled()))
+	fmt.Fprintf(os.Stderr, "\n%s\n", formatToolResultTerminal(display, success, terminalStatusANSIEnabled()))
+}
+
+func toolResultDisplay(name, summary string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "tool"
+	}
+	summary = truncateToolSummary(summary, 160)
+	if summary == "" {
+		return name
+	}
+	return name + "\n" + summary
 }
 
 func eventToolName(event map[string]interface{}) string {
@@ -2539,6 +2640,72 @@ func eventToolSuccess(event map[string]interface{}) bool {
 		}
 	}
 	return true
+}
+
+func eventToolSummary(event map[string]interface{}) string {
+	if summary := summarizeToolValue(event["error"], 0); summary != "" {
+		return summary
+	}
+	for _, key := range []string{"result", "tool_result", "toolResult", "body", "data", "payload"} {
+		if summary := summarizeToolValue(event[key], 0); summary != "" {
+			return summary
+		}
+	}
+	return ""
+}
+
+func summarizeToolValue(v interface{}, depth int) string {
+	if depth > 5 || v == nil {
+		return ""
+	}
+	switch typed := v.(type) {
+	case string:
+		text := strings.TrimSpace(typed)
+		if text == "" {
+			return ""
+		}
+		if (strings.HasPrefix(text, "{") && strings.HasSuffix(text, "}")) || (strings.HasPrefix(text, "[") && strings.HasSuffix(text, "]")) {
+			var parsed interface{}
+			if err := json.Unmarshal([]byte(text), &parsed); err == nil {
+				if summary := summarizeToolValue(parsed, depth+1); summary != "" {
+					return summary
+				}
+			}
+		}
+		return truncateToolSummary(text, 160)
+	case map[string]interface{}:
+		for _, key := range []string{"message", "error", "content", "result", "warning", "summary"} {
+			if summary := summarizeToolValue(typed[key], depth+1); summary != "" {
+				return summary
+			}
+		}
+	case []interface{}:
+		if len(typed) == 0 {
+			return ""
+		}
+		return summarizeToolValue(typed[0], depth+1)
+	case []string:
+		if len(typed) == 0 {
+			return ""
+		}
+		return summarizeToolValue(typed[0], depth+1)
+	}
+	return ""
+}
+
+func truncateToolSummary(summary string, maxRunes int) string {
+	summary = singleLineLabel(summary)
+	if maxRunes <= 0 {
+		return summary
+	}
+	runes := []rune(summary)
+	if len(runes) <= maxRunes {
+		return summary
+	}
+	if maxRunes <= 1 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-1]) + "…"
 }
 
 func eventCandidateMaps(event map[string]interface{}) []map[string]interface{} {
@@ -2601,7 +2768,7 @@ func (c *Client) readLoop() {
 			return
 		}
 		if c.debug {
-			fmt.Fprintf(os.Stderr, "\n<<< %s\n", redactDebugJSONBytes(data))
+			c.debugf("\n<<< %s\n", redactDebugJSONBytes(data))
 		}
 		if err := c.handleEvent(data); err != nil {
 			fmt.Fprintf(os.Stderr, "event handling error: %v\n", err)
@@ -2646,14 +2813,14 @@ func (c *Client) handleEvent(data []byte) error {
 	case "tool_call":
 		name, callID := c.recordToolCall(event)
 		if c.debug {
-			fmt.Fprintf(os.Stderr, "\n[tool call] %s %s\n", name, callID)
+			c.debugf("\n[tool call] %s %s\n", name, callID)
 		}
 	case "tool_result":
-		name, callID, success := c.recordToolResult(event)
+		name, callID, success, summary := c.recordToolResult(event)
 		if c.debug {
-			fmt.Fprintf(os.Stderr, "\n[tool result] %s success=%v\n", callID, success)
+			c.debugf("\n[tool result] %s success=%v\n", callID, success)
 		}
-		c.printToolResultStatus(name, success)
+		c.printToolResultStatus(name, success, summary)
 	case "client_elicitation":
 		return c.handleElicitation(event)
 	case "turn_summary":
@@ -2771,12 +2938,12 @@ func (c *Client) handleNirvanaStreamDelta(event map[string]interface{}) {
 	case "pending":
 		// Keep pending status off stdout so scripted output remains the assistant text only.
 		if c.debug {
-			fmt.Fprintf(os.Stderr, "\n[pending] %s\n", strings.TrimSpace(delta))
+			c.debugf("\n[pending] %s\n", strings.TrimSpace(delta))
 		}
 	default:
 		// Unknown stream types are rare; preserve visibility without breaking stdout.
 		if c.debug {
-			fmt.Fprintf(os.Stderr, "\n[%s] %s\n", contentType, strings.TrimSpace(delta))
+			c.debugf("\n[%s] %s\n", contentType, strings.TrimSpace(delta))
 		}
 	}
 }
@@ -2793,7 +2960,7 @@ func (c *Client) handleNirvanaStreamEnd(_ string, contentType string) {
 			duration = 0
 		}
 		if c.debug {
-			fmt.Fprintf(os.Stderr, "Finished thinking after %.1f seconds\n", duration.Seconds())
+			c.debugf("Finished thinking after %.1f seconds\n", duration.Seconds())
 		}
 		c.nirvanaThinkingDone = true
 	}
@@ -2921,10 +3088,9 @@ func (c *Client) clientCapabilities() map[string]interface{} {
 	}
 	if c.opts.Nirvana {
 		// Match the Glider Build Agent web client closely enough for the
-		// websocket runtime to send the same streaming event family observed in
-		// Chrome HARs. The corresponding client-side actions are handled with
-		// safe stubs below; the CLI does not execute arbitrary local filesystem
-		// tools.
+		// websocket runtime to send the same streaming/tool event family observed
+		// in Chrome HARs. Only specific safe client actions are implemented; the
+		// CLI does not execute arbitrary local filesystem tools.
 		caps["client_ide"] = map[string]interface{}{}
 		caps["elicitation"] = map[string]interface{}{}
 		caps["fluent_docs"] = map[string]interface{}{}
@@ -2952,7 +3118,7 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 	}
 
 	if c.debug {
-		fmt.Fprintf(os.Stderr, "\n[client request] %s\n", action)
+		c.debugf("\n[client request] %s\n", action)
 	}
 	var result map[string]interface{}
 	var status string
@@ -2965,19 +3131,48 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 		result, status, err = c.answerApproval(action, payload)
 	case "app_picker":
 		result, status, err = c.answerAppPicker(payload)
+	case "create_new_servicenow_app":
+		result, status, err = c.answerCreateNewServiceNowApp(payload)
 	case "set_app_scope":
 		result, status, err = c.answerSetAppScope(payload)
 	case "is_product_available":
 		result, status = map[string]interface{}{"available": true, "message": "Product is available."}, "complete"
 	case "fs_read_directory":
 		result, status = c.answerFSReadDirectory(payload)
+	case "fs_read_file":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
+			return c.answerGliderFSReadFile(ctx, payload)
+		})
+	case "fs_write_file":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
+			return c.answerGliderFSWriteFile(ctx, payload)
+		})
+	case "fs_create_directory":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
+			return c.answerGliderFSCreateDirectory(ctx, payload)
+		})
+	case "fs_tree":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) { return c.answerGliderFSTree(ctx, payload) })
+	case "fs_stat":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) { return c.answerGliderFSStat(ctx, payload) })
+	case "fs_glob":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) { return c.answerGliderFSGlob(ctx, payload) })
+	case "local_search":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
+			return c.answerGliderLocalSearch(ctx, payload)
+		})
+	case "run_diagnostics":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
+			return c.answerGliderRunDiagnostics(ctx, payload)
+		})
+	case "build", "install", "install_dependencies", "build_install":
+		result, status = c.answerGliderBuild(payload)
 	case "instance_skills_list":
 		result, status = map[string]interface{}{"content": "[]"}, "complete"
 	case "fluent_topics_list":
-		result, status = map[string]interface{}{
-			"error": "No active fluent project scope. Catalog will be available once an app is selected or created.",
-			"code":  "NO_FLUENT_PROJECT",
-		}, "error"
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
+			return c.answerFluentTopicsList(ctx, payload)
+		})
 	default:
 		result, status, err = c.answerUnknownElicitation(action, payload)
 	}
@@ -2985,17 +3180,21 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 		result = map[string]interface{}{"error": err.Error(), "code": "CLI_INPUT_ERROR"}
 		status = "error"
 	}
+	if len(c.toolCallNames) == 0 {
+		c.printToolResultStatus(action, status == "complete", summarizeToolValue(result, 0))
+	}
+	// Some client-side prompts (notably approvals) temporarily clear the animated
+	// Building footer so the blocking picker can own the terminal. Once the local
+	// answer is ready, restore the Building indicator before handing control back
+	// to the server; it should remain visible until turn_end/turn_error.
+	c.ensureTurnStatusVisible()
 	return c.sendElicitationResponse(elicitationID, status, result)
 }
 
 func (c *Client) answerFSReadDirectory(payload map[string]interface{}) (map[string]interface{}, string) {
-	msg := "Tool fs_read_directory requires an application to have been created - run `create_new_servicenow_app` before reattempting."
-	return map[string]interface{}{
-		"content":    msg,
-		"error":      msg,
-		"code":       "TOOL_ERROR",
-		"ideContext": emptyIDEContext(),
-	}, "error"
+	return c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
+		return c.answerGliderFSReadDirectory(ctx, payload)
+	})
 }
 
 func (c *Client) answerInterview(payload map[string]interface{}) (map[string]interface{}, string, error) {
@@ -3016,25 +3215,56 @@ func (c *Client) answerInterview(payload map[string]interface{}) (map[string]int
 }
 
 func (c *Client) answerApproval(action string, payload map[string]interface{}) (map[string]interface{}, string, error) {
-	c.clearTurnStatus()
-	if plan, ok := payload["plan"]; ok {
-		if raw, err := json.MarshalIndent(plan, "", "  "); err == nil {
-			fmt.Fprintf(os.Stderr, "%s\n", raw)
-		}
+	if c.opts.AutoApprove || emptyWebUIApproval(action, payload) {
+		return map[string]interface{}{"approved": true}, "complete", nil
 	}
+	c.clearTurnStatus()
 	message := stringify(payload["message"])
 	if message == "" && action == "plan_approval" {
 		message = "Approve this plan to begin applying changes?"
 	}
-	if message != "" {
-		fmt.Fprintf(os.Stderr, "%s\n", message)
-	}
-	approved := c.opts.AutoApprove
-	var err error
-	if !c.opts.AutoApprove {
-		approved, err = promptYesNo("Approve", true)
-	}
+	approved, err := promptApprovalTable(approvalRows(action, payload), message, true)
 	return map[string]interface{}{"approved": approved}, "complete", err
+}
+
+func approvalRows(action string, payload map[string]interface{}) [][2]string {
+	rows := [][2]string{{"Action", action}}
+	if plan := asMap(payload["plan"]); plan != nil {
+		if title := singleLineLabel(stringify(plan["title"])); title != "" {
+			rows = append(rows, [2]string{"Plan", title})
+		}
+		if description := singleLineLabel(stringify(plan["description"])); description != "" {
+			rows = append(rows, [2]string{"Description", description})
+		}
+		if steps, ok := plan["steps"].([]interface{}); ok {
+			for i, raw := range steps {
+				step := asMap(raw)
+				if step == nil {
+					continue
+				}
+				status := singleLineLabel(stringify(step["status"]))
+				description := singleLineLabel(stringify(step["description"]))
+				if description == "" {
+					description = singleLineLabel(stringify(step["title"]))
+				}
+				value := description
+				if status != "" {
+					value = "[" + status + "] " + value
+				}
+				rows = append(rows, [2]string{fmt.Sprintf("Step %d", i+1), value})
+			}
+		}
+	}
+	for _, key := range []string{"tool", "toolName", "name", "path", "filePath", "command"} {
+		if value := singleLineLabel(stringify(payload[key])); value != "" {
+			rows = append(rows, [2]string{key, value})
+		}
+	}
+	return rows
+}
+
+func emptyWebUIApproval(action string, payload map[string]interface{}) bool {
+	return action == "approval" && len(payload) == 0
 }
 
 func (c *Client) answerAppPicker(payload map[string]interface{}) (map[string]interface{}, string, error) {
@@ -3135,7 +3365,7 @@ func (c *Client) recordUsage(usage map[string]interface{}) {
 	c.usageInputTokens += usageTokenValue(usage, "input_tokens", "inputTokens", "prompt_tokens", "promptTokens")
 	c.usageOutputTokens += usageTokenValue(usage, "output_tokens", "outputTokens", "completion_tokens", "completionTokens")
 	c.usageThinkingTokens += usageTokenValue(usage, "thinking_tokens", "thinkingTokens")
-	if c.debug || !interactiveTerminalUIEnabled() {
+	if !interactiveTerminalUIEnabled() {
 		printUsage(usage)
 	} else {
 		c.drawPersistentStatus()
@@ -3157,13 +3387,13 @@ func (c *Client) printStatusBar() {
 }
 
 func (c *Client) printLiveUserTurn(content string) {
-	if c.debug || len(c.opts.Prompts) > 0 || !interactiveTerminalUIEnabled() || !terminalANSIEnabled() {
+	if len(c.opts.Prompts) > 0 || !interactiveTerminalUIEnabled() || !terminalANSIEnabled() {
 		return
 	}
 	printLiveUserPrompt(content)
 	// `printLiveUserPrompt` writes the submitted turn into the scrollback region.
 	// Put the terminal cursor back in the input footer immediately afterwards so
-	// any typeahead while `Working ...` is animating echoes in the prompt bar, not
+	// any typeahead while `Building...` is animating echoes in the prompt bar, not
 	// in the transcript/working area.
 	placeTerminalFooterPromptCursor("ba> ", 0)
 }

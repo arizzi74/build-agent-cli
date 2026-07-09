@@ -152,7 +152,7 @@ go run . --profile scratch --profile-delete dev
 - `--profile-list` lists configured profiles and exits
 - `--profile-delete <name>` deletes a profile directory and exits; it refuses to delete the active `--profile`
 - `--auto-approve` for approval prompts
-- `--debug` to print websocket/AMB JSON with auth, cookie, token, password, and secret fields redacted
+- `-debug <filename>`, `--debug <filename>`, or `--debug-file <filename>` to write a full log to a file: regular terminal output is still shown normally and is also copied to the file, while redacted debug trace output is written only to the file; bare `--debug` without a filename is intentionally invalid
 - `--no-open` to avoid launching a browser for OAuth
 - `--advertise-local-tools` exists only for experimentation; local tools are not implemented yet, so keep it off for normal backend/MCP use
 
@@ -197,7 +197,7 @@ The active application is also cached at:
 ~/.ba-cli/profiles/<profile>/active-app.json
 ```
 
-When an app is selected with `/app` (or backward-compatible `/app use`), returned by the backend via `set_app_scope`, or implied by a selected conversation's application metadata, the CLI sends the app scope back on subsequent Build Agent payloads as `appScope`. Selecting a conversation updates the active app like the Web UI when the conversation includes an application id, and clears the active app/status field to `<none>` when the conversation has no app.
+When an app is selected with `/app` (or backward-compatible `/app use`), returned by the backend via `set_app_scope`, or implied by a selected conversation's application metadata, the CLI sends the app scope back on subsequent Build Agent payloads as `appScope`. Selecting a conversation updates the active app like the Web UI when the conversation includes an application id, and clears the active app/status field to `<none>` when the conversation has no app. Creating a new conversation also clears the selected app so the new conversation starts app-less and the status bar shows `app=<none>` until an app is selected or created.
 
 ## Transport
 
@@ -274,15 +274,16 @@ Nirvana mode sends the same high-level protocol as the Glider Build Agent web cl
 1. `connect` with web-client-compatible capabilities, `invokeOptions`, OAuth token params, and Glider-style `mcpServers`
 2. `message` with `conversation_id`, content, `conversationHistory`, empty `ideContext`, images/attachments, discovered/static `mcpServers`, `workingSet`, `invokeOptions`, and token params
 3. discover connected WDF MCP servers from `/api/sn_wdf_mcp_client/mcp/servers?limit=50&offset=0&connected=true` using the saved web session and append the Glider static ATF Cloud runner when building the `mcpServers` array
-4. handle `client_elicitation` with safe CLI stubs for `fs_read_directory`, `instance_skills_list`, and `fluent_topics_list`
-5. persist the user prompt before sending and the final assistant text on `turn_end` using the same Glider `sender` message shape that `/sn_glider_app/ide.do` reloads
-6. stream/render `stream_delta` events: pending/thinking/client elicitation noise stays off the normal UI, text deltas stream through the interactive Markdown repaint renderer in real terminals, non-TTY/debug output remains plain append-only, and `turn_end` saves the server snapshot/local history
+4. handle `client_elicitation` for approval/app picker/scope setting, safe stubs for read-only unsupported local tools, and Web UI-style `create_new_servicenow_app`
+5. for `create_new_servicenow_app`, run the same browser-side REST orchestration observed in the Web UI: check `sys_app`, call `/api/now/templates` with scope-collision retries, update Glider workspace files through `/api/sn_glider/v2/sync/*`, patch the Build Agent conversation application id/title/working set, and return the Web UI-compatible `content`/`ideContext` shape over the websocket
+6. persist the user prompt before sending and the final assistant text on `turn_end` using the same Glider `sender` message shape that `/sn_glider_app/ide.do` reloads
+7. stream/render `stream_delta` events: pending/thinking/client elicitation noise stays off the normal UI, text deltas stream through the interactive Markdown repaint renderer in real terminals, non-TTY output remains plain append-only, and `turn_end` saves the server snapshot/local history
 ```
 
 ## Current limitations
 
-- No local filesystem, SDK build, install, or memfs tool implementation.
-- Unknown client-side elicitations are rejected unless handled generically.
+- No arbitrary local filesystem, SDK build, install, or memfs tool implementation.
+- `create_new_servicenow_app` is implemented through ServiceNow/Glider REST APIs, but other unknown client-side elicitations are rejected unless handled generically.
 - Web gateway mode uses a direct Bayeux/AMB long-poll implementation.
 - On some instances, Basic Auth works for generic table REST but the Build Agent API still rejects it with “User is not authenticated”. Use `--auth cookie` with cookies copied from the authenticated web UI in that case. Cookie/form sessions are stored once, reused, and deleted with `--logout` when they go stale.
 - `--auth form` only works with classic ServiceNow username/password login; if the instance enforces SSO/MFA/CAPTCHA, use `--auth cookie` to import a browser session manually.

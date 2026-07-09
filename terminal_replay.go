@@ -319,13 +319,26 @@ func formatToolResultTerminal(name string, success bool, color bool) string {
 	if name == "" {
 		name = "tool"
 	}
+	lines := strings.Split(name, "\n")
+	toolName := strings.TrimSpace(lines[0])
+	if toolName == "" {
+		toolName = "tool"
+	}
 	marker := "✗"
 	code := ansiRed + ansiBold
 	if success {
 		marker = "✓"
 		code = ansiWasabiGreen
 	}
-	return style(marker+" "+name, code, color)
+	out := style(marker+" "+toolName, code, color)
+	for _, line := range lines[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		out += "\n" + style("  "+line, ansiGrayFG, color)
+	}
+	return out
 }
 
 func wrapReplayRows(rows []string, width int) []string {

@@ -15,7 +15,7 @@ const (
 )
 
 func promptCredentialRecovery(profile, instanceURL, what string, cause error) (string, error) {
-	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) {
 		return credentialRecoveryReauth, nil
 	}
 	if what == "" {

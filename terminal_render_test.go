@@ -185,11 +185,15 @@ func TestLiveUserPromptPrintsThreeRowPromptBlock(t *testing.T) {
 	}
 }
 
-func TestAnimatedWorkingStatusBouncesAndUsesWasabiPalette(t *testing.T) {
-	first := animatedWorkingStatus(0)
-	later := animatedWorkingStatus(5)
-	if first == later || !strings.Contains(first, "38;5;190") || !strings.Contains(stripANSI(later), "Working") {
-		t.Fatalf("animated status did not vary/glow as expected: first=%q later=%q", first, later)
+func TestAnimatedBuildingAndConnectingStatusBounceAndUseWasabiPalette(t *testing.T) {
+	first := animatedBuildingStatus(0)
+	later := animatedBuildingStatus(5)
+	if first == later || !strings.Contains(first, "38;5;190") || !strings.Contains(stripANSI(later), "Building...") {
+		t.Fatalf("animated building status did not vary/glow as expected: first=%q later=%q", first, later)
+	}
+	connecting := animatedConnectingStatus(3)
+	if !strings.Contains(stripANSI(connecting), "Connecting...") || !strings.Contains(connecting, "38;5;") {
+		t.Fatalf("animated connecting status missing label/glow: %q", connecting)
 	}
 }
 

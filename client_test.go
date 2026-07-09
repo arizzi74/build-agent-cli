@@ -9,6 +9,9 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestNirvanaCapabilitiesMatchStreamingWebClient(t *testing.T) {
@@ -45,10 +48,28 @@ func TestGatewayStreamUpdateKeepsWorkingStatusActive(t *testing.T) {
 		c.printGatewayStreamUpdate("hello")
 	})
 	if !c.turnStatusActive {
-		t.Fatalf("stream update should keep Working status active until turn_end")
+		t.Fatalf("stream update should keep Building status active until turn_end")
 	}
 	if out != "hello" {
 		t.Fatalf("stdout = %q, want streamed chunk", out)
+	}
+}
+
+func TestElicitationResponseRequestsWorkingStatusDuringActiveTurn(t *testing.T) {
+	c := &Client{processing: true, turnDone: make(chan error, 1), turnStatusActive: true}
+	if !c.clearTurnStatus() {
+		t.Fatalf("clearTurnStatus should report that Building was active")
+	}
+	if c.turnStatusActive {
+		t.Fatalf("clearTurnStatus should mark Building inactive while a blocking prompt owns the terminal")
+	}
+	if !c.ensureTurnStatusVisible() {
+		t.Fatalf("elicitation response should request Building redraw while the turn is still processing")
+	}
+
+	c.processing = false
+	if c.ensureTurnStatusVisible() {
+		t.Fatalf("Building redraw must not be requested after the turn is no longer processing")
 	}
 }
 
@@ -118,16 +139,32 @@ func TestNirvanaToolResultUsesStoredNameAndFailureMarker(t *testing.T) {
 	if name != "MCP Script Runner/run_script" || callID != "abc" {
 		t.Fatalf("unexpected tool call tracking: name=%q callID=%q", name, callID)
 	}
-	name, callID, success := c.recordToolResult(map[string]interface{}{
+	name, callID, success, summary := c.recordToolResult(map[string]interface{}{
 		"type":    "tool_result",
 		"call_id": "abc",
 		"success": false,
 	})
-	if name != "MCP Script Runner/run_script" || callID != "abc" || success {
-		t.Fatalf("unexpected tool result tracking: name=%q callID=%q success=%v", name, callID, success)
+	if name != "MCP Script Runner/run_script" || callID != "abc" || success || summary != "" {
+		t.Fatalf("unexpected tool result tracking: name=%q callID=%q success=%v summary=%q", name, callID, success, summary)
 	}
 	if got := formatToolResultTerminal(name, success, false); got != "✗ MCP Script Runner/run_script" {
 		t.Fatalf("unexpected tool result line: %q", got)
+	}
+}
+
+func TestNirvanaToolResultSummaryFromNestedJSON(t *testing.T) {
+	c := &Client{toolCallNames: map[string]string{"abc": "fs_write_file"}}
+	name, _, success, summary := c.recordToolResult(map[string]interface{}{
+		"type":    "tool_result",
+		"call_id": "abc",
+		"success": true,
+		"result":  `{"success":true,"result":{"message":"Successfully wrote to src/fluent/demo.now.ts","path":"src/fluent/demo.now.ts"}}`,
+	})
+	if name != "fs_write_file" || !success || summary != "Successfully wrote to src/fluent/demo.now.ts" {
+		t.Fatalf("name=%q success=%v summary=%q", name, success, summary)
+	}
+	if got := toolResultDisplay(name, summary); got != "fs_write_file\nSuccessfully wrote to src/fluent/demo.now.ts" {
+		t.Fatalf("display = %q", got)
 	}
 }
 
@@ -157,18 +194,196 @@ func TestStatusBarStateCountsInputsAndCumulativeUsage(t *testing.T) {
 	}
 }
 
-func TestNirvanaSafeClientToolStubs(t *testing.T) {
+func TestEmptyWebUIApprovalAutoApproves(t *testing.T) {
+	c := &Client{}
+	result, status, err := c.answerApproval("approval", map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("answerApproval error = %v", err)
+	}
+	if status != "complete" || result["approved"] != true {
+		t.Fatalf("empty web approval should auto-approve, status=%q result=%#v", status, result)
+	}
+}
+
+func TestEmptyWebUIApprovalOnlyMatchesApprovalAction(t *testing.T) {
+	if emptyWebUIApproval("plan_approval", map[string]interface{}{}) {
+		t.Fatalf("empty plan_approval must not be treated as WebUI tool approval")
+	}
+	if emptyWebUIApproval("approval", map[string]interface{}{"message": "Approve?"}) {
+		t.Fatalf("non-empty approval payload must remain interactive")
+	}
+}
+
+func TestNirvanaFSReadDirectoryRequiresActiveApp(t *testing.T) {
 	c := &Client{}
 	result, status := c.answerFSReadDirectory(map[string]interface{}{"path": "."})
 	if status != "error" {
 		t.Fatalf("status = %q, want error", status)
 	}
 	msg := stringify(result["content"])
-	if !strings.Contains(msg, "create_new_servicenow_app") || stringify(result["code"]) != "TOOL_ERROR" {
-		t.Fatalf("unexpected fs_read_directory stub result: %#v", result)
+	if !strings.Contains(msg, "application") || stringify(result["code"]) != "TOOL_ERROR" {
+		t.Fatalf("unexpected fs_read_directory result: %#v", result)
 	}
-	if ctx := asMap(result["ideContext"]); ctx == nil || stringify(ctx["currentFile"]) != "" {
-		t.Fatalf("missing empty ideContext: %#v", result["ideContext"])
+}
+
+func TestResolveGliderPathAcceptsObservedShapes(t *testing.T) {
+	c := &Client{currentApp: &AppScope{ScopeID: "appsysid", ScopeName: "Demo", AppSysID: "appsysid"}}
+	cases := map[string]string{
+		".":                         "now-file:/appsysid",
+		"src/fluent/table.now.ts":   "now-file:/appsysid/src/fluent/table.now.ts",
+		"appsysid/src/fluent/a.ts":  "now-file:/appsysid/src/fluent/a.ts",
+		"/appsysid/src/fluent/a.ts": "now-file:/appsysid/src/fluent/a.ts",
+		"now-file:/appsysid/foo.ts": "now-file:/appsysid/foo.ts",
+	}
+	for input, wantURI := range cases {
+		gotURI, _, err := c.resolveGliderPath(input)
+		if err != nil {
+			t.Fatalf("resolveGliderPath(%q) error = %v", input, err)
+		}
+		if gotURI != wantURI {
+			t.Fatalf("resolveGliderPath(%q) uri = %q, want %q", input, gotURI, wantURI)
+		}
+	}
+}
+
+func TestCurrentIDEContextUsesStringWorkspaceFolders(t *testing.T) {
+	c := &Client{
+		currentApp: &AppScope{ScopeID: "appsysid123", ScopeName: "Geronimo", Scope: "x_snc_geronimo_2", AppSysID: "appsysid123"},
+		workspaceFolders: []WebWorkspaceFolder{
+			{Name: "Geronimo", URI: "now-file:/appsysid123"},
+			{Name: "Other", URI: "now-file:/otherapp"},
+		},
+	}
+	ctx := c.currentIDEContext()
+	folders, ok := ctx["workspaceFolders"].([]string)
+	if !ok {
+		t.Fatalf("workspaceFolders = %#v, want []string", ctx["workspaceFolders"])
+	}
+	if len(folders) != 1 || folders[0] != "/appsysid123" {
+		t.Fatalf("workspaceFolders = %#v, want active app path only", folders)
+	}
+	if ctx["currentDir"] != "/appsysid123" {
+		t.Fatalf("currentDir = %#v", ctx["currentDir"])
+	}
+	if ctx["scopeName"] != "x_snc_geronimo_2" {
+		t.Fatalf("scopeName = %#v", ctx["scopeName"])
+	}
+}
+
+func TestSendMessageUsesCurrentIDEContextForActiveApp(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	profile := "payload-test"
+	if err := saveCachedToken(profile, TokenResponse{AccessToken: "header.payload.sig", IssuedAt: time.Now().UnixMilli(), ExpiresIn: 3600, InstanceURL: "https://demo.service-now.com"}); err != nil {
+		t.Fatal(err)
+	}
+
+	received := make(chan map[string]interface{}, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		var payload map[string]interface{}
+		if err := conn.ReadJSON(&payload); err != nil {
+			t.Errorf("read payload: %v", err)
+			return
+		}
+		received <- payload
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	c := &Client{
+		cfg:        CLIConfig{InstanceURL: "https://demo.service-now.com"},
+		opts:       Options{Nirvana: true, CodeAssistWS: true, Profile: profile},
+		conn:       conn,
+		currentApp: &AppScope{ScopeID: "appsysid123", ScopeName: "Geronimo", AppSysID: "appsysid123"},
+	}
+	if err := c.SendMessage(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+
+	var payload map[string]interface{}
+	select {
+	case payload = <-received:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for websocket payload")
+	}
+	ctx := asMap(payload["ideContext"])
+	if ctx == nil {
+		t.Fatalf("ideContext missing from payload: %#v", payload)
+	}
+	folders, ok := ctx["workspaceFolders"].([]interface{})
+	if !ok || len(folders) != 1 || folders[0] != "/appsysid123" {
+		t.Fatalf("workspaceFolders = %#v, want active app path", ctx["workspaceFolders"])
+	}
+	if ctx["currentDir"] != "/appsysid123" {
+		t.Fatalf("currentDir = %#v", ctx["currentDir"])
+	}
+}
+
+func TestNirvanaOutboundAppScopeUsesObjectShape(t *testing.T) {
+	c := &Client{currentApp: &AppScope{ScopeID: "appsysid123", ScopeName: "Geronimo", AppSysID: "appsysid123"}}
+	got, ok := c.nirvanaOutboundAppScope()
+	if !ok {
+		t.Fatalf("nirvana appScope missing")
+	}
+	if got["scopeId"] != "appsysid123" || got["scopeName"] != "Geronimo" || got["appSysId"] != "appsysid123" {
+		t.Fatalf("unexpected appScope object: %#v", got)
+	}
+}
+
+func TestNirvanaOutboundAppScopeConvertsLegacyString(t *testing.T) {
+	c := &Client{appScope: "legacyappsysid"}
+	got, ok := c.nirvanaOutboundAppScope()
+	if !ok {
+		t.Fatalf("legacy string appScope should be converted")
+	}
+	if got["scopeId"] != "legacyappsysid" || got["appSysId"] != "legacyappsysid" {
+		t.Fatalf("unexpected converted appScope: %#v", got)
+	}
+}
+
+func TestNirvanaOutboundWorkingSetRejectsWorkspaceFolderShape(t *testing.T) {
+	folderShape := []interface{}{
+		map[string]interface{}{"name": "Existing App", "uri": "now-file:/existingappsysid"},
+	}
+	if got, ok := nirvanaOutboundWorkingSet(folderShape); ok || got != nil {
+		t.Fatalf("folder-shaped workingSet should be suppressed, got %#v ok=%v", got, ok)
+	}
+}
+
+func TestNirvanaOutboundWorkingSetAllowsServerRecordShape(t *testing.T) {
+	serverShape := []interface{}{
+		map[string]interface{}{"table": "sys_app", "sysId": "appsysid", "scopeId": "scopeid", "extra": true},
+	}
+	got, ok := nirvanaOutboundWorkingSet(serverShape)
+	if !ok || len(got) != 1 {
+		t.Fatalf("server-shaped workingSet rejected: %#v ok=%v", got, ok)
+	}
+}
+
+func TestWorkspaceStateOmitsInvalidWorkingSet(t *testing.T) {
+	c := &Client{workingSet: []interface{}{map[string]interface{}{"name": "Existing App", "uri": "now-file:/existingappsysid"}}}
+	if c.WorkspaceState().WorkingSet != nil {
+		t.Fatalf("invalid workingSet should not be persisted: %#v", c.WorkspaceState().WorkingSet)
+	}
+}
+
+func TestApplyWorkspaceDropsInvalidWorkingSet(t *testing.T) {
+	c := &Client{}
+	c.applyWorkspace(WorkspaceState{WorkingSet: []interface{}{map[string]interface{}{"name": "Existing App", "uri": "now-file:/existingappsysid"}}})
+	if c.workingSet != nil {
+		t.Fatalf("invalid workingSet should not be restored: %#v", c.workingSet)
 	}
 }
 
@@ -179,8 +394,8 @@ func TestNirvanaHARShapeHelpers(t *testing.T) {
 			t.Fatalf("%s = %q, want empty", key, ctx[key])
 		}
 	}
-	if _, ok := ctx["workspaceFolders"].([]interface{}); !ok {
-		t.Fatalf("workspaceFolders = %#v, want []interface{}", ctx["workspaceFolders"])
+	if _, ok := ctx["workspaceFolders"].([]string); !ok {
+		t.Fatalf("workspaceFolders = %#v, want []string", ctx["workspaceFolders"])
 	}
 	if got := instanceNameFromURL("https://demoalectriallwfze140800.service-now.com/"); got != "demoalectriallwfze140800" {
 		t.Fatalf("instanceNameFromURL = %q", got)

@@ -85,12 +85,22 @@ func TestTerminalSetConversationHistoryReplacesPriorTranscript(t *testing.T) {
 
 func TestTerminalTranscriptRowsFormatsToolResults(t *testing.T) {
 	rows := terminalTranscriptRows([]terminalTranscriptEntry{
-		{Role: "tool_success", Text: "list_properties"},
-		{Role: "tool_error", Text: "run_script"},
+		{Role: "tool_success", Text: "list_properties\nListed 12 properties"},
+		{Role: "tool_error", Text: "run_script\nScript failed validation"},
 	}, false, 80)
 	joined := strings.Join(rows, "\n")
-	if !strings.Contains(joined, "✓ list_properties") || !strings.Contains(joined, "✗ run_script") {
+	if !strings.Contains(joined, "✓ list_properties\n  Listed 12 properties") || !strings.Contains(joined, "✗ run_script\n  Script failed validation") {
 		t.Fatalf("tool result rows missing markers:\n%s", joined)
+	}
+}
+
+func TestColoredToolResultDescriptionUsesTableTextColorNotSuccessColor(t *testing.T) {
+	formatted := formatToolResultTerminal("fs_write_file\nSuccessfully wrote file", true, true)
+	if !strings.Contains(formatted, ansiWasabiGreen+"✓ fs_write_file") {
+		t.Fatalf("tool name should be success colored: %q", formatted)
+	}
+	if !strings.Contains(formatted, "\n"+ansiGrayFG+"  Successfully wrote file") {
+		t.Fatalf("description should be on next row in table-text color: %q", formatted)
 	}
 }
 

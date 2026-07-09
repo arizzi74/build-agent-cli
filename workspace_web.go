@@ -105,7 +105,7 @@ func (c *Client) ListWorkspaceChoices(ctx context.Context) ([]WorkspaceChoice, e
 			return c.webWorkspaceChoices(webWorkspaces), nil
 		}
 		if err != nil && c.debug {
-			slashCommandPrintf("warning: could not list web workspaces: %v\n", err)
+			c.debugf("warning: could not list web workspaces: %v\n", err)
 		}
 	}
 	localWorkspaces, err := listWorkspaces(c.opts.Profile)
@@ -194,7 +194,7 @@ func (c *Client) SwitchWebWorkspace(ctx context.Context, ws WebWorkspace) error 
 	}
 	loaded := ws
 	if err := c.loadWebWorkspaceContent(ctx, &loaded); err != nil && c.debug {
-		fmt.Fprintf(slashCommandOutputWriter, "warning: could not read workspace file %s: %v\n", ws.URI, err)
+		c.debugf("warning: could not read workspace file %s: %v\n", ws.URI, err)
 	}
 	if c.workspaceName != "" {
 		if err := c.saveCurrentState(); err != nil {
@@ -209,8 +209,8 @@ func (c *Client) SwitchWebWorkspace(ctx context.Context, ws WebWorkspace) error 
 	state.WebWorkspaceChecksum = loaded.Checksum
 	state.WebWorkspaceDescription = loaded.Description
 	state.WebWorkspaceFolders = append([]WebWorkspaceFolder(nil), loaded.Folders...)
+	state.WorkingSet = nil
 	if len(loaded.Folders) > 0 {
-		state.WorkingSet = webWorkspaceWorkingSet(loaded.Folders)
 		if app := appFromWebWorkspaceFolders(loaded.Folders); app != nil {
 			state.App = app
 			state.AppScope = app.ScopeID
@@ -630,21 +630,6 @@ func collectSyncFileJSONContents(v interface{}, out map[string][]byte) {
 			collectSyncFileJSONContents(item, out)
 		}
 	}
-}
-
-func webWorkspaceWorkingSet(folders []WebWorkspaceFolder) []map[string]interface{} {
-	workingSet := make([]map[string]interface{}, 0, len(folders))
-	for _, folder := range folders {
-		if strings.TrimSpace(folder.URI) == "" {
-			continue
-		}
-		item := map[string]interface{}{"uri": folder.URI}
-		if folder.Name != "" {
-			item["name"] = folder.Name
-		}
-		workingSet = append(workingSet, item)
-	}
-	return workingSet
 }
 
 func appFromWebWorkspaceFolders(folders []WebWorkspaceFolder) *AppScope {

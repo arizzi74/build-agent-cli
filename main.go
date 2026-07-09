@@ -36,6 +36,7 @@ type Options struct {
 	NoOpen              bool
 	AutoApprove         bool
 	Debug               bool
+	DebugFile           string
 	Nirvana             bool
 	WebGateway          bool
 	CodeAssistWS        bool
@@ -51,6 +52,10 @@ type Options struct {
 func main() {
 	loadDotEnvFiles()
 	opts := parseFlags()
+	if _, err := openDebugTraceFile(opts.DebugFile); err != nil {
+		fatal(fmt.Errorf("could not open debug trace file %q: %w", opts.DebugFile, err))
+	}
+	defer closeDebugOutputLog()
 	if handled, err := handleInstanceFlags(opts); handled {
 		if err != nil {
 			fatal(err)
@@ -112,13 +117,19 @@ func main() {
 	}
 
 	connectCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	stopConnectingStatus := func() {}
+	if appScreenEntered {
+		stopConnectingStatus = startTerminalConnectingStatus()
+	}
 	if err := client.Connect(connectCtx); err != nil {
+		stopConnectingStatus()
 		cancel()
 		if appScreenEntered {
 			leaveTerminalAppScreen()
 		}
 		fatal(err)
 	}
+	stopConnectingStatus()
 	cancel()
 	defer client.Close()
 
@@ -178,9 +189,51 @@ func startupReadyFooterMessage() string {
 	return "Connected · type a message · /help /conversation /mcp /workspace /app · /exit /quit"
 }
 
+func extractDebugFileArg(args []string) ([]string, string, error) {
+	out := make([]string, 0, len(args))
+	debugFile := ""
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-debug" || arg == "--debug" {
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return nil, "", fmt.Errorf("%s requires a filename", arg)
+			}
+			debugFile = args[i+1]
+			i++
+			continue
+		}
+		for _, prefix := range []string{"-debug=", "--debug="} {
+			if strings.HasPrefix(arg, prefix) {
+				value := strings.TrimSpace(strings.TrimPrefix(arg, prefix))
+				if !looksLikeDebugFilename(value) {
+					return nil, "", fmt.Errorf("%s requires a filename", strings.TrimSuffix(prefix, "="))
+				}
+				debugFile = value
+				goto nextArg
+			}
+		}
+		out = append(out, arg)
+	nextArg:
+	}
+	return out, debugFile, nil
+}
+
+func looksLikeDebugFilename(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "true", "false", "1", "0", "t", "f":
+		return false
+	default:
+		return true
+	}
+}
+
 func parseFlags() Options {
 	var prompts multiFlag
-	opts := Options{Nirvana: true}
+	normalizedArgs, debugFileFromArgs, err := extractDebugFileArg(os.Args[1:])
+	if err != nil {
+		fatal(err)
+	}
+	opts := Options{Nirvana: true, DebugFile: debugFileFromArgs}
 	flag.StringVar(&opts.InstanceURL, "instance", "", "ServiceNow instance URL, e.g. https://dev12345.service-now.com")
 	flag.BoolVar(&opts.InstanceList, "instance-list", false, "list configured ServiceNow instances and exit")
 	flag.BoolVar(&opts.InstanceList, "instances", false, "alias for --instance-list")
@@ -196,7 +249,7 @@ func parseFlags() Options {
 	flag.StringVar(&opts.Model, "model", "", "large model override, e.g. claude-opus-4-6, gemini_large, gpt_large")
 	flag.BoolVar(&opts.NoOpen, "no-open", false, "print OAuth URL but do not try to open a browser")
 	flag.BoolVar(&opts.AutoApprove, "auto-approve", false, "auto-approve approval/client prompts with safe defaults")
-	flag.BoolVar(&opts.Debug, "debug", false, "print raw websocket JSON frames to stderr")
+	flag.StringVar(&opts.DebugFile, "debug-file", debugFileFromArgs, "write terminal output plus redacted debug trace to file and enable debug mode")
 	flag.BoolVar(&opts.Nirvana, "nirvana", true, "use the Glider Build Agent Nirvana websocket transport for web UI streaming parity (default)")
 	flag.BoolVar(&opts.WebGateway, "web-gateway", false, "use legacy web Build Agent gateway/AMB transport instead of Nirvana")
 	flag.BoolVar(&opts.CodeAssistWS, "code-assist-ws", false, "experimental: use /sncapps/code/assist/ba/web-socket instead of REST+AMB web gateway")
@@ -209,14 +262,19 @@ func parseFlags() Options {
 	turnTimeout := flag.Duration("turn-timeout", 10*time.Minute, "timeout per agent turn")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options]\n\n", os.Args[0])
+		fmt.Fprintln(flag.CommandLine.Output(), "  -debug filename")
+		fmt.Fprintln(flag.CommandLine.Output(), "    \twrite terminal output plus redacted debug trace to filename; debug without filename is invalid")
 		flag.PrintDefaults()
 	}
-	flag.Parse()
+	_ = flag.CommandLine.Parse(normalizedArgs)
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "profile" {
 			opts.ProfileExplicit = true
 		}
 	})
+	if strings.TrimSpace(opts.DebugFile) != "" {
+		opts.Debug = true
+	}
 	opts.Prompts = prompts
 	opts.TurnTimeout = *turnTimeout
 	if opts.WebGateway || opts.CodeAssistWS {
@@ -236,5 +294,6 @@ func runPrompt(ctx context.Context, client *Client, prompt string, timeout time.
 
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	_ = closeDebugOutputLog()
 	os.Exit(1)
 }

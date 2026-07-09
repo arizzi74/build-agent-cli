@@ -5,6 +5,19 @@ import (
 	"testing"
 )
 
+func TestDebugTraceWriterReceivesDebugOutput(t *testing.T) {
+	var buf bytes.Buffer
+	setDebugTraceWriter(&buf)
+	defer setDebugTraceWriter(nil)
+	client := &Client{debug: true}
+
+	client.debugf("trace %s", "line")
+
+	if got := buf.String(); got != "trace line" {
+		t.Fatalf("debug trace = %q, want trace line", got)
+	}
+}
+
 func TestRedactDebugJSONRedactsSensitiveFields(t *testing.T) {
 	raw := []byte(`{
 		"authorization":"Basic secret-value",

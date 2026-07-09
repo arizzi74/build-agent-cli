@@ -60,6 +60,53 @@ func TestConversationLabelIsSingleLine(t *testing.T) {
 	}
 }
 
+func TestStartNewWebConversationClearsSelectedApp(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	app := AppScope{ScopeID: "appsysid123", ScopeName: "Existing App", AppSysID: "appsysid123"}
+	if err := saveActiveApp("default", app); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{
+		cfg:                CLIConfig{InstanceURL: "https://demo.example.com"},
+		opts:               Options{Profile: "default"},
+		runtime:            RuntimeModelConfig{LargeModel: "claude-opus-4-6"},
+		workspaceName:      "Default - admin",
+		conversationID:     "oldconversationid",
+		conversationTitle:  "Old app chat",
+		serverConversation: true,
+		currentApp:         &app,
+		appScope:           app.ScopeID,
+		history:            []interface{}{map[string]interface{}{"role": "user", "content": "old"}},
+	}
+
+	if err := client.StartNewWebConversation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if client.conversationID == "" || client.conversationID == "oldconversationid" || client.serverConversation || client.conversationTitle != "" || len(client.history) != 0 {
+		t.Fatalf("conversation was not reset correctly: id=%q server=%v title=%q history=%#v", client.conversationID, client.serverConversation, client.conversationTitle, client.history)
+	}
+	if client.CurrentApp() != nil || client.appScope != nil {
+		t.Fatalf("new conversation should clear app: current=%#v appScope=%#v", client.CurrentApp(), client.appScope)
+	}
+	if _, ok := loadActiveApp("default"); ok {
+		t.Fatalf("active app file should be deleted for a new conversation")
+	}
+	ws, ok := loadWorkspace("default", "Default - admin")
+	if !ok {
+		t.Fatalf("workspace state was not saved")
+	}
+	if ws.App != nil || ws.AppScope != nil {
+		t.Fatalf("workspace app state should be cleared: %#v", ws)
+	}
+	if state := client.statusBarState(); state.App != "" {
+		t.Fatalf("status app = %q, want empty for <none>", state.App)
+	}
+	if got := formatStatusBar(client.statusBarState(), false, 0); !strings.Contains(got, "app=<none>") {
+		t.Fatalf("status bar = %q, want app=<none>", got)
+	}
+}
+
 func TestSendGatewayMessageMirrorsWebUIConversationPersistence(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	conversationID := "cabf08f350d642268fc809f8f6b1e54e"
