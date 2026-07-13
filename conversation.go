@@ -912,18 +912,65 @@ func normalizePersistedRole(role string) string {
 	}
 }
 
+// conversationMessageAPISpecs prioritizes the installed Build Agent API used by
+// the web client. Older conversations_api routes remain read fallbacks.
+func (c *Client) conversationMessageAPISpecs() []conversationAPISpec {
+	specs := c.conversationAPISpecs()
+	ordered := make([]conversationAPISpec, 0, len(specs))
+	for _, spec := range specs {
+		if spec.BuildAgentAPI {
+			ordered = append(ordered, spec)
+		}
+	}
+	for _, spec := range specs {
+		if !spec.BuildAgentAPI {
+			ordered = append(ordered, spec)
+		}
+	}
+	return ordered
+}
+
+func shouldTryNextConversationMessageAPI(status int, body []byte) bool {
+	// A conversation id selected from a successful list is valid. Some older
+	// routes report an unsupported message resource as a bare 400 rather than a
+	// structured missing-resource response, so continue the read-only chain.
+	return status == http.StatusBadRequest || isConversationAPIMissing(status, body)
+}
+
 func (c *Client) fetchWebConversationMessages(ctx context.Context, id string) ([]interface{}, error) {
-	body, status, err := c.getConversationJSON(ctx, "/conversation/"+id+"/messages")
-	if err != nil {
-		if shouldFallbackToConversationTables(status, body) {
-			return c.fetchTableConversationMessages(ctx, id)
-		}
-		if status == http.StatusNotFound || isConversationAPIMissing(status, body) {
-			return nil, errWebConversationNotFound
-		}
+	if err := c.ensureConversationHTTPClient(); err != nil {
 		return nil, err
 	}
-	return parseWebMessages(body), nil
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, errWebConversationNotFound
+	}
+
+	for _, spec := range c.conversationMessageAPISpecs() {
+		result, err := c.retryGETResult(ctx, spec.URL("/conversation/"+url.PathEscape(id)+"/messages"), "conversation_history_read", "http", 16<<20, func(req *http.Request) {
+			c.setGatewayHeaders(req)
+			req.Header.Set("Accept", "application/json")
+		})
+		body, status := result.Body, result.Status
+		if err == nil {
+			return parseWebMessages(body), nil
+		}
+		if shouldTryNextConversationMessageAPI(status, body) {
+			continue
+		}
+		// Do not hide authentication, authorization, or server failures behind a
+		// different API/table path.
+		return nil, err
+	}
+
+	messages, err := c.fetchTableConversationMessages(ctx, id)
+	if err == nil {
+		return messages, nil
+	}
+	if errors.Is(err, errWebConversationNotFound) {
+		return nil, errWebConversationNotFound
+	}
+	return nil, err
 }
 
 func (c *Client) applyWebConversation(conv WebConversation, loadMessages bool) {
@@ -1428,11 +1475,14 @@ func parseWebMessages(body []byte) []interface{} {
 				role = rawRole
 			}
 		}
-		content := strings.TrimSpace(firstString(m, "content", "text", "message"))
-		if bodyMap := asMap(m["body"]); content == "" && bodyMap != nil {
-			content = strings.TrimSpace(firstString(bodyMap, "text", "message", "content"))
+		contentValue := firstMessageContentValue(m)
+		if contentValue == nil {
+			if bodyMap := asMap(m["body"]); bodyMap != nil {
+				contentValue = firstMessageContentValue(bodyMap)
+			}
 		}
-		contentRole, contentText, contentHasRole := messageContentRoleText(content)
+		contentRole, contentText, contentHasRole := messageContentRoleTextValue(contentValue)
+		content := strings.TrimSpace(messageContentTextValue(contentValue))
 		if contentHasRole {
 			if contentRole == "" {
 				continue
@@ -1441,8 +1491,6 @@ func parseWebMessages(body []byte) []interface{} {
 		}
 		if contentText != "" {
 			content = contentText
-		} else {
-			content = messageContentText(content)
 		}
 		role = normalizeMessageRole(role)
 		if rawRole == "" && !contentHasRole {
@@ -1496,28 +1544,60 @@ func inferBareWebMessageRole(previousRole string) string {
 	return "user"
 }
 
-func messageContentText(content string) string {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return ""
-	}
-	var decoded map[string]interface{}
-	if err := json.Unmarshal([]byte(content), &decoded); err == nil {
-		if text := strings.TrimSpace(firstString(decoded, "text", "message", "content")); text != "" {
-			return text
+func firstMessageContentValue(m map[string]interface{}) interface{} {
+	for _, key := range []string{"content", "text", "message"} {
+		if value, ok := m[key]; ok && value != nil {
+			return value
 		}
 	}
-	return content
+	return nil
+}
+
+func messageContentText(content string) string {
+	return messageContentTextValue(content)
+}
+
+func messageContentTextValue(content interface{}) string {
+	switch value := content.(type) {
+	case nil:
+		return ""
+	case string:
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return ""
+		}
+		var decoded map[string]interface{}
+		if err := json.Unmarshal([]byte(value), &decoded); err == nil {
+			if text := strings.TrimSpace(firstString(decoded, "text", "message", "content")); text != "" {
+				return text
+			}
+		}
+		return value
+	default:
+		if decoded := asMap(value); decoded != nil {
+			return strings.TrimSpace(firstString(decoded, "text", "message", "content"))
+		}
+		return strings.TrimSpace(stringify(value))
+	}
 }
 
 func messageContentRoleText(content string) (string, string, bool) {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return "", "", false
-	}
+	return messageContentRoleTextValue(content)
+}
+
+func messageContentRoleTextValue(content interface{}) (string, string, bool) {
 	var decoded map[string]interface{}
-	if err := json.Unmarshal([]byte(content), &decoded); err != nil {
-		return "", "", false
+	switch value := content.(type) {
+	case string:
+		value = strings.TrimSpace(value)
+		if value == "" || json.Unmarshal([]byte(value), &decoded) != nil {
+			return "", "", false
+		}
+	default:
+		decoded = asMap(value)
+		if decoded == nil {
+			return "", "", false
+		}
 	}
 	rawRole := strings.TrimSpace(firstString(decoded, "sender", "role", "author", "type"))
 	role := ""

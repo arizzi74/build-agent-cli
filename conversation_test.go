@@ -323,7 +323,8 @@ func TestConversationCommandUseLoadsServerMessages(t *testing.T) {
 		case "/api/sn_glider/applications/all":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"result":[]}`))
-		case "/api/sn_build_agent/build_agent_api/conversations":
+		case "/api/sn_build_agent/build_agent_api/conversations",
+			"/api/sn_build_agent/build_agent_api/conversations/" + conversationID + "/messages":
 			http.Error(w, `{"error":{"message":"Requested URI does not represent any resource"},"status":"failure"}`, http.StatusBadRequest)
 		case "/api/sn_ba_core/conversations_api/conversations":
 			w.Header().Set("Content-Type", "application/json")
@@ -380,7 +381,8 @@ func TestNirvanaConversationCommandUseLoadsServerMessages(t *testing.T) {
 		case "/api/sn_glider/applications/all":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"result":[]}`))
-		case "/api/sn_build_agent/build_agent_api/conversations":
+		case "/api/sn_build_agent/build_agent_api/conversations",
+			"/api/sn_build_agent/build_agent_api/conversations/" + conversationID + "/messages":
 			http.Error(w, `{"error":{"message":"Requested URI does not represent any resource"},"status":"failure"}`, http.StatusBadRequest)
 		case "/api/sn_ba_core/conversations_api/conversations":
 			w.Header().Set("Content-Type", "application/json")
@@ -900,6 +902,163 @@ func TestBuildAgentAPIConversationBaseFallback(t *testing.T) {
 	if err := client.persistWebUserMessage(context.Background(), "new prompt"); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestBuildAgentAPIMessageLoadPrioritizesInstalledEndpoint(t *testing.T) {
+	conversationID := "conv-build-agent-messages"
+	var buildAgentCalls, oldCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/sn_build_agent/build_agent_api/conversations/" + conversationID + "/messages":
+			buildAgentCalls++
+			result := make([]map[string]interface{}, 0, 532)
+			for sequence := 532; sequence >= 1; sequence-- {
+				content := interface{}(map[string]interface{}{"sender": "assistant", "text": "reply-" + strconv.Itoa(sequence)})
+				if sequence%2 == 1 {
+					content = map[string]interface{}{"sender": "user", "text": "prompt-" + strconv.Itoa(sequence)}
+				}
+				result = append(result, map[string]interface{}{
+					"content":        content,
+					"conversation":   conversationID,
+					"active":         true,
+					"sequence":       sequence,
+					"sys_created_on": "2026-07-13 16:00:00",
+					"sys_id":         "message-" + strconv.Itoa(sequence),
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": result})
+		case "/api/sn_ba_core/conversations_api/conversation/" + conversationID + "/messages",
+			"/api/sn_build_agent/conversations_api/conversation/" + conversationID + "/messages":
+			oldCalls++
+			t.Fatalf("old message API should not be fetched after installed API success")
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := &Client{cfg: CLIConfig{InstanceURL: server.URL}, httpClient: server.Client(), gatewayAuth: authModeCookie}
+	messages, err := client.fetchWebConversationMessages(context.Background(), conversationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if buildAgentCalls != 1 || oldCalls != 0 {
+		t.Fatalf("message API calls: installed=%d old=%d", buildAgentCalls, oldCalls)
+	}
+	if len(messages) != 532 || asMap(messages[0])["content"] != "prompt-1" || asMap(messages[531])["content"] != "reply-532" {
+		t.Fatalf("installed messages were not fully ordered: first=%#v last=%#v count=%d", messages[0], messages[len(messages)-1], len(messages))
+	}
+	if asMap(messages[0])["role"] != "user" || asMap(messages[1])["role"] != "assistant" {
+		t.Fatalf("nested content roles were not parsed: %#v %#v", messages[0], messages[1])
+	}
+}
+
+func TestBuildAgentAPIMessageLoadAllowsBoundedLargeHistory(t *testing.T) {
+	conversationID := "conv-large-history"
+	payload := strings.Repeat("x", 2<<20)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/sn_build_agent/build_agent_api/conversations/"+conversationID+"/messages" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": []interface{}{map[string]interface{}{
+			"sequence": 1,
+			"content":  map[string]interface{}{"sender": "user", "text": payload},
+		}}})
+	}))
+	defer server.Close()
+	client := &Client{cfg: CLIConfig{InstanceURL: server.URL}, httpClient: server.Client(), gatewayAuth: authModeCookie}
+	messages, err := client.fetchWebConversationMessages(context.Background(), conversationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || len(stringify(asMap(messages[0])["content"])) != len(payload) {
+		t.Fatalf("large bounded history was not preserved")
+	}
+}
+
+func TestFetchWebConversationMessagesFallsBackToOldAPIAndTables(t *testing.T) {
+	conversationID := "conv-message-fallback"
+	t.Run("old API after unsupported installed endpoint", func(t *testing.T) {
+		var buildAgentCalls, coreCalls, oldCalls int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/sn_build_agent/build_agent_api/conversations/" + conversationID + "/messages":
+				buildAgentCalls++
+				http.Error(w, `{"error":{"message":"unsupported message route"}}`, http.StatusBadRequest)
+			case "/api/sn_ba_core/conversations_api/conversation/" + conversationID + "/messages":
+				coreCalls++
+				http.Error(w, `{"error":{"message":"Requested URI does not represent any resource"}}`, http.StatusBadRequest)
+			case "/api/sn_build_agent/conversations_api/conversation/" + conversationID + "/messages":
+				oldCalls++
+				_, _ = w.Write([]byte(`{"result":[{"sequence":1,"content":"{\"sender\":\"user\",\"text\":\"legacy prompt\"}"},{"sequence":2,"content":"{\"sender\":\"assistant\",\"text\":\"legacy reply\"}"}]}`))
+			default:
+				t.Fatalf("unexpected path %s", r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		client := &Client{cfg: CLIConfig{InstanceURL: server.URL}, httpClient: server.Client(), gatewayAuth: authModeCookie}
+		messages, err := client.fetchWebConversationMessages(context.Background(), conversationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if buildAgentCalls != 1 || coreCalls != 1 || oldCalls != 1 || len(messages) != 2 || asMap(messages[1])["content"] != "legacy reply" {
+			t.Fatalf("unexpected fallback result: calls=%d/%d/%d messages=%#v", buildAgentCalls, coreCalls, oldCalls, messages)
+		}
+	})
+
+	t.Run("authorization failure does not fall through", func(t *testing.T) {
+		var oldCalls, tableCalls int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/sn_build_agent/build_agent_api/conversations/" + conversationID + "/messages":
+				http.Error(w, `{"error":{"message":"not authorized"}}`, http.StatusForbidden)
+			case "/api/sn_ba_core/conversations_api/conversation/" + conversationID + "/messages",
+				"/api/sn_build_agent/conversations_api/conversation/" + conversationID + "/messages":
+				oldCalls++
+			case "/api/now/table/sn_ba_core_conversation/" + conversationID,
+				"/api/now/table/sn_build_agent_conversation/" + conversationID:
+				tableCalls++
+			default:
+				t.Fatalf("unexpected path %s", r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		client := &Client{cfg: CLIConfig{InstanceURL: server.URL}, httpClient: server.Client(), gatewayAuth: authModeCookie}
+		if _, err := client.fetchWebConversationMessages(context.Background(), conversationID); err == nil {
+			t.Fatal("expected authorization error")
+		}
+		if oldCalls != 0 || tableCalls != 0 {
+			t.Fatalf("authorization failure was masked: old=%d table=%d", oldCalls, tableCalls)
+		}
+	})
+
+	t.Run("tables after all message APIs are unavailable", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/sn_build_agent/build_agent_api/conversations/" + conversationID + "/messages",
+				"/api/sn_ba_core/conversations_api/conversation/" + conversationID + "/messages",
+				"/api/sn_build_agent/conversations_api/conversation/" + conversationID + "/messages":
+				http.Error(w, `{"error":{"message":"Requested URI does not represent any resource"}}`, http.StatusBadRequest)
+			case "/api/now/table/sn_ba_core_conversation/" + conversationID:
+				http.Error(w, `{"error":{"message":"Invalid table"}}`, http.StatusBadRequest)
+			case "/api/now/table/sn_build_agent_conversation/" + conversationID:
+				_, _ = w.Write([]byte(`{"result":{"sys_id":"` + conversationID + `"}}`))
+			case "/api/now/table/sn_build_agent_message":
+				_, _ = w.Write([]byte(`{"result":[{"sequence":1,"content":"{\"sender\":\"user\",\"text\":\"table prompt\"}"},{"sequence":2,"content":"{\"sender\":\"assistant\",\"text\":\"table reply\"}"}]}`))
+			default:
+				t.Fatalf("unexpected path %s", r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		client := &Client{cfg: CLIConfig{InstanceURL: server.URL}, httpClient: server.Client(), gatewayAuth: authModeCookie}
+		messages, err := client.fetchWebConversationMessages(context.Background(), conversationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(messages) != 2 || asMap(messages[1])["content"] != "table reply" {
+			t.Fatalf("table fallback messages = %#v", messages)
+		}
+	})
 }
 
 func TestNirvanaPersistsUserMessageWithGliderContent(t *testing.T) {
