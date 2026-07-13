@@ -103,6 +103,11 @@ type Client struct {
 	activeTurnStopping      bool
 	activeServerTurnID      string
 	cancelledServerTurnIDs  map[string]struct{}
+	semanticMu              sync.Mutex
+	semanticState           SemanticTurnState
+	semanticSequence        uint64
+	semanticEventIDSequence uint64
+	semanticLifecycleID     string
 
 	connected chan error
 	turnDone  chan error
@@ -135,16 +140,18 @@ func NewClient(cfg CLIConfig, opts Options) (*Client, error) {
 		return nil, err
 	}
 	c := &Client{
-		cfg:             cfg,
-		opts:            opts,
-		runtime:         runtimeCfg,
-		streamTypes:     map[string]string{},
-		toolCallNames:   map[string]string{},
-		toolCallInputs:  map[string]interface{}{},
-		toolCallStarted: map[string]time.Time{},
-		connected:       make(chan error, 1),
-		closed:          make(chan struct{}),
-		debug:           opts.Debug,
+		cfg:                 cfg,
+		opts:                opts,
+		runtime:             runtimeCfg,
+		streamTypes:         map[string]string{},
+		toolCallNames:       map[string]string{},
+		toolCallInputs:      map[string]interface{}{},
+		toolCallStarted:     map[string]time.Time{},
+		semanticState:       NewSemanticTurnState(),
+		semanticLifecycleID: uuidV4Compact(),
+		connected:           make(chan error, 1),
+		closed:              make(chan struct{}),
+		debug:               opts.Debug,
 	}
 	if err := c.loadInitialState(); err != nil {
 		return nil, err
@@ -573,6 +580,9 @@ func (c *Client) beginActiveTurn(parent context.Context) context.Context {
 		c.cancelledServerTurnIDs = map[string]struct{}{}
 	}
 	c.activeTurnMu.Unlock()
+	if c.opts.Nirvana {
+		c.beginSemanticTurn()
+	}
 	return ctx
 }
 
@@ -622,6 +632,7 @@ func (c *Client) cancelActiveTurn() bool {
 	cancel := c.activeTurnCancel
 	conversationID := c.conversationID
 	c.activeTurnMu.Unlock()
+	c.emitSemanticEvent(EventTurnCancelled, "", TurnCancelledPayload{Reason: "user_requested"})
 
 	if c.conn != nil && conversationID != "" {
 		_ = c.writeJSON(map[string]interface{}{"type": "stop", "conversation_id": conversationID})
@@ -3018,6 +3029,7 @@ func (c *Client) handleEvent(data []byte) error {
 	}
 	switch typeName {
 	case "connected":
+		c.emitSemanticEvent(EventConnectionStateChanged, "", ConnectionStateChangedPayload{State: "connected"})
 		if !c.suppressInteractiveStartupScrollback() {
 			fmt.Fprintf(os.Stderr, "connected to %s\n", c.cfg.InstanceURL)
 		}
@@ -3026,9 +3038,11 @@ func (c *Client) handleEvent(data []byte) error {
 		default:
 		}
 	case "turn_start":
+		turnID := strings.TrimSpace(stringify(event["turn_id"]))
 		c.activeTurnMu.Lock()
-		c.activeServerTurnID = strings.TrimSpace(stringify(event["turn_id"]))
+		c.activeServerTurnID = turnID
 		c.activeTurnMu.Unlock()
+		c.emitSemanticEvent(EventTurnStarted, turnID, nil)
 		c.resetTurnToolTracking()
 		c.showTurnStatus()
 	case "turn_resumed":
@@ -3041,6 +3055,9 @@ func (c *Client) handleEvent(data []byte) error {
 		}
 		c.handleNirvanaStreamStart(streamID, contentType, event)
 	case "stream_delta":
+		if delta := stringify(event["delta"]); delta != "" && c.streamTypes[stringify(event["stream_id"])] == "text" {
+			c.emitSemanticEvent(EventAssistantDelta, "", AssistantDeltaPayload{Delta: delta})
+		}
 		c.handleNirvanaStreamDelta(event)
 	case "stream_end":
 		streamID, _ := event["stream_id"].(string)
@@ -3049,11 +3066,13 @@ func (c *Client) handleEvent(data []byte) error {
 		delete(c.streamTypes, streamID)
 	case "tool_call":
 		name, callID := c.recordToolCall(event)
+		c.emitSemanticEvent(EventToolStarted, "", ToolStartedPayload{ToolID: callID, Name: name})
 		if c.debug {
 			c.debugf("\n[tool call] %s %s\n", name, callID)
 		}
 	case "tool_result":
 		name, callID, success, summary := c.recordToolResult(event)
+		c.emitSemanticEvent(EventToolCompleted, "", ToolCompletedPayload{ToolID: callID, Success: success})
 		started := c.toolCallStarted[callID]
 		input := c.toolCallInputs[callID]
 		delete(c.toolCallStarted, callID)
@@ -3080,6 +3099,7 @@ func (c *Client) handleEvent(data []byte) error {
 		}
 		c.printToolResultStatus(name, success, summary)
 	case "client_elicitation":
+		c.emitSemanticEvent(EventElicitationRequested, "", ElicitationRequestedPayload{Kind: stringify(event["elicitation_type"])})
 		return c.handleElicitation(event)
 	case "turn_summary":
 		if summary, ok := event["summary"].(string); ok && summary != "" {
@@ -3092,6 +3112,20 @@ func (c *Client) handleEvent(data []byte) error {
 		name, _ := event["name"].(string)
 		fmt.Fprintf(os.Stderr, "\n[sub-agent ended] %s\n", name)
 	case "turn_end":
+		// Emit final observed state before terminal lifecycle events. This keeps
+		// the semantic sequence usable for replay without changing established UI.
+		if v, ok := event["appScope"]; ok {
+			c.emitSemanticEvent(EventAppScopeChanged, "", AppScopeChangedPayload{ScopeID: strings.TrimSpace(stringify(v))})
+		}
+		if v, ok := event["workingSet"]; ok {
+			c.emitSemanticEvent(EventWorkingSetUpdated, "", WorkingSetUpdatedPayload{Hash: semanticWorkingSetHash(v)})
+		}
+		if usage, ok := event["usage"].(map[string]interface{}); ok {
+			c.recordUsage(usage)
+			c.emitSemanticEvent(EventUsageUpdated, "", UsageUpdatedPayload{InputTokens: c.usageInputTokens, OutputTokens: c.usageOutputTokens, ThinkingTokens: c.usageThinkingTokens})
+		}
+		c.emitSemanticEvent(EventAssistantCompleted, "", AssistantCompletedPayload{Reason: "stream_end"})
+		c.emitSemanticEvent(EventTurnCompleted, "", TurnCompletedPayload{Reason: "server_turn_end"})
 		c.finishGatewayStreamOutput()
 		c.clearTurnStatus()
 		assistantText := strings.TrimSpace(c.webStreamText)
@@ -3121,9 +3155,6 @@ func (c *Client) handleEvent(data []byte) error {
 		if v, ok := event["workingSet"]; ok {
 			c.workingSet = v
 		}
-		if usage, ok := event["usage"].(map[string]interface{}); ok {
-			c.recordUsage(usage)
-		}
 		if err := c.saveCurrentState(); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not save workspace %q: %v\n", c.workspaceName, err)
 		}
@@ -3145,6 +3176,7 @@ func (c *Client) handleEvent(data []byte) error {
 		}
 	case "turn_error":
 		err := eventError(event, "turn error")
+		c.emitSemanticEvent(EventTurnFailed, "", TurnFailedPayload{Code: "server_turn_error"})
 		c.clearTurnStatus()
 		fmt.Fprintf(os.Stderr, "\n%s\n", err)
 		c.processing = false

@@ -4,6 +4,10 @@ Minimal Go CLI for talking to the ServiceNow Build Agent backend.
 
 The primary/default mode is now the Glider Build Agent Nirvana websocket transport, matching the web UI path observed in Chrome HARs. It supports real streaming and advertises the same WDF/static MCP server configs as the Glider client. The older web Build Agent gateway/AMB transport remains available with `--web-gateway` for compatibility testing.
 
+### Internal semantic lifecycle seam
+
+The Nirvana websocket lifecycle now also emits a small, versioned internal semantic-event envelope into a deterministic turn reducer. This is an observational **Nirvana-only** compatibility seam: existing rendering, remote persistence, telemetry, and transport behavior remain unchanged, and web-gateway/Code Assist paths do not initialize it. The envelope contains only normalized/redaction-safe diagnostic metadata (never raw frames, OAuth tokens, cookies, passwords, authorization headers, or metadata values containing bearer/basic/cookie header material). Event IDs are client-lifecycle unique while `Sequence` remains per turn; the reducer binds the server turn ID at `turn_start`, deduplicates identical event-ID replays, rejects conflicting duplicates and invalid lifecycle/tool transitions, and covers connection, turn acceptance/start/terminal states, assistant output, tools, elicitation, usage, observed app/working-set updates, retry/fallback, and telemetry failures. Additional transports will migrate incrementally.
+
 ## Auth
 
 Default Nirvana mode uses the Glider/TypeScript CLI OAuth PKCE flow and stores OAuth tokens under `~/.ba-cli`. The legacy `--web-gateway` mode is pure Go and has no browser/Playwright/runtime dependency. Its default auth mode is `--auth form`: it first reuses a validated saved web session for the same profile+instance; otherwise it asks for a ServiceNow username/password, performs classic `GET/POST /login.do`, captures cookies plus `g_ck`, validates the resulting web session, and persists it under `~/.ba-cli`.

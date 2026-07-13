@@ -1,6 +1,6 @@
 # Build Agent Go CLI — Implemented Specification
 
-Last updated: 2026-07-09
+Last updated: 2026-07-13
 
 This document describes what has been implemented so far in `/home/ubuntu/.openclaw/workspace/build-agent-go-cli`. It is a functional spec of the current Go CLI behavior, not a future roadmap.
 
@@ -16,6 +16,7 @@ Primary goals implemented:
 - Provide a polished interactive terminal UI with a persistent footer/status bar.
 - Preserve clean non-interactive output for automation.
 - Keep secrets local and redact debug output.
+- Normalize the initial Nirvana turn lifecycle through a versioned, redaction-safe semantic event/reducer seam without changing existing user-visible rendering or persistence.
 
 ## 2. Binary and build
 
@@ -52,6 +53,10 @@ Latest known rebuilt binary after `fluent_topics_list` local-doc fallback and `n
 build-agent-go-cli
 sha256 431c00004d9f6b5d9a47a288998e8f08491d9dd991179a879f098f9d1c3c7a7d
 ```
+
+## 2.1 Internal semantic event reducer
+
+Implemented a deliberately small internal lifecycle envelope (`SemanticEventVersion = 1`) and pure `Apply`/`Reduce` state reducer. It covers connection state, accepted/started turns, assistant deltas/completion, tool start/completion, elicitation, usage, working-set/app/conversation updates, retry/fallback, cancellation/failure/completion, and telemetry failure. `Apply` clones reducer-owned maps/slices before mutation, deduplicates identical event-ID replays, rejects conflicting ID reuse, validates metadata keys case-insensitively and rejects bearer/basic/cookie header material in metadata values, binds a non-empty server turn ID at start, and rejects mismatched later IDs, invalid terminal ordering, negative/non-monotonic usage, post-completion assistant output, unknown tool completions, and conflicting tool duplicates. It preserves immutable accepted-turn context while staging later context updates for the next turn, and treats telemetry failure as non-terminal for the user operation. The initial integration is an observational **Nirvana-only** compatibility seam: per-turn `Sequence` resets, client-lifecycle event identity does not; normalized events leave current rendering, persistence, telemetry, and transport handlers intact. Web gateway and Code Assist paths do not initialize this seam.
 
 ## 3. Command-line flags
 
