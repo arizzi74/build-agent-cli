@@ -52,6 +52,10 @@ type Options struct {
 
 func main() {
 	loadDotEnvFiles()
+	if updated, message := checkForSelfUpdate(); updated {
+		fmt.Fprintln(os.Stderr, message)
+		return
+	}
 	opts := parseFlags()
 	if _, err := openDebugTraceFile(opts.DebugFile); err != nil {
 		fatal(fmt.Errorf("could not open debug trace file %q: %w", opts.DebugFile, err))

@@ -1,56 +1,124 @@
-# Build
+# Build and release
 
-Build Agent Go CLI release binaries are built as a single static, stripped Linux aarch64 executable named `build-agent-go-cli`.
+Build Agent Go CLI releases are cross-compiled as four pure-Go, stripped binaries. All public release files live under `./dist` and the installed executable is always named `bacli` (`bacli.exe` on Windows).
 
-## Target
+## Supported targets
 
-- OS: Linux
-- Architecture: aarch64 / arm64
-- Linking: static
-- Symbols/debug info: stripped
-- Output filename: `build-agent-go-cli`
+| Target | Release file |
+| --- | --- |
+| Linux aarch64 / arm64 | `dist/bacli-linux-arm64` |
+| macOS Intel / amd64 | `dist/bacli-darwin-amd64` |
+| macOS Apple Silicon / arm64 | `dist/bacli-darwin-arm64` |
+| Windows amd64 / x86-64 | `dist/bacli-windows-amd64.exe` |
 
-Do **not** build or publish dynamic non-stripped binaries for normal use. Only make a non-stripped build as a temporary local debugging exception when explicitly requested.
+Every build uses:
 
-## Release build command
+- `CGO_ENABLED=0` for a pure-Go binary with no C runtime dependency.
+- `-trimpath` to remove local source paths.
+- `-ldflags='-s -w -buildid= ...'` to strip symbols/debug metadata and omit the Go build ID.
+- Embedded `main.cliVersion` and `main.cliUpdateBaseURL` values for startup updates.
+
+Linux is statically linked in the normal ELF sense. Go's `CGO_ENABLED=0` macOS and Windows outputs contain no project-supplied dynamic libraries or CGO runtime, although platform inspection tools may still describe normal operating-system loader/framework imports.
+
+## Release build
 
 Run from the repository root:
 
 ```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w -buildid=' -o build-agent-go-cli .
+VERSION=2026.07.13.1 ./scripts/build-release.sh
 ```
 
-Why these flags:
+If `VERSION` is omitted, the script uses `YYYY.MM.DD.<short-git-sha>`. Override the publication root only when staging:
 
-- `CGO_ENABLED=0` forces a pure-Go/static binary.
-- `GOOS=linux GOARCH=arm64` targets Linux aarch64.
-- `-trimpath` removes local filesystem paths from the binary.
-- `-ldflags='-s -w -buildid='` strips symbols/debug metadata and removes the Go build id for a smaller, cleaner artifact.
-- `-o build-agent-go-cli` keeps the release artifact name stable with no architecture suffix.
+```bash
+VERSION=2026.07.13.1 BASE_URL=https://staging.example/bacli ./scripts/build-release.sh
+```
+
+The script creates:
+
+```text
+dist/
+├── bacli-linux-arm64
+├── bacli-darwin-amd64
+├── bacli-darwin-arm64
+├── bacli-windows-amd64.exe
+├── install.sh
+├── install.ps1
+├── version.json
+└── SHA256SUMS
+```
+
+Do not build or publish dynamic/non-stripped binaries for normal releases. A non-stripped binary is allowed only as a temporary debugging exception when explicitly requested.
+
+## Publication layout
+
+Publish the complete contents of `dist/` at:
+
+```text
+https://nowdemo.it/bacli/
+```
+
+The following URLs must therefore work:
+
+```text
+https://nowdemo.it/bacli/install.sh
+https://nowdemo.it/bacli/install.ps1
+https://nowdemo.it/bacli/version.json
+https://nowdemo.it/bacli/bacli-linux-arm64
+https://nowdemo.it/bacli/bacli-darwin-amd64
+https://nowdemo.it/bacli/bacli-darwin-arm64
+https://nowdemo.it/bacli/bacli-windows-amd64.exe
+```
+
+`version.json` is the source of truth for installers and self-update. Never publish a new manifest before every referenced binary has finished uploading; upload binaries first and `version.json` last.
+
+## Installer behavior
+
+- Unix installer: detects Linux arm64, macOS Intel, or macOS Apple Silicon; verifies SHA-256; installs as `~/.local/bin/bacli`; and adds an idempotent PATH line to `.zshrc`, `.bashrc`, or `.profile` when needed.
+- Windows installer: selects Windows amd64; verifies SHA-256; installs as `%USERPROFILE%\.local\bin\bacli.exe`; and adds that directory to the user PATH when needed.
+
+Environment overrides for staging/testing:
+
+```text
+BACLI_BASE_URL
+BACLI_INSTALL_DIR
+BACLI_UPDATE_BASE_URL
+BACLI_NO_UPDATE=1
+```
+
+## Startup update protocol
+
+Every versioned `bacli` startup requests `https://nowdemo.it/bacli/version.json` with a five-second timeout. Failures are non-fatal so an offline user can continue working.
+
+When the manifest version is newer, the CLI:
+
+1. Selects its current OS/architecture artifact.
+2. Downloads it with a 128 MiB bound.
+3. Verifies the manifest SHA-256.
+4. Replaces the current Unix executable atomically, or stages a Windows replacement helper because a running `.exe` cannot overwrite itself.
+5. Exits with a message asking the user to relaunch `bacli`.
+
+Development binaries with embedded version `dev` skip the update request. `BACLI_NO_UPDATE=1` disables it explicitly.
 
 ## Verification
 
-After building, verify the artifact:
+Before release:
 
 ```bash
-file build-agent-go-cli
-ldd build-agent-go-cli || true
-sha256sum build-agent-go-cli
-ls -lh build-agent-go-cli
-```
-
-Expected results:
-
-- `file` reports an `ELF 64-bit ... ARM aarch64` executable.
-- `file` includes `statically linked, stripped`.
-- `ldd` prints `not a dynamic executable`.
-
-## Optional pre-build checks
-
-Before producing a release binary, run:
-
-```bash
+go test -race -count=1 ./...
 go test -count=1 ./...
-go build ./...
 go vet ./...
+git diff --check
+VERSION=2026.07.13.1 ./scripts/build-release.sh
 ```
+
+Inspect artifacts:
+
+```bash
+file dist/bacli-*
+ldd dist/bacli-linux-arm64 || true
+sha256sum -c dist/SHA256SUMS
+ls -lh dist/
+```
+
+Expected Linux output includes `ELF 64-bit`, `ARM aarch64`, `statically linked`, and `stripped`; `ldd` reports that it is not a dynamic executable. Darwin outputs are Mach-O for their requested architectures. Windows output is PE32+ x86-64.

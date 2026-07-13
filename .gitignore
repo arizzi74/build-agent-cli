@@ -9,6 +9,8 @@ build-agent-go-cli-linux-arm64
 build-agent-go-cli-linux-arm64.sha256
 *.test
 
+# Release artifacts are committed together under dist/ for direct publication.
+
 # Generated validation and terminal captures
 *-captures/
 tmux-*-captures/

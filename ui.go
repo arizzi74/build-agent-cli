@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -176,47 +174,12 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 	} else {
 		fmt.Fprint(os.Stderr, commandInputLine(prompt, string(line)))
 	}
-	resizeSignals := make(chan os.Signal, 1)
-	resizeDone := make(chan struct{})
-	signal.Notify(resizeSignals, syscall.SIGWINCH)
-	defer func() {
-		signal.Stop(resizeSignals)
-		close(resizeDone)
-	}()
-	go func() {
-		var timer *time.Timer
-		var timerC <-chan time.Time
-		defer func() {
-			if timer != nil {
-				timer.Stop()
-			}
-		}()
-		for {
-			select {
-			case <-resizeDone:
-				return
-			case <-resizeSignals:
-				if timer == nil {
-					timer = time.NewTimer(350 * time.Millisecond)
-					timerC = timer.C
-					continue
-				}
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				timer.Reset(350 * time.Millisecond)
-			case <-timerC:
-				timerC = nil
-				timer = nil
-				if layout.enabled {
-					redraw()
-				}
-			}
+	stopResizeNotifications := startTerminalResizeNotifications(func() {
+		if layout.enabled {
+			redraw()
 		}
-	}()
+	})
+	defer stopResizeNotifications()
 	buf := make([]byte, 1)
 	for {
 		if _, err := os.Stdin.Read(buf); err != nil {
@@ -1066,8 +1029,8 @@ func (c *processingInputCapture) run(prompt string, status statusBarState) {
 	}
 	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
 	fd := int(os.Stdin.Fd())
-	_ = syscall.SetNonblock(fd, true)
-	defer func() { _ = syscall.SetNonblock(fd, false) }()
+	_ = setTerminalNonblock(fd, true)
+	defer func() { _ = setTerminalNonblock(fd, false) }()
 
 	line, submitted := peekPendingCommandInput()
 	var escapeArmedUntil time.Time
@@ -1084,7 +1047,7 @@ func (c *processingInputCapture) run(prompt string, status statusBarState) {
 			return
 		default:
 		}
-		n, err := syscall.Read(fd, buf)
+		n, err := readTerminalFD(fd, buf)
 		if n > 0 {
 			changed := false
 			for _, b := range buf[:n] {
@@ -1127,7 +1090,7 @@ func (c *processingInputCapture) run(prompt string, status statusBarState) {
 			}
 			continue
 		}
-		if err != nil && err != syscall.EAGAIN && err != syscall.EWOULDBLOCK {
+		if err != nil && !terminalReadWouldBlock(err) {
 			setPendingCommandInput(line, submitted)
 			return
 		}
@@ -1748,17 +1711,17 @@ func readPendingEscapeSequence() []byte {
 	// arrow-key sequences such as "[A" / "[B".
 	time.Sleep(10 * time.Millisecond)
 	fd := int(os.Stdin.Fd())
-	_ = syscall.SetNonblock(fd, true)
-	defer func() { _ = syscall.SetNonblock(fd, false) }()
+	_ = setTerminalNonblock(fd, true)
+	defer func() { _ = setTerminalNonblock(fd, false) }()
 	buf := make([]byte, 8)
 	seq := make([]byte, 0, len(buf))
 	for len(seq) < cap(seq) {
-		n, err := syscall.Read(fd, buf[len(seq):cap(seq)])
+		n, err := readTerminalFD(fd, buf[len(seq):cap(seq)])
 		if n > 0 {
 			seq = append(seq, buf[len(seq):len(seq)+n]...)
 			continue
 		}
-		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK || err == nil {
+		if terminalReadWouldBlock(err) || err == nil {
 			break
 		}
 		break
