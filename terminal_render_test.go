@@ -196,12 +196,21 @@ func TestAnimatedConnectingLogoMatchesReferenceShapeAndGlows(t *testing.T) {
 	if first == later || !strings.Contains(first, "38;5;") {
 		t.Fatalf("connecting logo should animate with wasabi glow")
 	}
-	if !strings.Contains(rows[3], "▄████████▀") || !strings.Contains(rows[4], "█████████") || !strings.Contains(rows[4], "            ") {
-		t.Fatalf("connecting logo does not preserve the open-center ring silhouette: %q", plain)
+	for _, r := range plain {
+		if r > 127 {
+			t.Fatalf("connecting logo must use ASCII only, found %q", r)
+		}
 	}
-	frame := stripANSI(connectingScreenFrame(2))
-	if !strings.HasPrefix(frame, rows[0]) || !strings.Contains(frame, "\n\nConnecting...") {
-		t.Fatalf("connecting screen should put the logo above the status: %q", frame)
+	if len([]rune(rows[0])) > 24 || !strings.Contains(rows[3], "oOO'") || !strings.Contains(rows[4], "OOO              OOO") {
+		t.Fatalf("connecting logo does not preserve the narrow open-center ring silhouette: %q", plain)
+	}
+	details := "profile: zaiagents\ntransport: Nirvana websocket\n"
+	frame := stripANSI(connectingScreenFrame(details, 2))
+	profileAt := strings.Index(frame, "profile: zaiagents")
+	transportAt := strings.Index(frame, "transport: Nirvana websocket")
+	connectingAt := strings.Index(frame, "Connecting...")
+	if !strings.HasPrefix(frame, rows[0]) || profileAt < len(rows[0]) || transportAt <= profileAt || connectingAt <= transportAt {
+		t.Fatalf("connecting screen order should be logo, details, status: %q", frame)
 	}
 }
 

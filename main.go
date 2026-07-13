@@ -102,25 +102,15 @@ func main() {
 		defer leaveTerminalAppScreen()
 	}
 
-	fmt.Fprintf(os.Stderr, "profile: %s\n", opts.Profile)
-	if opts.Nirvana {
-		fmt.Fprintf(os.Stderr, "oauth token cache: %s\n", tokenStorageDescription(opts.Profile))
-		fmt.Fprintf(os.Stderr, "model: provider=%s large=%s small=%s\n", client.runtime.Provider, client.runtime.LargeModel, client.runtime.SmallModel)
-		fmt.Fprintln(os.Stderr, "transport: Nirvana websocket; matches the Glider Build Agent web client streaming path")
-	} else {
-		if opts.CodeAssistWS {
-			fmt.Fprintln(os.Stderr, "transport: experimental Code Assist websocket")
-		} else {
-			fmt.Fprintln(os.Stderr, "transport: web Build Agent gateway; MCP tools should match the web UI")
-		}
-		mode, _ := normalizeAuthMode(opts.AuthMode)
-		fmt.Fprintf(os.Stderr, "auth: %s; pure Go/no browser automation; secrets stay under ~/.ba-cli when persisted\n", mode)
+	startupDetails := startupConnectionDetails(opts, client)
+	if !appScreenEntered {
+		fmt.Fprint(os.Stderr, startupDetails)
 	}
 
 	connectCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	stopConnectingStatus := func() {}
 	if appScreenEntered {
-		stopConnectingStatus = startTerminalConnectingStatus()
+		stopConnectingStatus = startTerminalConnectingStatus(startupDetails)
 	}
 	if err := client.Connect(connectCtx); err != nil {
 		stopConnectingStatus()
@@ -189,6 +179,27 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		}
 	}
+}
+
+func startupConnectionDetails(opts Options, client *Client) string {
+	var out strings.Builder
+	fmt.Fprintf(&out, "profile: %s\n", opts.Profile)
+	if opts.Nirvana {
+		fmt.Fprintf(&out, "oauth token cache: %s\n", tokenStorageDescription(opts.Profile))
+		if client != nil {
+			fmt.Fprintf(&out, "model: provider=%s large=%s small=%s\n", client.runtime.Provider, client.runtime.LargeModel, client.runtime.SmallModel)
+		}
+		out.WriteString("transport: Nirvana websocket; matches the Glider Build Agent web client streaming path\n")
+		return out.String()
+	}
+	if opts.CodeAssistWS {
+		out.WriteString("transport: experimental Code Assist websocket\n")
+	} else {
+		out.WriteString("transport: web Build Agent gateway; MCP tools should match the web UI\n")
+	}
+	mode, _ := normalizeAuthMode(opts.AuthMode)
+	fmt.Fprintf(&out, "auth: %s; pure Go/no browser automation; secrets stay under ~/.ba-cli when persisted\n", mode)
+	return out.String()
 }
 
 func startupReadyFooterMessage() string {

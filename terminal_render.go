@@ -872,15 +872,15 @@ func animatedStatusText(label string, frame int) string {
 }
 
 var connectingLogoRows = []string{
-	"            ▄████▄            ",
-	"        ▄████████████▄        ",
-	"    ▄██████▀      ▀██████▄    ",
-	"▄████████▀          ▀████████▄",
-	"█████████            █████████",
-	"▀████████▄          ▄████████▀",
-	"    ▀██████▄      ▄██████▀    ",
-	"        ▀████████████▀        ",
-	"            ▀████▀            ",
+	"       .oooo.       ",
+	"    .ooOOOOOOoo.    ",
+	"  .oOO'      'OOo.  ",
+	" oOO'          'OOo ",
+	"OOO              OOO",
+	" oOO.          .OOo ",
+	"  'oOO.      .OOo'  ",
+	"    'ooOOOOOOoo'    ",
+	"       'oooo'       ",
 }
 
 func animatedConnectingLogo(frame int) string {
@@ -905,11 +905,15 @@ func animatedConnectingLogo(frame int) string {
 	return out.String()
 }
 
-func connectingScreenFrame(frame int) string {
-	return animatedConnectingLogo(frame) + "\n\n" + animatedConnectingStatus(frame)
+func connectingScreenFrame(details string, frame int) string {
+	details = strings.TrimRight(details, "\n")
+	if details == "" {
+		return animatedConnectingLogo(frame) + "\n\n" + animatedConnectingStatus(frame)
+	}
+	return animatedConnectingLogo(frame) + "\n\n" + details + "\n\n" + animatedConnectingStatus(frame)
 }
 
-func startTerminalConnectingStatus() func() {
+func startTerminalConnectingStatus(details string) func() {
 	if !terminalStatusANSIEnabled() {
 		return func() {}
 	}
@@ -923,7 +927,7 @@ func startTerminalConnectingStatus() func() {
 		frame := 0
 		for {
 			terminalRenderMu.Lock()
-			fmt.Fprintf(os.Stderr, "\x1b[H\x1b[2J%s", connectingScreenFrame(frame))
+			fmt.Fprintf(os.Stderr, "\x1b[H\x1b[2J%s", connectingScreenFrame(details, frame))
 			terminalRenderMu.Unlock()
 			frame++
 			select {

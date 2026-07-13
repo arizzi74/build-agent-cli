@@ -88,6 +88,17 @@ func TestExtractDebugFileArgRejectsBareDebug(t *testing.T) {
 	}
 }
 
+func TestStartupConnectionDetailsPreservePreviousMessages(t *testing.T) {
+	opts := Options{Profile: "zaiagents", Nirvana: true}
+	client := &Client{runtime: RuntimeModelConfig{Provider: "openai", LargeModel: "large", SmallModel: "small"}}
+	details := startupConnectionDetails(opts, client)
+	for _, want := range []string{"profile: zaiagents", "oauth token cache:", "model: provider=openai large=large small=small", "transport: Nirvana websocket"} {
+		if !strings.Contains(details, want) {
+			t.Fatalf("startup details missing %q: %q", want, details)
+		}
+	}
+}
+
 func TestStartupReadyFooterMessageIsCompactAndInstanceFree(t *testing.T) {
 	message := startupReadyFooterMessage()
 	if strings.Contains(message, "service-now.com") || strings.Contains(message, "https://") || strings.Contains(message, "instance") {
