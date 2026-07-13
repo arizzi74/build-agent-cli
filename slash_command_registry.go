@@ -155,6 +155,12 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		Handler: handleTurnCommand,
 	},
 	{
+		Canonical: "/support-bundle", Description: "create a local redacted deterministic support archive", Category: "General", Order: 26,
+		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/support-bundle", "/support-bundle --json"},
+		Handler: handleSupportBundleCommand,
+	},
+	{
 		Canonical: "/debug", Description: "control local redacted diagnostics; inspect semantic journal", Category: "General", Order: 27,
 		Arguments: SlashCommandRequiredSubcommand, Behavior: SlashCommandTemplate, Runtime: SlashCommandRuntimeAny,
 		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/debug status", "/debug tail", "/debug event "},
