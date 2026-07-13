@@ -1,5 +1,11 @@
 # Implementation Activity
 
+## 2026-07-13 — Final roadmap acceptance
+
+- Completed and individually tmux-gated roadmap units 1–10: typed slash registry, semantic reducer seam, append-only recovery journal, immutable turn snapshots, `/status`, `/turn` and redacted `/debug`, deterministic support bundles, offline search/export, bounded retry/fallback telemetry, and durable goals/approval gates.
+- Final aggregate tmux gate passed `go test -count=1 ./...`, `go test -race -count=1 ./...`, `go vet ./...`, and `git diff --check` with all-zero results.
+- Rebuilt only the requested static stripped ARM64 artifact `build-agent-go-cli` using `CGO_ENABLED=0 GOOS=linux GOARCH=arm64`, verified AArch64 ELF, statically linked, stripped, and not dynamically linked.
+
 ## 2026-07-13 — Roadmap unit 10: durable goals and approval-gated local actions
 
 - Added versioned, profile-local goal and approval stores with atomic private persistence, corruption quarantine, deterministic ordering, bounded retention, and safe/redacted fields.
