@@ -9,6 +9,19 @@ import (
 	"testing"
 )
 
+func TestFetchGliderStateReportsNonJSONResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html><title>Login required</title></html>"))
+	}))
+	defer server.Close()
+	c := &Client{cfg: CLIConfig{InstanceURL: server.URL}, httpClient: server.Client()}
+	_, err := c.fetchGliderStateForURIs(context.Background(), []string{"now-file:/app"})
+	if err == nil || !strings.Contains(err.Error(), "non-JSON response") || !strings.Contains(err.Error(), "Login required") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestGliderFSWriteFileTreatsVerifiedApply500AsSuccess(t *testing.T) {
 	content := "export const ok = true\n"
 	checksum := sha1Hex([]byte(content))

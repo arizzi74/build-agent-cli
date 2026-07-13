@@ -304,7 +304,7 @@ func (c *Client) fetchGliderStateForURIs(ctx context.Context, uris []string) ([]
 	}
 	var root interface{}
 	if err := json.Unmarshal(body, &root); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Glider sync/state returned a non-JSON response: %s", trimBody(body))
 	}
 	files := syncStateFiles(root)
 	entries := make([]gliderChangeEntry, 0, len(files))
