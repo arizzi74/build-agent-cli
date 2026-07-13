@@ -1,7 +1,0 @@
-UNIT9_FOCUSED
-ok  	build-agent-go-cli	0.049s
-UNIT9_RACE
-ok  	build-agent-go-cli	0.185s
-UNIT9_FULL
-ok  	build-agent-go-cli	13.435s
-UNIT9_GATE_RESULTS:0:0:0

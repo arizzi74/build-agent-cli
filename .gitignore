@@ -7,3 +7,21 @@ build-agent-go-cli
 build-agent-go-cli-linux-arm64
 build-agent-go-cli-linux-arm64.sha256
 *.test
+
+# Generated validation and terminal captures
+*-captures/
+tmux-*-captures/
+live-acceptance-captures/
+
+# Local validation/export bundles
+E2E_CHECKLIST_*.md
+e2e-validation-*.zip
+
+# Temporary implementation traces and activity notes
+HAR_METADATA_SYNC_TRACE.md
+IMPLEMENTATION_ACTIVITY.md
+INSTALL_FAILURE_INVESTIGATION.md
+METADATA_SYNC_DESIGN_REVIEW.md
+METADATA_SYNC_IMPLEMENTATION_ACTIVITY.md
+SDK_METADATA_SYNC_TRACE.md
+WEB_PARITY_ACTIVITY.md

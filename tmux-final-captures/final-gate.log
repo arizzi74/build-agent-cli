@@ -1,7 +1,0 @@
-FINAL_TEST
-ok  	build-agent-go-cli	14.045s
-FINAL_RACE
-ok  	build-agent-go-cli	85.857s
-FINAL_VET
-FINAL_DIFF_CHECK
-FINAL_GATE_RESULTS:0:0:0:0
