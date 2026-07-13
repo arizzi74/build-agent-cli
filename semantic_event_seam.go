@@ -22,6 +22,9 @@ func (c *Client) beginSemanticTurnSnapshot(snapshot TurnRuntimeSnapshot) {
 		RuntimeGeneration: snapshot.MCPGeneration,
 		Transport:         snapshot.Transport,
 	}
+	if snapshot.Goal != nil {
+		context.GoalID = snapshot.Goal.ID
+	}
 	if snapshot.App != nil {
 		context.AppScopeID = snapshot.App.ScopeID
 	} else {

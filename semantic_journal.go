@@ -498,6 +498,10 @@ func decodeSemanticJournalEvent(event SemanticEvent) (SemanticEvent, error) {
 		target = &TurnCompletedPayload{}
 	case EventTelemetryFailed:
 		target = &TelemetryFailedPayload{}
+	case EventGoalStatusChanged:
+		target = &GoalStatusChangedPayload{}
+	case EventApprovalRequested, EventApprovalStatusChanged, EventApprovalExecuted, EventApprovalFailed:
+		target = &ApprovalEventPayload{}
 	case EventTurnStarted:
 		event.Payload = nil
 		return event, nil
@@ -543,6 +547,10 @@ func decodeSemanticJournalEvent(event SemanticEvent) (SemanticEvent, error) {
 	case *TurnCompletedPayload:
 		event.Payload = *value
 	case *TelemetryFailedPayload:
+		event.Payload = *value
+	case *GoalStatusChangedPayload:
+		event.Payload = *value
+	case *ApprovalEventPayload:
 		event.Payload = *value
 	}
 	return event, nil

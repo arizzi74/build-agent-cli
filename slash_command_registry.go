@@ -179,7 +179,31 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		Handler: handleDebugCommand,
 	},
 	{
-		Canonical: "/mcp", Description: "show MCP servers advertised to Nirvana/Forge", Category: "Tools", Order: 30,
+		Canonical: "/goal", Description: "manage local durable goals (/goal --json for schema output)", Category: "General", Order: 30,
+		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/goal", "/goal add ", "/goal --json"},
+		Handler: handleGoalCommand,
+	},
+	{
+		Canonical: "/approvals", Description: "list local pending/recent approval requests", Category: "General", Order: 31,
+		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/approvals", "/approvals --json"},
+		Handler: handleApprovalsCommand,
+	},
+	{
+		Canonical: "/approve", Description: "execute one approved local action exactly once", Category: "General", Order: 32,
+		Arguments: SlashCommandRequiredSubcommand, Behavior: SlashCommandTemplate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: false, Suggestions: []string{"/approve "},
+		Handler: handleApproveCommand,
+	},
+	{
+		Canonical: "/reject", Description: "reject one pending local action", Category: "General", Order: 33,
+		Arguments: SlashCommandRequiredSubcommand, Behavior: SlashCommandTemplate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/reject "},
+		Handler: handleRejectCommand,
+	},
+	{
+		Canonical: "/mcp", Description: "show MCP servers advertised to Nirvana/Forge", Category: "Tools", Order: 40,
 		Arguments: SlashCommandRequiredSubcommand, Behavior: SlashCommandTemplate, Runtime: SlashCommandRuntimeNirvana,
 		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/mcp list"},
 		Handler: func(ctx context.Context, c *Client, args []string) (bool, error) {
@@ -187,7 +211,7 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		},
 	},
 	{
-		Canonical: "/workspace", Aliases: []string{"/ws"}, Description: "choose an existing Web UI/local workspace", Category: "Context", Order: 40,
+		Canonical: "/workspace", Aliases: []string{"/ws"}, Description: "choose an existing Web UI/local workspace", Category: "Context", Order: 50,
 		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandModal, Runtime: SlashCommandRuntimeAny,
 		CapturePolicy: SlashCommandDoNotCaptureModal, Suggestions: []string{"/workspace"},
 		IsModal: func(args []string) bool { return commandArgsStartModal(args, "select", "choose") },
@@ -196,7 +220,7 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		},
 	},
 	{
-		Canonical: "/app", Aliases: []string{"/application"}, Description: "choose an app from the active workspace", Category: "Context", Order: 50,
+		Canonical: "/app", Aliases: []string{"/application"}, Description: "choose an app from the active workspace", Category: "Context", Order: 60,
 		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandModal, Runtime: SlashCommandRuntimeAny,
 		CapturePolicy: SlashCommandDoNotCaptureModal, Suggestions: []string{"/app"},
 		IsModal: func(args []string) bool { return commandArgsStartModal(args, "select", "choose", "list", "ls") },
@@ -205,7 +229,7 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		},
 	},
 	{
-		Canonical: "/exit", Aliases: []string{"/quit"}, Description: "quit", Category: "General", Order: 60,
+		Canonical: "/exit", Aliases: []string{"/quit"}, Description: "quit", Category: "General", Order: 70,
 		Arguments: SlashCommandNoArguments, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeAny,
 		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/exit", "/quit"},
 		Handler: func(_ context.Context, _ *Client, _ []string) (bool, error) { return false, nil },

@@ -31,6 +31,8 @@ type runtimeStatusDocument struct {
 	Policy        statusPolicy     `json:"policy"`
 	Journal       statusJournal    `json:"journal"`
 	Remote        statusRemote     `json:"remote"`
+	Goals         statusGoals      `json:"goals"`
+	Approvals     statusApprovals  `json:"approvals"`
 }
 
 type statusProfile struct {
@@ -109,6 +111,15 @@ type statusJournal struct {
 	Recovery     string `json:"recovery"`
 	Status       string `json:"status"`
 }
+type statusGoals struct {
+	ActiveID     string `json:"activeId,omitempty"`
+	ActiveStatus string `json:"activeStatus,omitempty"`
+	Count        int    `json:"count"`
+}
+type statusApprovals struct {
+	Pending int `json:"pending"`
+	Recent  int `json:"recent"`
+}
 type statusRemote struct {
 	MetadataSync   string `json:"metadataSync"`
 	BuildReadiness string `json:"buildReadiness"`
@@ -168,6 +179,20 @@ func (c *Client) statusDocument() runtimeStatusDocument {
 	}
 	sort.Slice(timeouts, func(i, j int) bool { return timeouts[i].Name < timeouts[j].Name })
 	overall := combineStatus("healthy", journal.Status, remote.Status, connectionState.Status)
+	goals := c.listGoals()
+	activeGoal := c.activeGoalReference()
+	goalStatus := statusGoals{Count: len(goals)}
+	if activeGoal != nil {
+		goalStatus.ActiveID = safeStatusString(activeGoal.ID)
+		goalStatus.ActiveStatus = string(activeGoal.Status)
+	}
+	approvals := c.listApprovals()
+	approvalStatus := statusApprovals{Recent: len(approvals)}
+	for _, approval := range approvals {
+		if approval.Status == ApprovalPending || approval.Status == ApprovalApproved {
+			approvalStatus.Pending++
+		}
+	}
 	return runtimeStatusDocument{
 		SchemaVersion: StatusSchemaVersion, GeneratedAt: now.Format(time.RFC3339Nano), Overall: overall,
 		Profile:   statusProfile{Name: safeStatusString(strings.TrimSpace(snapshot.Profile)), InstanceHost: safeStatusString(statusSnapshotHost(snapshot, c.cfg.InstanceURL, active)), Status: "healthy"},
@@ -176,7 +201,7 @@ func (c *Client) statusDocument() runtimeStatusDocument {
 		Servers:    statusServers{Inventory: servers, Generation: safeStatusString(snapshot.MCPGeneration), Hash: safeStatusString(snapshot.MCPHash), Status: statusKnownStatus(len(servers) > 0)},
 		WorkingSet: statusWorkingSet{Count: len(workingSet), Hash: workingHash, Status: "healthy"},
 		Runtime:    statusRuntime{Provider: safeStatusString(snapshot.Model.Provider), Model: safeStatusString(snapshot.Model.LargeModel), Skill: safeStatusString(snapshot.Model.SkillID), Status: "healthy"},
-		Policy:     statusPolicy{DefaultTimeout: snapshot.DefaultTimeout.String(), ToolTimeouts: timeouts, Retry: "safe_reads_bounded", Attempts: len(attempts), LastDecision: safeStatusString(lastDecision), Status: "healthy"}, Journal: journal, Remote: remote,
+		Policy:     statusPolicy{DefaultTimeout: snapshot.DefaultTimeout.String(), ToolTimeouts: timeouts, Retry: "safe_reads_bounded", Attempts: len(attempts), LastDecision: safeStatusString(lastDecision), Status: "healthy"}, Journal: journal, Remote: remote, Goals: goalStatus, Approvals: approvalStatus,
 	}
 }
 
@@ -185,7 +210,7 @@ func (c *Client) statusSnapshot() (TurnRuntimeSnapshot, bool) {
 	active := c.processing && c.turnRuntimeSnapshot != nil
 	var snapshot TurnRuntimeSnapshot
 	if active {
-		snapshot = *c.turnRuntimeSnapshot
+		snapshot = cloneTurnRuntimeSnapshot(*c.turnRuntimeSnapshot)
 	}
 	c.activeTurnMu.Unlock()
 	if active {

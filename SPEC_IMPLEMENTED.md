@@ -18,6 +18,15 @@ Primary goals implemented:
 - Keep secrets local and redact debug output.
 - Normalize the initial Nirvana turn lifecycle through a versioned, redaction-safe semantic event/reducer seam without changing existing user-visible rendering or persistence.
 
+## Durable goals and approval-gated local actions
+
+- Goals use schema version 1 with stable IDs, timestamps, explicit lifecycle states, scoped references, bounded local retention, and manual source markers. Titles are safe single-line labels; raw prompt/assistant content and credentials are rejected. Persisted stores are treated as untrusted: every field is validated and deep-copied before any diagnostic, search, export, or support output.
+- Goal and approval stores are profile-local (`goals.json`, `approvals.json`), atomically written with 0700 directories/0600 files and parent-directory fsync. Symlinked and non-regular storage paths are rejected. Invalid local JSON or unsafe schema-valid records are quarantined with a unique timestamp suffix by a mutating command rather than silently deleted; diagnostics remain read-only and report an in-memory degraded view. Cross-process locks protect all store mutations.
+- `/goal`, `/goal --json`, `/goal add`, `/goal done`, and `/goal cancel` are offline/local-only. One active goal is maintained per workspace/conversation; terminal transitions are idempotent.
+- An active goal reference is captured in the immutable accepted turn snapshot and appears in safe turn/status/search/export diagnostics. Mutating a goal during an active turn does not mutate that snapshot.
+- Approval requests use schema version 1 with safe action summaries, scope references, risk, hash/preview, expiry, and exactly-once execution states. `/approvals`, `/approve`, and `/reject` are local-only. Cross-process locking serializes execution; a persisted interrupted `executing` state becomes failed-uncertain on a later mutating command and is never replayed.
+- `/workspace delete <name>` is the integrated high-risk gated operation. It now creates a local request and leaves the workspace untouched until `/approve <id>`; `/reject` never executes it. This is the only deliberately changed destructive CLI behavior; remote operations retain prior behavior.
+
 ## 2. Binary and build
 
 Implemented build output:

@@ -37,6 +37,7 @@ type TurnRuntimeSnapshot struct {
 	RetryPolicy         string                   `json:"retryPolicy"`
 	CLIVersion          string                   `json:"cliVersion"`
 	BuildSHA            string                   `json:"buildSha,omitempty"`
+	Goal                *Goal                    `json:"goal,omitempty"`
 }
 
 type TurnWorkspaceSnapshot struct {
@@ -89,8 +90,28 @@ func (c *Client) captureTurnRuntimeSnapshot(mcpServers []MCPServer) TurnRuntimeS
 		Workspace: safeSnapshotWorkspace(TurnWorkspaceSnapshot{Name: c.workspaceName, URI: c.workspaceURI, Checksum: c.workspaceChecksum, Folders: append([]WebWorkspaceFolder(nil), c.workspaceFolders...)}),
 		App:       app, WorkingSet: workingSet, WorkingSetHash: canonicalHash(workingSet), IDEContext: safeSnapshotValue(c.currentIDEContext()).(map[string]interface{}), ConversationHistory: safeSnapshotValue(nirvanaConversationHistory(c.history)).([]interface{}),
 		Model:      TurnModelSnapshot{Provider: safeSnapshotString(c.runtime.Provider), LargeModel: safeSnapshotString(effectiveLargeModel(c)), SmallModel: safeSnapshotString(c.runtime.SmallModel), CapabilityID: safeSnapshotString(effectiveCapabilityID(c)), SkillID: safeSnapshotString(strings.TrimSpace(c.webAgentConfig.SkillID)), LargeMaxOutputTokens: c.runtime.LargeMaxOutputTokens, SmallMaxOutputTokens: c.runtime.SmallMaxOutputTokens, LargeThinkingTokens: c.runtime.LargeThinkingTokens, SmallThinkingTokens: c.runtime.SmallThinkingTokens, LargeTemperature: c.runtime.LargeTemperature, SmallTemperature: c.runtime.SmallTemperature},
-		MCPServers: servers, MCPGeneration: canonicalHash(servers), MCPHash: canonicalHash(servers), Timeouts: safeSnapshotTimeouts(timeouts), DefaultTimeout: c.webStartupConfig.DefaultTimeout, RetryPolicy: safeSnapshotString("transport-managed"), CLIVersion: turnRuntimeCLIVersion, BuildSHA: safeSnapshotString(strings.TrimSpace(turnRuntimeBuildSHA)),
+		MCPServers: servers, MCPGeneration: canonicalHash(servers), MCPHash: canonicalHash(servers), Timeouts: safeSnapshotTimeouts(timeouts), DefaultTimeout: c.webStartupConfig.DefaultTimeout, RetryPolicy: safeSnapshotString("transport-managed"), CLIVersion: turnRuntimeCLIVersion, BuildSHA: safeSnapshotString(strings.TrimSpace(turnRuntimeBuildSHA)), Goal: c.activeGoalReference(),
 	}
+}
+
+func cloneTurnRuntimeSnapshot(snapshot TurnRuntimeSnapshot) TurnRuntimeSnapshot {
+	clone := snapshot
+	clone.AuthCapabilities = append([]string(nil), snapshot.AuthCapabilities...)
+	clone.Workspace.Folders = append([]WebWorkspaceFolder(nil), snapshot.Workspace.Folders...)
+	clone.WorkingSet = cloneJSONSlice(snapshot.WorkingSet)
+	clone.IDEContext = cloneJSONMap(snapshot.IDEContext)
+	clone.ConversationHistory = cloneJSONSlice(snapshot.ConversationHistory)
+	clone.MCPServers = cloneMCPServers(snapshot.MCPServers)
+	clone.Timeouts = safeSnapshotTimeouts(snapshot.Timeouts)
+	if snapshot.App != nil {
+		clone.App = safeSnapshotApp(snapshot.App)
+	}
+	if snapshot.Goal != nil {
+		g := *snapshot.Goal
+		g.Checklist = append([]string(nil), snapshot.Goal.Checklist...)
+		clone.Goal = safeGoalReference(g)
+	}
+	return clone
 }
 
 func (c *Client) turnTransport() string {

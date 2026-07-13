@@ -239,6 +239,12 @@ func (c *Client) offlineSearchRecords() ([]offlineSearchRecord, searchSourceHeal
 	for _, tool := range turn.Turn.Tools {
 		records = append(records, offlineSearchRecord{"runtime", "tool", tool.ID, "", map[string]string{"name": tool.Name, "state": tool.State}})
 	}
+	for _, goal := range c.listGoals() {
+		records = append(records, offlineSearchRecord{"local", "goal", goal.ID, goal.UpdatedAt, map[string]string{"title": goal.Title, "status": string(goal.Status), "workspace": goal.Workspace}})
+	}
+	for _, approval := range c.listApprovals() {
+		records = append(records, offlineSearchRecord{"local", "approval", approval.ID, approval.CreatedAt, map[string]string{"actionClass": approval.ActionClass, "status": string(approval.Status), "summary": approval.Summary}})
+	}
 	entries, journal := readTurnJournal(c.opts.Profile, c.workspaceName, c.semanticJournalSequence)
 	sources := searchSourceHealth{Journal: journal.Health, Runtime: "healthy", Messages: "healthy"}
 	if journal.Health == "healthy" || journal.Health == "pruned" {
@@ -386,12 +392,14 @@ func (c *Client) conversationExportPayloads(now time.Time) (map[string][]byte, c
 	scope := c.exportScope(status, turn)
 	events := selectExportEvents(entries, journal, scope)
 	contextDoc := struct {
-		SchemaVersion  int        `json:"schemaVersion"`
-		Workspace      string     `json:"workspace"`
-		ConversationID string     `json:"conversationId,omitempty"`
-		App            *statusApp `json:"app,omitempty"`
-		Snapshot       string     `json:"snapshot"`
-	}{ExportSchemaVersion, scope.Workspace, scope.ConversationID, status.Context.App, exportSnapshotLabel(status, turn)}
+		SchemaVersion  int             `json:"schemaVersion"`
+		Workspace      string          `json:"workspace"`
+		ConversationID string          `json:"conversationId,omitempty"`
+		App            *statusApp      `json:"app,omitempty"`
+		Snapshot       string          `json:"snapshot"`
+		Goals          statusGoals     `json:"goals"`
+		Approvals      statusApprovals `json:"approvals"`
+	}{ExportSchemaVersion, scope.Workspace, scope.ConversationID, status.Context.App, exportSnapshotLabel(status, turn), status.Goals, status.Approvals}
 	journalDoc := struct {
 		SchemaVersion int             `json:"schemaVersion"`
 		Health        turnJournalInfo `json:"health"`

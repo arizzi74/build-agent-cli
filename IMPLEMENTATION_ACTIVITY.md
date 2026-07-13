@@ -1,5 +1,15 @@
 # Implementation Activity
 
+## 2026-07-13 — Roadmap unit 10: durable goals and approval-gated local actions
+
+- Added versioned, profile-local goal and approval stores with atomic private persistence, corruption quarantine, deterministic ordering, bounded retention, and safe/redacted fields.
+- Registered `/goal`, `/approvals`, `/approve`, and `/reject`, including JSON listings and command completion/help support.
+- Captured the active scoped goal into future immutable turn snapshots and exposed safe summaries in status, turn, search, and export artifacts.
+- Integrated explicit confirmation for `/workspace delete <name>`: creation is non-destructive, approval executes once, rejection/expiry does not execute, and concurrent approve calls claim safely.
+- Added focused offline CRUD, transition, corruption, permissions, expiry, race/claim, redaction, and integration tests.
+- Review hardening: diagnostics now use pure, fully validated in-memory views; persisted schema-valid but unsafe records are treated as corrupt and never surfaced. Mutating commands alone repair/quarantine corrupt stores. Goals and approvals use cross-process profile locks; approval execution has durable `executing` state and an interrupted execution is conservatively marked failed-uncertain and never replayed. Atomic writes fsync the parent directory and reject symlinked/non-regular storage paths.
+
+
 - 2026-07-13 14:23 CEST — Final unit 9 review fixes: central read executor now returns safe Content-Type metadata, bounds metadata/session bodies (1 MiB/2 MiB), closes every body, and classifies read failures without retaining oversized content. Active `/turn` retry telemetry is offset at active-turn start so prior process attempts are excluded; idle/last remains process-observed. Semantic retry labels are sanitized before journal append. Added Content-Type, limits/secret-tail, failing-reader, per-turn offset, and journal-canary tests. No binary rebuilt.
 
 - 2026-07-13 14:20 CEST — Unit 8 review fixes: export now derives an explicit selected active/last/no-turn workspace-conversation-turn scope and filters all retained events to that scope; active exports include matching post-checkpoint events, pruned chains retain safe matching suffixes, corrupt chains fail closed only event inclusion, and manifest/message scope policies are explicit. Tagged messages from another conversation are excluded; untagged current history is marked unproven. Content hashes are domain-separated and omitted for short/credential-like bodies. Search now reports overall availability separately from journal/runtime/message health, retains runtime/message search through journal failures, and fully orders field/result ties. Added interleaved conversation, active suffix, pruned/corrupt, metadata scope, hash, and deterministic tests. No binary rebuilt.

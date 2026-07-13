@@ -27,20 +27,25 @@ type turnDocument struct {
 	Journal       turnJournalInfo `json:"journal"`
 }
 type turnDetail struct {
-	State            string          `json:"state"`
-	ServerTurnID     string          `json:"serverTurnId,omitempty"`
-	AcceptedSnapshot *turnSnapshot   `json:"acceptedSnapshot,omitempty"`
-	StartedAt        string          `json:"startedAt,omitempty"`
-	TerminalAt       string          `json:"terminalAt,omitempty"`
-	Duration         string          `json:"duration,omitempty"`
-	Tools            []turnTool      `json:"tools"`
-	Elicitation      string          `json:"elicitation"`
-	Usage            turnUsage       `json:"usage"`
-	TerminalReason   string          `json:"terminalReason,omitempty"`
-	ErrorCategory    string          `json:"errorCategory,omitempty"`
-	PendingNextTurn  turnNextContext `json:"pendingNextTurn"`
-	Retry            turnRetry       `json:"retry"`
-	Telemetry        turnTelemetry   `json:"telemetry"`
+	State            string              `json:"state"`
+	ServerTurnID     string              `json:"serverTurnId,omitempty"`
+	AcceptedSnapshot *turnSnapshot       `json:"acceptedSnapshot,omitempty"`
+	StartedAt        string              `json:"startedAt,omitempty"`
+	TerminalAt       string              `json:"terminalAt,omitempty"`
+	Duration         string              `json:"duration,omitempty"`
+	Tools            []turnTool          `json:"tools"`
+	Elicitation      string              `json:"elicitation"`
+	Usage            turnUsage           `json:"usage"`
+	TerminalReason   string              `json:"terminalReason,omitempty"`
+	ErrorCategory    string              `json:"errorCategory,omitempty"`
+	PendingNextTurn  turnNextContext     `json:"pendingNextTurn"`
+	Retry            turnRetry           `json:"retry"`
+	Telemetry        turnTelemetry       `json:"telemetry"`
+	Approvals        turnApprovalSummary `json:"approvals"`
+}
+type turnApprovalSummary struct {
+	Pending int `json:"pending"`
+	Recent  int `json:"recent"`
 }
 type turnSnapshot struct {
 	ID             string `json:"id,omitempty"`
@@ -52,6 +57,7 @@ type turnSnapshot struct {
 	Transport      string `json:"transport,omitempty"`
 	AppScopeID     string `json:"appScopeId,omitempty"`
 	WorkingSetHash string `json:"workingSetHash,omitempty"`
+	GoalID         string `json:"goalId,omitempty"`
 }
 type turnTool struct {
 	ID    string `json:"id"`
@@ -115,6 +121,12 @@ func (c *Client) turnDocument() turnDocument {
 	state, snapshot, active, started, checkpoint := c.turnReadState()
 	entries, journal := readTurnJournal(c.opts.Profile, c.workspaceName, checkpoint)
 	doc := turnDocument{SchemaVersion: TurnSchemaVersion, GeneratedAt: statusNow().UTC().Format(time.RFC3339Nano), Availability: "no_turn", Turn: turnDetail{State: string(state.Status), Tools: []turnTool{}, Elicitation: "unknown", Usage: turnUsage{Status: "unknown"}, PendingNextTurn: turnNextContext{State: "none"}, Retry: turnRetry{State: "unknown"}, Telemetry: turnTelemetry{Components: []string{}, State: "unknown"}}, Journal: journal}
+	for _, approval := range c.listApprovals() {
+		doc.Turn.Approvals.Recent++
+		if approval.Status == ApprovalPending || approval.Status == ApprovalApproved {
+			doc.Turn.Approvals.Pending++
+		}
+	}
 	if state.Status == SemanticTurnIdle {
 		return doc
 	}
@@ -126,13 +138,13 @@ func (c *Client) turnDocument() turnDocument {
 	}
 	if snapshot != nil {
 		ctx := state.Context
-		doc.Turn.AcceptedSnapshot = &turnSnapshot{ID: snapshotID(*snapshot), Generation: safeSnapshotString(snapshot.MCPGeneration), CapturedAt: snapshot.CapturedAt.UTC().Format(time.RFC3339Nano), Profile: safeSnapshotString(snapshot.Profile), Workspace: safeSnapshotString(snapshot.Workspace.Name), ConversationID: safeSnapshotString(snapshot.ConversationID), Transport: safeSnapshotString(snapshot.Transport), WorkingSetHash: safeSnapshotString(ctx.WorkingSetHash)}
+		doc.Turn.AcceptedSnapshot = &turnSnapshot{ID: snapshotID(*snapshot), Generation: safeSnapshotString(snapshot.MCPGeneration), CapturedAt: snapshot.CapturedAt.UTC().Format(time.RFC3339Nano), Profile: safeSnapshotString(snapshot.Profile), Workspace: safeSnapshotString(snapshot.Workspace.Name), ConversationID: safeSnapshotString(snapshot.ConversationID), Transport: safeSnapshotString(snapshot.Transport), WorkingSetHash: safeSnapshotString(ctx.WorkingSetHash), GoalID: safeSnapshotString(ctx.GoalID)}
 		if snapshot.App != nil {
 			doc.Turn.AcceptedSnapshot.AppScopeID = safeSnapshotString(snapshot.App.ScopeID)
 		}
 	} else {
 		ctx := state.Context
-		doc.Turn.AcceptedSnapshot = &turnSnapshot{Profile: safeSnapshotString(ctx.Profile), Workspace: safeSnapshotString(ctx.Workspace), ConversationID: safeSnapshotString(ctx.ConversationID), Transport: safeSnapshotString(ctx.Transport), Generation: safeSnapshotString(ctx.RuntimeGeneration), WorkingSetHash: safeSnapshotString(ctx.WorkingSetHash), AppScopeID: safeSnapshotString(ctx.AppScopeID)}
+		doc.Turn.AcceptedSnapshot = &turnSnapshot{Profile: safeSnapshotString(ctx.Profile), Workspace: safeSnapshotString(ctx.Workspace), ConversationID: safeSnapshotString(ctx.ConversationID), Transport: safeSnapshotString(ctx.Transport), Generation: safeSnapshotString(ctx.RuntimeGeneration), WorkingSetHash: safeSnapshotString(ctx.WorkingSetHash), AppScopeID: safeSnapshotString(ctx.AppScopeID), GoalID: safeSnapshotString(ctx.GoalID)}
 	}
 	timing := journalTurnTiming{}
 	// A pruned or unhealthy chain cannot prove that its first lifecycle marker
@@ -217,7 +229,7 @@ func (c *Client) turnReadState() (SemanticTurnState, *TurnRuntimeSnapshot, bool,
 	active := c.processing && c.turnRuntimeSnapshot != nil
 	var snapshot *TurnRuntimeSnapshot
 	if active {
-		v := *c.turnRuntimeSnapshot
+		v := cloneTurnRuntimeSnapshot(*c.turnRuntimeSnapshot)
 		snapshot = &v
 	}
 	started := c.turnStartedAt

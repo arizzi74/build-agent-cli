@@ -36,6 +36,11 @@ const (
 	EventTurnFailed             SemanticEventType = "turn_failed"
 	EventTurnCompleted          SemanticEventType = "turn_completed"
 	EventTelemetryFailed        SemanticEventType = "telemetry_failed"
+	EventGoalStatusChanged      SemanticEventType = "goal_status_changed"
+	EventApprovalRequested      SemanticEventType = "approval_requested"
+	EventApprovalStatusChanged  SemanticEventType = "approval_status_changed"
+	EventApprovalExecuted       SemanticEventType = "approval_executed"
+	EventApprovalFailed         SemanticEventType = "approval_failed"
 )
 
 // SemanticEvent is deliberately smaller than any transport frame. Metadata is
@@ -63,6 +68,7 @@ type TurnContext struct {
 	WorkingSetHash    string `json:"workingSetHash,omitempty"`
 	RuntimeGeneration string `json:"runtimeGeneration,omitempty"`
 	Transport         string `json:"transport,omitempty"`
+	GoalID            string `json:"goalId,omitempty"`
 }
 type TurnAcceptedPayload struct {
 	Context TurnContext `json:"context"`
@@ -128,6 +134,15 @@ type TurnCompletedPayload struct {
 type TelemetryFailedPayload struct {
 	Component string `json:"component,omitempty"`
 	Code      string `json:"code,omitempty"`
+}
+type GoalStatusChangedPayload struct {
+	GoalID string `json:"goalId"`
+	Status string `json:"status"`
+}
+type ApprovalEventPayload struct {
+	ApprovalID  string `json:"approvalId"`
+	Status      string `json:"status,omitempty"`
+	ActionClass string `json:"actionClass,omitempty"`
 }
 
 type SemanticTurnStatus string
@@ -278,6 +293,20 @@ func Apply(state SemanticTurnState, event SemanticEvent) (SemanticTurnState, err
 	}
 
 	switch event.Type {
+	case EventGoalStatusChanged:
+		if _, ok := event.Payload.(GoalStatusChangedPayload); !ok {
+			return state, payloadTypeError(event.Type)
+		}
+		if !activeTurnStatus(state.Status) {
+			return state, errors.New("goal event outside active turn")
+		}
+	case EventApprovalRequested, EventApprovalStatusChanged, EventApprovalExecuted, EventApprovalFailed:
+		if _, ok := event.Payload.(ApprovalEventPayload); !ok {
+			return state, payloadTypeError(event.Type)
+		}
+		if !activeTurnStatus(state.Status) {
+			return state, errors.New("approval event outside active turn")
+		}
 	case EventConnectionStateChanged:
 		p, ok := event.Payload.(ConnectionStateChangedPayload)
 		if !ok {

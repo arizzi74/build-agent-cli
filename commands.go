@@ -308,10 +308,11 @@ func handleWorkspaceCommand(parent context.Context, c *Client, args []string) er
 			return fmt.Errorf("usage: /workspace delete <name>")
 		}
 		name := strings.Join(args[1:], " ")
-		if err := deleteWorkspace(c.opts.Profile, c.workspaceName, name); err != nil {
+		request, err := c.requestWorkspaceDeleteApproval(name)
+		if err != nil {
 			return err
 		}
-		slashCommandPrintf("deleted workspace %q\n", name)
+		slashCommandPrintf("workspace deletion requires approval: %s (run /approve %s or /reject %s)\n", request.ID, request.ID, request.ID)
 		return nil
 	default:
 		return fmt.Errorf("unknown /workspace command %q", args[0])
