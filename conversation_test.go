@@ -54,9 +54,47 @@ func TestParseWebConversationsAndMessages(t *testing.T) {
 }
 
 func TestConversationLabelIsSingleLine(t *testing.T) {
-	label := conversationLabel(WebConversation{ID: "abcdef1234567890", Title: "Global: CMDB\nAssessment   Prompt", State: "open"})
-	if strings.Contains(label, "\n") || strings.Contains(label, "  Assessment") || !strings.Contains(label, "Global: CMDB Assessment Prompt") {
+	label := conversationLabel(WebConversation{ID: "abcdef1234567890", Title: "Global: CMDB\nAssessment\x1b[31m   Prompt", State: "open"})
+	if strings.ContainsAny(label, "\n\x1b") || strings.Contains(label, "  Assessment") || !strings.Contains(label, "Global: CMDB Assessment Prompt") || strings.Contains(label, "[31m") {
 		t.Fatalf("label was not compacted: %q", label)
+	}
+}
+
+func TestConversationLabelsIncludeScopeAndLastUsed(t *testing.T) {
+	app := conversationLabel(WebConversation{ID: "conv-app", ApplicationID: "app1234567890", ApplicationName: "CMDB\nTools", Title: "Review   records", State: "open", UpdatedAt: "2026-07-13\n12:00"})
+	if want := "📦 CMDB Tools · Review records  [open]  2026-07-13 12:00  conv-app"; app != want {
+		t.Fatalf("app label = %q, want %q", app, want)
+	}
+	global := conversationLabelWithCurrent(WebConversation{ID: "conv-global", Title: "Global chat"}, true)
+	if want := "🌐 Global / no app · Global chat  conv-global  🕘 Last used"; global != want {
+		t.Fatalf("global current label = %q, want %q", global, want)
+	}
+	missingName := conversationLabel(WebConversation{ID: "conv-unnamed", ApplicationID: "1234567890abcdef", Title: "Scoped chat"})
+	if !strings.HasPrefix(missingName, "📦 12345678…cdef · Scoped chat") || strings.Contains(missingName, "Global / no app") {
+		t.Fatalf("missing application name label = %q", missingName)
+	}
+}
+
+func TestConversationListAndPlainPickerExplainGlobalScope(t *testing.T) {
+	conversations := []WebConversation{
+		{ID: "global", Title: "Everywhere"},
+		{ID: "app", ApplicationID: "app-id", ApplicationName: "Scoped app", Title: "Only here"},
+	}
+	for name, printFn := range map[string]func([]WebConversation, string){
+		"list":   printConversationList,
+		"picker": printConversationPicker,
+	} {
+		t.Run(name, func(t *testing.T) {
+			output := captureStderr(t, func() { printFn(conversations, "global") })
+			if got := strings.Count(output, "🌐 Global / no app conversations are available across workspaces."); got != 1 {
+				t.Fatalf("global explanation count = %d, output=%q", got, output)
+			}
+			for _, want := range []string{"🌐 Global / no app · Everywhere", "📦 Scoped app · Only here", "🕘 Last used"} {
+				if !strings.Contains(output, want) {
+					t.Fatalf("output missing %q: %q", want, output)
+				}
+			}
+		})
 	}
 }
 

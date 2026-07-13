@@ -1,0 +1,9 @@
+LABEL_FOCUSED
+ok  	build-agent-go-cli	0.019s
+LABEL_RACE
+ok  	build-agent-go-cli	0.093s
+LABEL_FULL
+ok  	build-agent-go-cli	13.790s
+LABEL_VET
+LABEL_DIFF
+LABEL_RESULTS:0:0:0:0:0

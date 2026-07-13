@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 var errWebConversationNotFound = errors.New("web conversation not found")
@@ -1187,12 +1188,15 @@ func printConversationPicker(conversations []WebConversation, currentID string) 
 	if len(conversations) == 0 {
 		fmt.Fprintln(os.Stderr, "  <none found>")
 	} else {
+		if hasGlobalConversations(conversations) {
+			fmt.Fprintln(os.Stderr, "  🌐 Global / no app conversations are available across workspaces.")
+		}
 		for i, conv := range conversations {
 			marker := " "
-			if conv.ID != "" && conv.ID == currentID {
+			if conversationIDMatches(conv.ID, currentID) {
 				marker = "*"
 			}
-			fmt.Fprintf(os.Stderr, "%s %2d) %s\n", marker, i+1, conversationLabel(conv))
+			fmt.Fprintf(os.Stderr, "%s %2d) %s\n", marker, i+1, conversationLabelWithCurrent(conv, conversationIDMatches(conv.ID, currentID)))
 		}
 	}
 	fmt.Fprintln(os.Stderr, "   n) New conversation")
@@ -1204,12 +1208,15 @@ func printConversationList(conversations []WebConversation, currentID string) {
 		return
 	}
 	fmt.Fprintln(os.Stderr, "Build Agent conversations:")
+	if hasGlobalConversations(conversations) {
+		fmt.Fprintln(os.Stderr, "  🌐 Global / no app conversations are available across workspaces.")
+	}
 	for i, conv := range conversations {
 		marker := " "
-		if conv.ID != "" && conv.ID == currentID {
+		if conversationIDMatches(conv.ID, currentID) {
 			marker = "*"
 		}
-		fmt.Fprintf(os.Stderr, "%s %2d) %s\n", marker, i+1, conversationLabel(conv))
+		fmt.Fprintf(os.Stderr, "%s %2d) %s\n", marker, i+1, conversationLabelWithCurrent(conv, conversationIDMatches(conv.ID, currentID)))
 	}
 }
 
@@ -1253,25 +1260,66 @@ func conversationBySelection(conversations []WebConversation, answer string) (We
 }
 
 func conversationLabel(conv WebConversation) string {
+	return conversationLabelWithCurrent(conv, false)
+}
+
+func conversationLabelWithCurrent(conv WebConversation, current bool) string {
 	title := singleLineLabel(conv.Title)
 	if title == "" {
 		title = "Untitled conversation"
 	}
-	parts := []string{title}
-	if conv.State != "" {
-		parts = append(parts, "["+conv.State+"]")
+	appID := singleLineLabel(conv.ApplicationID)
+	appName := singleLineLabel(conv.ApplicationName)
+	prefix := "🌐 Global / no app"
+	if appID != "" {
+		if appName == "" {
+			appName = shortConversationID(appID)
+		}
+		prefix = "📦 " + appName
 	}
-	if conv.UpdatedAt != "" {
-		parts = append(parts, conv.UpdatedAt)
+	parts := []string{prefix + " · " + title}
+	if state := singleLineLabel(conv.State); state != "" {
+		parts = append(parts, "["+state+"]")
 	}
-	if conv.ID != "" {
-		parts = append(parts, shortConversationID(conv.ID))
+	if updatedAt := singleLineLabel(conv.UpdatedAt); updatedAt != "" {
+		parts = append(parts, updatedAt)
+	}
+	if id := singleLineLabel(conv.ID); id != "" {
+		parts = append(parts, shortConversationID(id))
+	}
+	if current {
+		parts = append(parts, "🕘 Last used")
 	}
 	return strings.Join(parts, "  ")
 }
 
+func conversationIDMatches(id, currentID string) bool {
+	id = strings.TrimSpace(id)
+	currentID = strings.TrimSpace(currentID)
+	if id == "" || currentID == "" {
+		return false
+	}
+	if id == currentID {
+		return true
+	}
+	currentNormalized := normalizeGatewayConversationID(currentID)
+	return currentNormalized != "" && normalizeGatewayConversationID(id) == currentNormalized
+}
+
+func hasGlobalConversations(conversations []WebConversation) bool {
+	for _, conv := range conversations {
+		if strings.TrimSpace(conv.ApplicationID) == "" {
+			return true
+		}
+	}
+	return false
+}
+
 func singleLineLabel(s string) string {
-	return strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+	s = stripANSI(s)
+	return strings.Join(strings.FieldsFunc(strings.TrimSpace(s), func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}), " ")
 }
 
 func shortConversationID(id string) string {

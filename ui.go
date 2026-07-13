@@ -1194,6 +1194,7 @@ type conversationPickerOption struct {
 	Value   string
 	Label   string
 	Current bool
+	Global  bool
 }
 
 func promptInstanceSelection(instances []ProfileInfo, currentProfile string) (string, error) {
@@ -1438,8 +1439,9 @@ func conversationPickerOptions(conversations []WebConversation, currentID string
 		}
 		options = append(options, conversationPickerOption{
 			Value:   conv.ID,
-			Label:   conversationLabel(conv),
+			Label:   conversationLabelWithCurrent(conv, current),
 			Current: current,
+			Global:  strings.TrimSpace(conv.ApplicationID) == "",
 		})
 	}
 	if allowNew {
@@ -1769,6 +1771,12 @@ func conversationPickerLines(options []conversationPickerOption, selected int) [
 	lines := []string{pickerHeader("Build Agent conversations", "↑/↓ choose · Enter open · n new · q cancel", color)}
 	if len(options) == 0 {
 		return append(lines, style("  <none found>", ansiDim, color))
+	}
+	for _, option := range options {
+		if option.Global {
+			lines = append(lines, style("  🌐 Global / no app conversations are available across workspaces.", ansiDim, color))
+			break
+		}
 	}
 	for i, option := range options {
 		lines = append(lines, pickerOptionLine(option, i == selected, color))

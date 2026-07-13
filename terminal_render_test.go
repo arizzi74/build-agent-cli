@@ -275,6 +275,26 @@ func TestConversationPickerOptionsPreselectCurrentConversation(t *testing.T) {
 	}
 }
 
+func TestConversationPickerScopeLabelsAndGlobalExplanation(t *testing.T) {
+	options, selected := conversationPickerOptions([]WebConversation{
+		{ID: "global", Title: "Everywhere"},
+		{ID: "app", ApplicationID: "app-id", ApplicationName: "Scoped app", Title: "Only here"},
+	}, "global", true)
+	if selected != 0 || !options[0].Current || !options[0].Global {
+		t.Fatalf("global conversation should remain current/preselected: selected=%d options=%#v", selected, options)
+	}
+	if !strings.Contains(options[0].Label, "🌐 Global / no app · Everywhere") || !strings.Contains(options[0].Label, "🕘 Last used") {
+		t.Fatalf("global option label = %q", options[0].Label)
+	}
+	if !strings.Contains(options[1].Label, "📦 Scoped app · Only here") {
+		t.Fatalf("app option label = %q", options[1].Label)
+	}
+	joined := strings.Join(conversationPickerLines(options, selected), "\n")
+	if got := strings.Count(joined, "🌐 Global / no app conversations are available across workspaces."); got != 1 {
+		t.Fatalf("global explanation count = %d, lines=%q", got, joined)
+	}
+}
+
 func TestTerminalRowsCountsWrappingAndANSI(t *testing.T) {
 	got := terminalRows("short\n\x1b[1m"+strings.Repeat("x", 101)+"\x1b[0m", 100)
 	if got != 3 {

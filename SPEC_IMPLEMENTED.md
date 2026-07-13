@@ -327,6 +327,8 @@ Implemented primary interactive conversation selector:
 
 `/conversation` opens the conversation picker and includes both existing conversations and `New conversation`. Legacy/direct selectors (`/conversation current|list|new|use`) and the `--conversation latest|new|<id>|<id-prefix>|<number>` flag remain accepted for scripts/tests but are no longer advertised in the interactive slash picker or help.
 
+Conversation picker and `/conversation list` rows label scope explicitly: app-bound rows use `📦 <application name> · <title>`, app-less rows use `🌐 Global / no app · <title>`, and app-bound rows missing a name safely use a shortened application ID. Existing title/state/updated/id metadata remains present and single-line sanitized. The saved/current workspace conversation is marked `🕘 Last used` without changing selection behavior. When global rows are included, picker/list output prints a single explanatory line that those conversations are available across workspaces.
+
 Conversation behavior:
 
 - Works in both default Nirvana and legacy web-gateway mode.
