@@ -20,7 +20,7 @@ The installer selects the correct published binary, verifies its SHA-256 checksu
 
 Every released `bacli` checks `https://nowdemo.it/bacli/version.json` at startup. If a newer version exists, it downloads and verifies the matching platform binary, installs/stages the update, exits, and prints a message asking you to relaunch `bacli`. Update-check failures are non-fatal; set `BACLI_NO_UPDATE=1` to disable the check temporarily.
 
-Supported release platforms are Linux arm64, macOS Intel, macOS Apple Silicon, and Windows amd64. See [BUILD.md](BUILD.md) for artifact names, publication ordering, release commands, and update-manifest details.
+Supported release platforms are Linux arm64, Linux amd64, macOS Intel, macOS Apple Silicon, and Windows amd64. See [BUILD.md](BUILD.md) for artifact names, publication ordering, release commands, and update-manifest details.
 
 The primary/default mode is now the Glider Build Agent Nirvana websocket transport, matching the web UI path observed in Chrome HARs. It supports real streaming and advertises the same WDF/static MCP server configs as the Glider client. The older web Build Agent gateway/AMB transport remains available with `--web-gateway` for compatibility testing.
 

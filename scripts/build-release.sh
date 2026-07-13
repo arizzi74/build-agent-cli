@@ -14,7 +14,7 @@ fi
 LDFLAGS="-s -w -buildid= -X main.cliVersion=$VERSION -X main.cliUpdateBaseURL=$BASE_URL"
 
 mkdir -p "$DIST"
-rm -f "$DIST"/bacli-linux-arm64 "$DIST"/bacli-darwin-amd64 "$DIST"/bacli-darwin-arm64 "$DIST"/bacli-windows-amd64.exe "$DIST"/version.json
+rm -f "$DIST"/bacli-linux-arm64 "$DIST"/bacli-linux-amd64 "$DIST"/bacli-darwin-amd64 "$DIST"/bacli-darwin-arm64 "$DIST"/bacli-windows-amd64.exe "$DIST"/version.json
 
 build() {
   goos=$1
@@ -25,10 +25,11 @@ build() {
 }
 
 build linux arm64 bacli-linux-arm64
+build linux amd64 bacli-linux-amd64
 build darwin amd64 bacli-darwin-amd64
 build darwin arm64 bacli-darwin-arm64
 build windows amd64 bacli-windows-amd64.exe
-chmod 755 "$DIST/install.sh" "$DIST/bacli-linux-arm64" "$DIST/bacli-darwin-amd64" "$DIST/bacli-darwin-arm64"
+chmod 755 "$DIST/install.sh" "$DIST/bacli-linux-arm64" "$DIST/bacli-linux-amd64" "$DIST/bacli-darwin-amd64" "$DIST/bacli-darwin-arm64"
 
 python3 - "$VERSION" "$BASE_URL" "$DIST" <<'PY'
 import hashlib, json, pathlib, sys
@@ -36,6 +37,7 @@ version, base, dist = sys.argv[1:]
 d = pathlib.Path(dist)
 files = {
     'linux-arm64': 'bacli-linux-arm64',
+    'linux-amd64': 'bacli-linux-amd64',
     'darwin-amd64': 'bacli-darwin-amd64',
     'darwin-arm64': 'bacli-darwin-arm64',
     'windows-amd64': 'bacli-windows-amd64.exe',

@@ -41,6 +41,8 @@ func releaseTarget(goos, goarch string) string {
 	switch goos + "/" + goarch {
 	case "linux/arm64":
 		return "linux-arm64"
+	case "linux/amd64":
+		return "linux-amd64"
 	case "darwin/amd64":
 		return "darwin-amd64"
 	case "darwin/arm64":

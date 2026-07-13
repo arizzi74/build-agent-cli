@@ -1,22 +1,26 @@
 {
   "schemaVersion": 1,
-  "version": "2026.07.13.1",
+  "version": "2026.07.14.1",
   "files": {
     "linux-arm64": {
       "url": "bacli-linux-arm64",
-      "sha256": "1490507edda5c589728e96396667794ab3225942ef89a8dcf331f346e2a935df"
+      "sha256": "0b13a69b82558535ca9489ef6300bbb4d2517e3f8e806d4d13a192d94abf16eb"
+    },
+    "linux-amd64": {
+      "url": "bacli-linux-amd64",
+      "sha256": "ee7f0fb0ae64af8d89819baf044654eacb2396c3eef137e88ac6cdeb06bb7a42"
     },
     "darwin-amd64": {
       "url": "bacli-darwin-amd64",
-      "sha256": "13b1c36cdbd8e16b1e8a4e7e2044a4ab0548d6334f2892ad52a4cdb1556d232d"
+      "sha256": "749b5046497868a75fb1dcbdf12b9db88b769db61586d0d33f6033618130890b"
     },
     "darwin-arm64": {
       "url": "bacli-darwin-arm64",
-      "sha256": "04bab0dac44f1fd0844f2af19587c11e5d52a17eebc9f9ddbe9c4094c0dcd050"
+      "sha256": "dd5e210ed0a8f50c6be40cbf550cd310a2156d57a766df66c57eaea2e434597e"
     },
     "windows-amd64": {
       "url": "bacli-windows-amd64.exe",
-      "sha256": "811a84dc56173b6c0839c0db0ca0d9f18bf6376a2f4f20a836d882a060e6b576"
+      "sha256": "69398e67d3a644e497fd462092aa425dbad1f96f184d284486fdcb287bacb33e"
     }
   }
 }

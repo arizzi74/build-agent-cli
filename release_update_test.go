@@ -38,10 +38,11 @@ func TestCompareReleaseVersions(t *testing.T) {
 func TestReleaseTarget(t *testing.T) {
 	cases := map[string]string{
 		"linux/arm64":   "linux-arm64",
+		"linux/amd64":   "linux-amd64",
 		"darwin/amd64":  "darwin-amd64",
 		"darwin/arm64":  "darwin-arm64",
 		"windows/amd64": "windows-amd64",
-		"linux/amd64":   "",
+		"linux/386":     "",
 	}
 	for raw, want := range cases {
 		var goos, goarch string

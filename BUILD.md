@@ -1,12 +1,13 @@
 # Build and release
 
-Build Agent Go CLI releases are cross-compiled as four pure-Go, stripped binaries. All public release files live under `./dist` and the installed executable is always named `bacli` (`bacli.exe` on Windows).
+Build Agent Go CLI releases are cross-compiled as five pure-Go, stripped binaries. All public release files live under `./dist` and the installed executable is always named `bacli` (`bacli.exe` on Windows).
 
 ## Supported targets
 
 | Target | Release file |
 | --- | --- |
 | Linux aarch64 / arm64 | `dist/bacli-linux-arm64` |
+| Linux Intel/AMD / amd64 | `dist/bacli-linux-amd64` |
 | macOS Intel / amd64 | `dist/bacli-darwin-amd64` |
 | macOS Apple Silicon / arm64 | `dist/bacli-darwin-arm64` |
 | Windows amd64 / x86-64 | `dist/bacli-windows-amd64.exe` |
@@ -39,6 +40,7 @@ The script creates:
 ```text
 dist/
 ├── bacli-linux-arm64
+├── bacli-linux-amd64
 ├── bacli-darwin-amd64
 ├── bacli-darwin-arm64
 ├── bacli-windows-amd64.exe
@@ -65,6 +67,7 @@ https://nowdemo.it/bacli/install.sh
 https://nowdemo.it/bacli/install.ps1
 https://nowdemo.it/bacli/version.json
 https://nowdemo.it/bacli/bacli-linux-arm64
+https://nowdemo.it/bacli/bacli-linux-amd64
 https://nowdemo.it/bacli/bacli-darwin-amd64
 https://nowdemo.it/bacli/bacli-darwin-arm64
 https://nowdemo.it/bacli/bacli-windows-amd64.exe
@@ -74,7 +77,7 @@ https://nowdemo.it/bacli/bacli-windows-amd64.exe
 
 ## Installer behavior
 
-- Unix installer: detects Linux arm64, macOS Intel, or macOS Apple Silicon; verifies SHA-256; installs as `~/.local/bin/bacli`; and adds an idempotent PATH line to `.zshrc`, `.bashrc`, or `.profile` when needed.
+- Unix installer: detects Linux arm64, Linux amd64, macOS Intel, or macOS Apple Silicon; verifies SHA-256; installs as `~/.local/bin/bacli`; and adds an idempotent PATH line to `.zshrc`, `.bashrc`, or `.profile` when needed.
 - Windows installer: selects Windows amd64; verifies SHA-256; installs as `%USERPROFILE%\.local\bin\bacli.exe`; and adds that directory to the user PATH when needed.
 
 Environment overrides for staging/testing:
@@ -117,6 +120,7 @@ Inspect artifacts:
 ```bash
 file dist/bacli-*
 ldd dist/bacli-linux-arm64 || true
+ldd dist/bacli-linux-amd64 || true
 sha256sum -c dist/SHA256SUMS
 ls -lh dist/
 ```

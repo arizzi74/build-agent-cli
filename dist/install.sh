@@ -17,6 +17,7 @@ os=$(uname -s)
 arch=$(uname -m)
 case "$os/$arch" in
   Linux/aarch64|Linux/arm64) target=linux-arm64 ;;
+  Linux/x86_64|Linux/amd64) target=linux-amd64 ;;
   Darwin/x86_64|Darwin/amd64) target=darwin-amd64 ;;
   Darwin/arm64|Darwin/aarch64) target=darwin-arm64 ;;
   *) fail "unsupported platform $os/$arch" ;;
