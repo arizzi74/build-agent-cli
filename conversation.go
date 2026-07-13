@@ -555,7 +555,7 @@ func (c *Client) conversationListApplicationIDs(ctx context.Context) ([]string, 
 		for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
 			return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\t'
 		}) {
-			id := normalizeGatewayConversationID(part)
+			id := normalizeConversationApplicationID(part)
 			if id == "" {
 				continue
 			}
@@ -574,6 +574,15 @@ func (c *Client) conversationListApplicationIDs(ctx context.Context) ([]string, 
 		if app, ok := appScopeFromWorkspaceFolder(folder); ok {
 			add(app.AppSysID)
 			add(app.ScopeID)
+			// Build Agent conversation rows vary by release: application_id can
+			// be either the sys_id or the textual scope (for example x_snc_foo).
+			// Resolve both aliases so the server query and local safety filter
+			// cannot leak scope-valued conversations from another workspace.
+			if metadata, err := c.fetchServiceNowAppBySysID(ctx, app.AppSysID); err == nil {
+				add(metadata.Scope)
+			} else if c.debug {
+				c.debugf("[conversation list] app scope lookup skipped for %s: %v\n", app.AppSysID, err)
+			}
 		}
 	}
 	collectConversationApplicationIDs(c.workingSet, add)
@@ -631,6 +640,17 @@ func buildAgentConversationListSuffix(applicationIDs []string) string {
 	return "/conversations?" + query.Encode()
 }
 
+func normalizeConversationApplicationID(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" || raw == "<nil>" || raw == "null" {
+		return ""
+	}
+	if compact := normalizeGatewayConversationID(raw); compact != "" {
+		return compact
+	}
+	return raw
+}
+
 func filterWebConversationsForApplications(conversations []WebConversation, applicationIDs []string) []WebConversation {
 	return filterWebConversationsForWorkspaceApplications(conversations, applicationIDs, false)
 }
@@ -639,7 +659,7 @@ func filterWebConversationsForWorkspaceApplications(conversations []WebConversat
 	if workspaceScoped && len(applicationIDs) == 0 {
 		out := make([]WebConversation, 0, len(conversations))
 		for _, conv := range conversations {
-			if normalizeGatewayConversationID(conv.ApplicationID) == "" {
+			if normalizeConversationApplicationID(conv.ApplicationID) == "" {
 				out = append(out, conv)
 			}
 		}
@@ -650,7 +670,7 @@ func filterWebConversationsForWorkspaceApplications(conversations []WebConversat
 	}
 	allowed := map[string]struct{}{}
 	for _, id := range applicationIDs {
-		if normalized := normalizeGatewayConversationID(id); normalized != "" {
+		if normalized := normalizeConversationApplicationID(id); normalized != "" {
 			allowed[normalized] = struct{}{}
 		}
 	}
@@ -659,7 +679,7 @@ func filterWebConversationsForWorkspaceApplications(conversations []WebConversat
 	}
 	out := make([]WebConversation, 0, len(conversations))
 	for _, conv := range conversations {
-		appID := normalizeGatewayConversationID(conv.ApplicationID)
+		appID := normalizeConversationApplicationID(conv.ApplicationID)
 		if appID == "" {
 			out = append(out, conv)
 			continue

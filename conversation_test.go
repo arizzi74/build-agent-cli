@@ -731,6 +731,64 @@ func TestBuildAgentAPIConversationListUsesWebUIApplicationIDList(t *testing.T) {
 	}
 }
 
+func TestWorkspaceConversationFilterRejectsOutOfWorkspaceScopeValues(t *testing.T) {
+	workspaceSysID := "8c93bae33b58f210d6531d9c73e45a5b"
+	workspaceScope := "x_snc_reverse_prox"
+	conversations := []WebConversation{
+		{ID: "global", Title: "Global", ApplicationID: ""},
+		{ID: "sysid", Title: "Reverse Proxy by sys id", ApplicationID: workspaceSysID},
+		{ID: "scope", Title: "Reverse Proxy by scope", ApplicationID: workspaceScope},
+		{ID: "whatsapp", Title: "WhatsApp Summarization Bot", ApplicationID: "x_snc_whatsapp_sum"},
+	}
+	got := filterWebConversationsForWorkspaceApplications(conversations, []string{workspaceSysID, workspaceScope}, true)
+	if len(got) != 3 || got[0].ID != "global" || got[1].ID != "sysid" || got[2].ID != "scope" {
+		t.Fatalf("workspace scope filter leaked or removed rows: %#v", got)
+	}
+}
+
+func TestBuildAgentAPIConversationListResolvesWorkspaceScopeAliases(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	appSysID := "8c93bae33b58f210d6531d9c73e45a5b"
+	appScope := "x_snc_reverse_prox"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/now/table/sys_app/" + appSysID:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"result":{"sys_id":"` + appSysID + `","name":"Reverse Prox","scope":"` + appScope + `"}}`))
+		case "/api/sn_build_agent/build_agent_api/conversations":
+			if got := r.URL.Query().Get("application_id_list"); got != appSysID+","+appScope {
+				t.Fatalf("application_id_list = %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"result":[` +
+				`{"sys_id":"keep","title":"Reverse Proxy","application_id":"` + appScope + `"},` +
+				`{"sys_id":"leak","title":"WhatsApp Summarization Bot","application_id":"x_snc_whatsapp_sum"}` +
+				`]}`))
+		case "/api/now/table/sn_ba_core_conversation", "/api/now/table/sn_build_agent_conversation":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"result":[]}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.String())
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(CLIConfig{InstanceURL: server.URL}, Options{Profile: "default", AuthMode: authModeCookie})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.httpClient = server.Client()
+	client.gatewayAuth = authModeCookie
+	client.workspaceURI = "settings:/users/test/workspaces/Rev Proxy.code-workspace"
+	client.workspaceFolders = []WebWorkspaceFolder{{Name: "Reverse Prox", URI: "now-file:/" + appSysID}}
+	conversations, err := client.ListWebConversations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conversations) != 1 || conversations[0].ID != "keep" {
+		t.Fatalf("out-of-workspace scope-valued conversation leaked: %#v", conversations)
+	}
+}
+
 func TestBuildAgentAPIConversationListKeepsGlobalRowsWhenWorkspaceHasNoAppIDs(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	globalID := "aa6fe6bc3b91c350d6531d9c73e45aaa"
