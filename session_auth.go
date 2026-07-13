@@ -82,14 +82,11 @@ func saveWebSession(profile string, session WebSession) error {
 	if session.CreatedAt.IsZero() {
 		session.CreatedAt = time.Now()
 	}
-	if err := os.MkdirAll(profileDir(profile), 0o700); err != nil {
-		return err
-	}
 	raw, err := json.MarshalIndent(session, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(sessionFile(profile), append(raw, '\n'), 0o600)
+	return writePrivateFile(sessionFile(profile), append(raw, '\n'))
 }
 
 func deleteWebSession(profile string) error {

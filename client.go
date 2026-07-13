@@ -453,10 +453,10 @@ func (c *Client) startNirvanaPingLoop() {
 }
 
 func (c *Client) prepareNirvanaConversationSelection(ctx context.Context) error {
-	if c.opts.CodeAssistWS || c.opts.Conversation == "" {
+	if c.opts.CodeAssistWS {
 		return nil
 	}
-	tok, err := getAccessToken(ctx, oauthConfig(c.cfg), c.opts.Profile, c.cfg.InstanceURL, c.opts.NoOpen, false)
+	tok, err := c.getNirvanaAccessToken(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -3369,7 +3369,7 @@ func (c *Client) handleNirvanaStreamEnd(_ string, contentType string) {
 
 func (c *Client) buildInvokePayload(ctx context.Context, silentAuth bool) (map[string]interface{}, map[string]interface{}, error) {
 	c.tryLoadNirvanaWebAgentConfig(ctx)
-	tok, err := getAccessToken(ctx, oauthConfig(c.cfg), c.opts.Profile, c.cfg.InstanceURL, c.opts.NoOpen, silentAuth)
+	tok, err := c.getNirvanaAccessToken(ctx, silentAuth)
 	if err != nil {
 		return nil, nil, err
 	}

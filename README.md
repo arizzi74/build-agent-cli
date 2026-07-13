@@ -32,7 +32,7 @@ For Nirvana turns, each already-redacted semantic event is also fsync-appended t
 
 ## Auth
 
-Default Nirvana mode uses the Glider/TypeScript CLI OAuth PKCE flow and stores OAuth tokens under `~/.ba-cli`. The legacy `--web-gateway` mode is pure Go and has no browser/Playwright/runtime dependency. Its default auth mode is `--auth form`: it first reuses a validated saved web session for the same profile+instance; otherwise it asks for a ServiceNow username/password, performs classic `GET/POST /login.do`, captures cookies plus `g_ck`, validates the resulting web session, and persists it under `~/.ba-cli`.
+Default Nirvana mode is session-first: it validates and reuses the matching saved ServiceNow web session, or performs the existing form login and persists `session.json` before deriving OAuth PKCE authorization from that authenticated session. `--auth cookie` and `--auth basic` remain explicit recovery/compatibility choices. If session-derived OAuth cannot complete, the CLI warns and falls back to the manual PKCE code flow. It prints the browser URL only when it cannot open a browser (or `--no-open` is used); the URL contains only transient PKCE/state parameters, never cookies, passwords, client secrets, authorization codes, or tokens. The legacy `--web-gateway` mode remains pure Go.
 
 ```text
 GET/POST <instance>/login.do
@@ -170,7 +170,7 @@ go run . --profile scratch --profile-delete dev
 - `--web-gateway` uses the older web Build Agent gateway/AMB transport for compatibility testing.
 - `--code-assist-ws` is an experimental diagnostic path for `/sncapps/code/assist/ba/web-socket`; keep it off for normal Build Agent/MCP use
 - `--conversation latest|<id>|<id-prefix>|new` resumes/selects a Build Agent conversation before scripted prompts or the REPL; works in web gateway and Nirvana mode.
-- `--auth form|cookie|basic` chooses pure-Go web gateway auth; ignored with `--nirvana`. `form` is the default. Saved form/cookie sessions are validated and reused for the same profile+instance.
+- `--auth form|cookie|basic` selects the ServiceNow web-session recovery/compatibility mode. In default Nirvana mode, `form` is session-first and saved form/cookie sessions are validated and reused for the same profile+instance; `cookie` is the explicit browser-session alternative. `basic` is supported only by `--web-gateway`, because it cannot establish a reusable browser session for session-derived Nirvana OAuth.
 - `--user <username>` supplies the ServiceNow username for web gateway basic/form auth; password is still prompted
 - `--session-status` shows saved web session metadata without printing cookies/tokens
 - `--logout` deletes the saved web session for the active profile

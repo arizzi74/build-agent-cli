@@ -1,0 +1,7 @@
+AUTH_FOCUSED
+ok  	build-agent-go-cli	0.018s
+AUTH_RACE
+ok  	build-agent-go-cli	0.073s
+AUTH_FULL
+ok  	build-agent-go-cli	13.807s
+AUTH_GATE_RESULTS:0:0:0

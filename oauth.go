@@ -108,7 +108,27 @@ func tokenExpired(tok TokenResponse) bool {
 	return time.Now().UnixMilli() > expiresAt-expirationBuffer
 }
 
+func noRedirectTokenClient(hc *http.Client) *http.Client {
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	copy := *hc
+	copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &copy
+}
+
+func tokenEndpointAllowed(cfg OAuthConfig) bool {
+	u, err := url.Parse(cfg.AuthorizationEndpoint)
+	if err != nil {
+		return false
+	}
+	return sameOriginInstance(u.Scheme+"://"+u.Host, cfg.TokenEndpoint)
+}
+
 func refreshAccessToken(ctx context.Context, cfg OAuthConfig, refreshToken string) (TokenResponse, error) {
+	if !tokenEndpointAllowed(cfg) {
+		return TokenResponse{}, errors.New("invalid OAuth token endpoint")
+	}
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("client_id", cfg.ClientID)
@@ -120,25 +140,28 @@ func refreshAccessToken(ctx context.Context, cfg OAuthConfig, refreshToken strin
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	res, err := http.DefaultClient.Do(req)
+	res, err := noRedirectTokenClient(nil).Do(req)
 	if err != nil {
 		return TokenResponse{}, err
 	}
 	defer res.Body.Close()
-	body, _ := io.ReadAll(res.Body)
+	body, readErr := io.ReadAll(io.LimitReader(res.Body, authResponseLimit))
+	if readErr != nil {
+		return TokenResponse{}, errors.New("could not read token refresh response")
+	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return TokenResponse{}, fmt.Errorf("token refresh failed (%d): %s", res.StatusCode, trimBody(body))
+		return TokenResponse{}, fmt.Errorf("token refresh failed (%d)", res.StatusCode)
 	}
 	return decodeTokenResponse(body)
 }
+
+var oauthOpenBrowser = openBrowser
 
 func runOAuthPKCEFlow(ctx context.Context, cfg OAuthConfig, noOpen bool) (TokenResponse, error) {
 	codeVerifier := randomBase64URL(32)
 	sum := sha256.Sum256([]byte(codeVerifier))
 	codeChallenge := base64.RawURLEncoding.EncodeToString(sum[:])
 	state := randomHex(16)
-	clientSecret := randomHex(32)
-
 	authURL, err := url.Parse(cfg.AuthorizationEndpoint)
 	if err != nil {
 		return TokenResponse{}, err
@@ -146,26 +169,35 @@ func runOAuthPKCEFlow(ctx context.Context, cfg OAuthConfig, noOpen bool) (TokenR
 	q := authURL.Query()
 	q.Set("response_type", "code")
 	q.Set("client_id", cfg.ClientID)
-	q.Set("client_secret", clientSecret)
 	q.Set("redirect_uri", cfg.RedirectURI)
 	q.Set("state", state)
 	q.Set("code_challenge", codeChallenge)
 	q.Set("code_challenge_method", "S256")
 	authURL.RawQuery = q.Encode()
 
-	fmt.Fprintln(os.Stderr, "\nOpen this URL to authorize the CLI:")
-	fmt.Fprintf(os.Stderr, "%s\n\n", authURL.String())
-	if !noOpen {
-		_ = openBrowser(authURL.String())
+	if noOpen || oauthOpenBrowser(authURL.String()) != nil {
+		// State and PKCE challenge are transient public protocol parameters. This URL
+		// never includes cookies, passwords, client secrets, authorization codes, or tokens.
+		fmt.Fprintln(os.Stderr, "Open this authorization URL in a browser:")
+		fmt.Fprintln(os.Stderr, authURL.String())
+	} else {
+		fmt.Fprintln(os.Stderr, "Complete authorization in the opened browser, then paste the redirected URL or code.")
 	}
-	fmt.Fprintln(os.Stderr, "After approving, paste either the full redirected URL or just the code parameter.")
+	fmt.Fprintln(os.Stderr, "Paste either the full redirected URL or just the code parameter.")
 	input, err := promptLine("Auth code: ")
 	if err != nil {
 		return TokenResponse{}, err
 	}
-	code := extractAuthCode(input)
+	code, inputState, fullRedirect := extractAuthCodeState(input)
 	if code == "" {
 		return TokenResponse{}, errors.New("no authorization code found")
+	}
+	if fullRedirect {
+		if inputState != state {
+			return TokenResponse{}, errors.New("OAuth state did not match")
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "warning: bare authorization code accepted for legacy compatibility; OAuth state could not be independently verified")
 	}
 
 	form := url.Values{}
@@ -181,14 +213,20 @@ func runOAuthPKCEFlow(ctx context.Context, cfg OAuthConfig, noOpen bool) (TokenR
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	res, err := http.DefaultClient.Do(req)
+	if !tokenEndpointAllowed(cfg) {
+		return TokenResponse{}, errors.New("invalid OAuth token endpoint")
+	}
+	res, err := noRedirectTokenClient(nil).Do(req)
 	if err != nil {
 		return TokenResponse{}, err
 	}
 	defer res.Body.Close()
-	body, _ := io.ReadAll(res.Body)
+	body, readErr := io.ReadAll(io.LimitReader(res.Body, authResponseLimit))
+	if readErr != nil {
+		return TokenResponse{}, errors.New("could not read token response")
+	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return TokenResponse{}, fmt.Errorf("token exchange failed (%d): %s", res.StatusCode, trimBody(body))
+		return TokenResponse{}, fmt.Errorf("token exchange failed (%d)", res.StatusCode)
 	}
 	tok, err := decodeTokenResponse(body)
 	if err != nil {
@@ -229,18 +267,18 @@ func decodeTokenResponse(body []byte) (TokenResponse, error) {
 	return tok, nil
 }
 
-func extractAuthCode(input string) string {
+func extractAuthCodeState(input string) (code, state string, fullRedirect bool) {
 	input = strings.TrimSpace(input)
 	if input == "" {
-		return ""
+		return "", "", false
 	}
-	if u, err := url.Parse(input); err == nil && u.RawQuery != "" {
-		if code := u.Query().Get("code"); code != "" {
-			return code
-		}
+	if u, err := url.Parse(input); err == nil && u.IsAbs() {
+		return u.Query().Get("code"), u.Query().Get("state"), true
 	}
-	return input
+	return input, "", false
 }
+
+func extractAuthCode(input string) string { code, _, _ := extractAuthCodeState(input); return code }
 
 func randomBase64URL(n int) string {
 	b := make([]byte, n)
@@ -284,10 +322,7 @@ func saveCachedToken(profile string, tok TokenResponse) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(profileDir(profile), 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(fileTokenPath(profile), append(raw, '\n'), 0o600)
+	return writePrivateFile(fileTokenPath(profile), append(raw, '\n'))
 }
 
 func deleteCachedToken(profile string) {

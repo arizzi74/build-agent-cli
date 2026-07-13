@@ -259,7 +259,7 @@ func parseFlags() Options {
 	flag.BoolVar(&opts.Nirvana, "nirvana", true, "use the Glider Build Agent Nirvana websocket transport for web UI streaming parity (default)")
 	flag.BoolVar(&opts.WebGateway, "web-gateway", false, "use legacy web Build Agent gateway/AMB transport instead of Nirvana")
 	flag.BoolVar(&opts.CodeAssistWS, "code-assist-ws", false, "experimental: use /sncapps/code/assist/ba/web-socket instead of REST+AMB web gateway")
-	flag.StringVar(&opts.AuthMode, "auth", "form", "web gateway auth mode: form, cookie, or basic; ignored with --nirvana")
+	flag.StringVar(&opts.AuthMode, "auth", "form", "ServiceNow auth: form session (default), cookie recovery; basic is --web-gateway-only")
 	flag.StringVar(&opts.BasicUser, "user", "", "ServiceNow username for web gateway basic/form auth; password is prompted and never stored")
 	flag.BoolVar(&opts.Logout, "logout", false, "delete the saved web session for the active profile and exit")
 	flag.BoolVar(&opts.SessionStatus, "session-status", false, "show saved web session status for the active profile and exit")
