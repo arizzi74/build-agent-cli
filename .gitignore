@@ -25,3 +25,8 @@ METADATA_SYNC_DESIGN_REVIEW.md
 METADATA_SYNC_IMPLEMENTATION_ACTIVITY.md
 SDK_METADATA_SYNC_TRACE.md
 WEB_PARITY_ACTIVITY.md
+
+# Keep only primary repository documentation under version control
+*.md
+!README.md
+!BUILD.md
