@@ -448,6 +448,45 @@ func TestNirvanaOutboundWorkingSetAllowsServerRecordShape(t *testing.T) {
 	}
 }
 
+func TestSaveCurrentStatePreservesPersistedWebWorkspaceScope(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	profile := "scope-preserve"
+	existing := newWorkspaceState("Instance Scan")
+	existing.WebWorkspaceURI = "settings:/users/test/workspaces/Instance Scan.code-workspace"
+	existing.WebWorkspaceChecksum = "checksum"
+	existing.WebWorkspaceDescription = "workspace description"
+	existing.WebWorkspaceFolders = []WebWorkspaceFolder{
+		{Name: "My Exp Approval", URI: "now-file:/app-one"},
+		{Name: "BA Analytics", URI: "now-file:/app-two"},
+	}
+	if err := saveWorkspace(profile, existing); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &Client{
+		opts:              Options{Profile: profile},
+		workspaceName:     existing.Name,
+		conversationID:    "conversation-one",
+		conversationTitle: "Selected conversation",
+	}
+	if err := c.saveCurrentState(); err != nil {
+		t.Fatal(err)
+	}
+	saved, ok := loadWorkspace(profile, existing.Name)
+	if !ok {
+		t.Fatal("saved workspace not found")
+	}
+	if saved.WebWorkspaceURI != existing.WebWorkspaceURI || saved.WebWorkspaceChecksum != existing.WebWorkspaceChecksum || saved.WebWorkspaceDescription != existing.WebWorkspaceDescription {
+		t.Fatalf("web workspace metadata was erased: %#v", saved)
+	}
+	if len(saved.WebWorkspaceFolders) != 2 || saved.WebWorkspaceFolders[1].Name != "BA Analytics" {
+		t.Fatalf("web workspace folders were erased: %#v", saved.WebWorkspaceFolders)
+	}
+	if saved.ConversationID != c.conversationID || saved.ConversationTitle != c.conversationTitle {
+		t.Fatalf("conversation update was not saved: %#v", saved)
+	}
+}
+
 func TestWorkspaceStateOmitsInvalidWorkingSet(t *testing.T) {
 	c := &Client{workingSet: []interface{}{map[string]interface{}{"name": "Existing App", "uri": "now-file:/existingappsysid"}}}
 	if c.WorkspaceState().WorkingSet != nil {

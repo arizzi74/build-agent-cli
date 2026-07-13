@@ -254,7 +254,19 @@ func (c *Client) WorkspaceState() WorkspaceState {
 }
 
 func (c *Client) saveCurrentState() error {
-	return saveWorkspace(c.opts.Profile, c.WorkspaceState())
+	state := c.WorkspaceState()
+	// Preserve persisted Web workspace scope when a partial/non-startup client
+	// only loads conversation state. Otherwise saving a selected conversation
+	// can erase the workspace URI/folders and hide other app conversations.
+	if existing, ok := loadWorkspace(c.opts.Profile, state.Name); ok {
+		if state.WebWorkspaceURI == "" && len(state.WebWorkspaceFolders) == 0 && existing.WebWorkspaceURI != "" {
+			state.WebWorkspaceURI = existing.WebWorkspaceURI
+			state.WebWorkspaceChecksum = existing.WebWorkspaceChecksum
+			state.WebWorkspaceDescription = existing.WebWorkspaceDescription
+			state.WebWorkspaceFolders = append([]WebWorkspaceFolder(nil), existing.WebWorkspaceFolders...)
+		}
+	}
+	return saveWorkspace(c.opts.Profile, state)
 }
 
 func (c *Client) SwitchWorkspace(name string, create bool) error {
