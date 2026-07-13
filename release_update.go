@@ -49,6 +49,8 @@ func releaseTarget(goos, goarch string) string {
 		return "darwin-arm64"
 	case "windows/amd64":
 		return "windows-amd64"
+	case "windows/arm64":
+		return "windows-arm64"
 	default:
 		return ""
 	}

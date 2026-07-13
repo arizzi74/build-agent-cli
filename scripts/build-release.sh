@@ -14,7 +14,7 @@ fi
 LDFLAGS="-s -w -buildid= -X main.cliVersion=$VERSION -X main.cliUpdateBaseURL=$BASE_URL"
 
 mkdir -p "$DIST"
-rm -f "$DIST"/bacli-linux-arm64 "$DIST"/bacli-linux-amd64 "$DIST"/bacli-darwin-amd64 "$DIST"/bacli-darwin-arm64 "$DIST"/bacli-windows-amd64.exe "$DIST"/version.json
+rm -f "$DIST"/bacli-linux-arm64 "$DIST"/bacli-linux-amd64 "$DIST"/bacli-darwin-amd64 "$DIST"/bacli-darwin-arm64 "$DIST"/bacli-windows-amd64.exe "$DIST"/bacli-windows-arm64.exe "$DIST"/version.json
 
 build() {
   goos=$1
@@ -29,6 +29,7 @@ build linux amd64 bacli-linux-amd64
 build darwin amd64 bacli-darwin-amd64
 build darwin arm64 bacli-darwin-arm64
 build windows amd64 bacli-windows-amd64.exe
+build windows arm64 bacli-windows-arm64.exe
 chmod 755 "$DIST/install.sh" "$DIST/bacli-linux-arm64" "$DIST/bacli-linux-amd64" "$DIST/bacli-darwin-amd64" "$DIST/bacli-darwin-arm64"
 
 python3 - "$VERSION" "$BASE_URL" "$DIST" <<'PY'
@@ -41,6 +42,7 @@ files = {
     'darwin-amd64': 'bacli-darwin-amd64',
     'darwin-arm64': 'bacli-darwin-arm64',
     'windows-amd64': 'bacli-windows-amd64.exe',
+    'windows-arm64': 'bacli-windows-arm64.exe',
 }
 out = {'schemaVersion': 1, 'version': version, 'files': {}}
 for target, name in files.items():

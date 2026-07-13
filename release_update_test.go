@@ -42,6 +42,7 @@ func TestReleaseTarget(t *testing.T) {
 		"darwin/amd64":  "darwin-amd64",
 		"darwin/arm64":  "darwin-arm64",
 		"windows/amd64": "windows-amd64",
+		"windows/arm64": "windows-arm64",
 		"linux/386":     "",
 	}
 	for raw, want := range cases {

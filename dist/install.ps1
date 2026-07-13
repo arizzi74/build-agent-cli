@@ -7,10 +7,11 @@ if (-not [Environment]::Is64BitOperatingSystem) {
     throw 'bacli requires 64-bit Windows'
 }
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-if ($arch -ne 'X64') {
-    throw "Unsupported Windows architecture: $arch"
+switch ($arch) {
+    'X64' { $target = 'windows-amd64' }
+    'Arm64' { $target = 'windows-arm64' }
+    default { throw "Unsupported Windows architecture: $arch" }
 }
-$target = 'windows-amd64'
 
 $manifestUri = "$BaseUrl/version.json"
 $manifest = Invoke-RestMethod -Uri $manifestUri -UseBasicParsing
