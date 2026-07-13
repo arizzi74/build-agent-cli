@@ -47,8 +47,11 @@ type WorkspaceState struct {
 	WorkingSet              interface{}          `json:"workingSet,omitempty"`
 	AppScope                interface{}          `json:"appScope,omitempty"`
 	App                     *AppScope            `json:"app,omitempty"`
-	CreatedAt               string               `json:"createdAt"`
-	UpdatedAt               string               `json:"updatedAt"`
+	// SemanticJournalSequence is a local checkpoint only. Omitting it keeps
+	// existing workspace JSON readable by prior versions.
+	SemanticJournalSequence uint64 `json:"semanticJournalSequence,omitempty"`
+	CreatedAt               string `json:"createdAt"`
+	UpdatedAt               string `json:"updatedAt"`
 }
 
 func profileManagementRequested(opts Options) bool {

@@ -63,6 +63,7 @@ type Client struct {
 	workspaceFolders        []WebWorkspaceFolder
 	streamTypes             map[string]string
 	webAgentConfig          WebAgentConfig
+	webStartupConfig        WebStartupConfig
 	webStreamID             string
 	webStreamType           string
 	webStreamText           string
@@ -83,6 +84,7 @@ type Client struct {
 	turnTelemetry           *BuildAgentTelemetryState
 	turnToolTelemetry       []BuildAgentToolTelemetry
 	turnStopPersisted       bool
+	turnRuntimeSnapshot     *TurnRuntimeSnapshot
 	lastGliderBuild         *gliderBuildState
 	buildOperationMu        sync.Mutex
 	metadataSyncMu          sync.Mutex
@@ -108,6 +110,7 @@ type Client struct {
 	semanticSequence        uint64
 	semanticEventIDSequence uint64
 	semanticLifecycleID     string
+	semanticJournalSequence uint64
 
 	connected chan error
 	turnDone  chan error
@@ -162,17 +165,26 @@ func NewClient(cfg CLIConfig, opts Options) (*Client, error) {
 func (c *Client) loadInitialState() error {
 	name := readActiveWorkspaceName(c.opts.Profile)
 	ws, ok := loadWorkspace(c.opts.Profile, name)
+	snapshotSequence := ws.SemanticJournalSequence
 	if !ok {
 		ws = newWorkspaceState(name)
-		if app, ok := loadActiveApp(c.opts.Profile); ok {
+		if app, appOK := loadActiveApp(c.opts.Profile); appOK {
 			ws.App = app
 			ws.AppScope = app.ScopeID
 		}
+	}
+	recovery, err := recoverWorkspaceFromJournal(c.opts.Profile, name, ws, ok)
+	if err != nil {
+		return err
+	}
+	ws = recovery.Workspace
+	if !ok || recovery.LastSequence > snapshotSequence || recovery.IncompleteTurn {
 		if err := saveWorkspace(c.opts.Profile, ws); err != nil {
 			return err
 		}
 	}
 	c.applyWorkspace(ws)
+	c.semanticJournalSequence = ws.SemanticJournalSequence
 	return saveActiveWorkspaceName(c.opts.Profile, c.workspaceName)
 }
 
@@ -232,6 +244,7 @@ func (c *Client) WorkspaceState() WorkspaceState {
 		WorkingSet:              persistentNirvanaWorkingSet(c.workingSet),
 		AppScope:                c.appScope,
 		App:                     c.currentApp,
+		SemanticJournalSequence: c.semanticJournalSequence,
 	}
 }
 
@@ -354,7 +367,7 @@ func (c *Client) absorbAppScope(v interface{}) {
 func (c *Client) Connect(ctx context.Context) error {
 	// The browser loads these values before opening Nirvana. Keep this
 	// best-effort so older instances and non-browser auth remain usable.
-	_ = c.loadWebStartupConfig(ctx)
+	c.webStartupConfig = c.loadWebStartupConfig(ctx)
 	if !c.opts.Nirvana {
 		return c.connectGateway(ctx)
 	}
@@ -483,38 +496,37 @@ func (c *Client) SendMessage(ctx context.Context, content string) error {
 		return errors.New("a turn is already processing")
 	}
 	c.ensureNirvanaConversationID()
-	invokeOptions, params, err := c.buildInvokePayload(ctx, false)
-	if err != nil {
-		return err
-	}
 	if !c.opts.CodeAssistWS {
 		_ = c.ensureActiveAppMetadata(ctx)
 	}
 	mcpServers := c.nirvanaMCPServerPayload(ctx)
+	if err := c.ensureWebConversationWithTitle(ctx, content); err != nil {
+		return err
+	}
+	invokeOptions, params, err := c.buildInvokePayload(ctx, false)
+	if err != nil {
+		return err
+	}
+	// This is the turn boundary: all outbound context below is sourced from
+	// this immutable, redaction-safe copy rather than mutable Client fields.
+	snapshot := c.captureTurnRuntimeSnapshot(mcpServers)
 	payload := map[string]interface{}{
 		"type":                "message",
-		"conversation_id":     c.conversationID,
+		"conversation_id":     snapshot.ConversationID,
 		"content":             content,
-		"conversationHistory": nirvanaConversationHistory(c.history),
-		"ideContext":          c.currentIDEContext(),
+		"conversationHistory": snapshot.ConversationHistory,
+		"ideContext":          snapshot.IDEContext,
 		"images":              []interface{}{},
 		"attachments":         []interface{}{},
 		"isGreeting":          false,
 		"isMCPRetry":          false,
-		"mcpServers":          mcpServers,
-		"workingSet":          []interface{}{},
+		"mcpServers":          cloneMCPServers(snapshot.MCPServers),
+		"workingSet":          snapshot.WorkingSet,
 		"invokeOptions":       invokeOptions,
 		"params":              params,
 	}
-	if appScope, ok := c.nirvanaOutboundAppScope(); ok {
-		payload["appScope"] = appScope
-	}
-	if workingSet, ok := nirvanaOutboundWorkingSet(c.workingSet); ok {
-		payload["workingSet"] = workingSet
-	}
-
-	if err := c.ensureWebConversationWithTitle(ctx, content); err != nil {
-		return err
+	if snapshot.App != nil {
+		payload["appScope"] = appScopeObject(*snapshot.App)
 	}
 	userRow := NewRichUserContent("", content)
 	c.lastUserMessageContent = userRow
@@ -529,19 +541,22 @@ func (c *Client) SendMessage(ctx context.Context, content string) error {
 			return err
 		}
 	}
-	payload["conversation_id"] = c.conversationID
+	payload["conversation_id"] = snapshot.ConversationID
 	if attrs := asMap(invokeOptions["attributes"]); attrs != nil {
-		attrs["conversationId"] = c.conversationID
+		attrs["conversationId"] = snapshot.ConversationID
 	}
 	c.resetWebStream()
 	c.pendingUserContent = content
 	c.turnDone = make(chan error, 1)
 	c.processing = true
+	c.turnRuntimeSnapshot = &snapshot
+	c.beginSemanticTurnSnapshot(snapshot)
 	if err := c.writeJSON(payload); err != nil {
 		c.ErrorBuildAgentTelemetry(ctx, c.turnTelemetry)
 		c.turnTelemetry = nil
 		c.processing = false
 		c.pendingUserContent = ""
+		c.turnRuntimeSnapshot = nil
 		return err
 	}
 	return nil
@@ -580,9 +595,6 @@ func (c *Client) beginActiveTurn(parent context.Context) context.Context {
 		c.cancelledServerTurnIDs = map[string]struct{}{}
 	}
 	c.activeTurnMu.Unlock()
-	if c.opts.Nirvana {
-		c.beginSemanticTurn()
-	}
 	return ctx
 }
 
@@ -598,6 +610,7 @@ func (c *Client) endActiveTurn() {
 		c.activeTurnCtx = nil
 	}
 	c.activeTurnCancel = nil
+	c.turnRuntimeSnapshot = nil
 	c.activeTurnMu.Unlock()
 }
 

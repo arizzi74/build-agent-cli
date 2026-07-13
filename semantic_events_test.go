@@ -223,7 +223,7 @@ func TestSemanticSeamNirvanaLifecycleAndNonNirvanaGate(t *testing.T) {
 		toolCallInputs:      map[string]interface{}{},
 		toolCallStarted:     map[string]time.Time{},
 	}
-	nirvana.beginActiveTurn(context.Background())
+	nirvana.beginSemanticTurnSnapshot(nirvana.captureTurnRuntimeSnapshot(nil))
 	nirvana.handleEvent([]byte(`{"type":"turn_start","turn_id":"server-turn"}`))
 	nirvana.handleEvent([]byte(`{"type":"stream_start","stream_id":"text","content_type":"text"}`))
 	nirvana.handleEvent([]byte(`{"type":"stream_delta","stream_id":"text","delta":"hello"}`))
@@ -235,7 +235,7 @@ func TestSemanticSeamNirvanaLifecycleAndNonNirvanaGate(t *testing.T) {
 		t.Fatalf("semantic sequence = %d, want 5", nirvana.semanticSequence)
 	}
 	firstTurnEventIDSequence := nirvana.semanticEventIDSequence
-	nirvana.beginActiveTurn(context.Background())
+	nirvana.beginSemanticTurnSnapshot(nirvana.captureTurnRuntimeSnapshot(nil))
 	if nirvana.semanticSequence != 1 || nirvana.semanticEventIDSequence != firstTurnEventIDSequence+1 {
 		t.Fatalf("turn sequence/id sequence not scoped correctly: turn=%d id=%d", nirvana.semanticSequence, nirvana.semanticEventIDSequence)
 	}

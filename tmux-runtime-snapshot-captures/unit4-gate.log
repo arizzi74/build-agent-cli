@@ -1,0 +1,7 @@
+UNIT4_FOCUSED
+ok  	build-agent-go-cli	0.016s
+UNIT4_RACE
+ok  	build-agent-go-cli	0.073s
+UNIT4_FULL
+ok  	build-agent-go-cli	11.925s
+UNIT4_GATE_RESULTS:0:0:0

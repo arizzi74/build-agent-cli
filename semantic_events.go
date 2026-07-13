@@ -53,11 +53,13 @@ type ConnectionStateChangedPayload struct {
 	State string `json:"state"`
 }
 type TurnContext struct {
-	Profile        string `json:"profile,omitempty"`
-	Workspace      string `json:"workspace,omitempty"`
-	ConversationID string `json:"conversationId,omitempty"`
-	AppScopeID     string `json:"appScopeId,omitempty"`
-	WorkingSetHash string `json:"workingSetHash,omitempty"`
+	Profile           string `json:"profile,omitempty"`
+	Workspace         string `json:"workspace,omitempty"`
+	ConversationID    string `json:"conversationId,omitempty"`
+	AppScopeID        string `json:"appScopeId,omitempty"`
+	WorkingSetHash    string `json:"workingSetHash,omitempty"`
+	RuntimeGeneration string `json:"runtimeGeneration,omitempty"`
+	Transport         string `json:"transport,omitempty"`
 }
 type TurnAcceptedPayload struct {
 	Context TurnContext `json:"context"`
