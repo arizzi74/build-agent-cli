@@ -27,7 +27,10 @@ const (
 	EventWorkingSetUpdated      SemanticEventType = "working_set_updated"
 	EventAppScopeChanged        SemanticEventType = "app_scope_changed"
 	EventConversationUpdated    SemanticEventType = "conversation_updated"
-	EventTransportRetry         SemanticEventType = "transport_retry"
+	EventTransportRetry         SemanticEventType = "transport_retry" // legacy compatibility
+	EventRetryScheduled         SemanticEventType = "retry_scheduled"
+	EventRetryAttempted         SemanticEventType = "retry_attempted"
+	EventRetryExhausted         SemanticEventType = "retry_exhausted"
 	EventTransportFallback      SemanticEventType = "transport_fallback"
 	EventTurnCancelled          SemanticEventType = "turn_cancelled"
 	EventTurnFailed             SemanticEventType = "turn_failed"
@@ -102,9 +105,16 @@ type TransportRetryPayload struct {
 	Attempt   int    `json:"attempt,omitempty"`
 	Category  string `json:"category,omitempty"`
 }
+type RetryPayload struct {
+	Operation   string `json:"operation,omitempty"`
+	Attempt     int    `json:"attempt,omitempty"`
+	Category    string `json:"category,omitempty"`
+	DelayMillis int64  `json:"delayMillis,omitempty"`
+}
 type TransportFallbackPayload struct {
-	From string `json:"from,omitempty"`
-	To   string `json:"to,omitempty"`
+	From   string `json:"from,omitempty"`
+	To     string `json:"to,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 type TurnCancelledPayload struct {
 	Reason string `json:"reason,omitempty"`
@@ -386,11 +396,26 @@ func Apply(state SemanticTurnState, event SemanticEvent) (SemanticTurnState, err
 			return state, payloadTypeError(event.Type)
 		}
 		state.NextConversation = p
-	case EventTransportRetry:
-		if state.Status != SemanticTurnStarted {
-			return state, errors.New("transport retry outside active turn")
+	case EventTransportRetry, EventRetryScheduled, EventRetryAttempted:
+		if state.Status != SemanticTurnAccepted && state.Status != SemanticTurnStarted {
+			return state, errors.New("retry outside active turn")
 		}
-		state.RetryCount++
+		// RetryCount means actual retry attempts after the initial request.
+		if event.Type == EventRetryAttempted {
+			p, ok := event.Payload.(RetryPayload)
+			if !ok {
+				return state, payloadTypeError(event.Type)
+			}
+			if p.Attempt > 1 {
+				state.RetryCount++
+			}
+		} else if event.Type == EventTransportRetry {
+			state.RetryCount++
+		}
+	case EventRetryExhausted:
+		if state.Status != SemanticTurnAccepted && state.Status != SemanticTurnStarted {
+			return state, errors.New("retry outside active turn")
+		}
 	case EventTransportFallback:
 		p, ok := event.Payload.(TransportFallbackPayload)
 		if !ok {

@@ -86,6 +86,32 @@ func (c *Client) emitSemanticEvent(eventType SemanticEventType, turnID string, p
 	c.semanticState = next
 }
 
+func (c *Client) activeSemanticTurn() bool {
+	c.semanticMu.Lock()
+	defer c.semanticMu.Unlock()
+	return c.semanticState.Status == SemanticTurnAccepted || c.semanticState.Status == SemanticTurnStarted
+}
+func (c *Client) emitRetryAttempted(operation string, attempt int, category string) {
+	if c.activeSemanticTurn() {
+		c.emitSemanticEvent(EventRetryAttempted, "", RetryPayload{Operation: safeTelemetryLabel(operation), Attempt: attempt, Category: safeTelemetryLabel(category)})
+	}
+}
+func (c *Client) emitRetryScheduled(operation string, attempt int, category string, delay time.Duration) {
+	if c.activeSemanticTurn() {
+		c.emitSemanticEvent(EventRetryScheduled, "", RetryPayload{Operation: safeTelemetryLabel(operation), Attempt: attempt, Category: safeTelemetryLabel(category), DelayMillis: delay.Milliseconds()})
+	}
+}
+func (c *Client) emitRetryExhausted(operation string, attempt int, category, reason string) {
+	if c.activeSemanticTurn() {
+		c.emitSemanticEvent(EventRetryExhausted, "", RetryPayload{Operation: safeTelemetryLabel(operation), Attempt: attempt, Category: safeTelemetryLabel(category + "_" + reason)})
+	}
+}
+func (c *Client) emitTransportFallback(from, to, reason string) {
+	if c.canFallback(from, to, reason).Allowed {
+		c.emitSemanticEvent(EventTransportFallback, "", TransportFallbackPayload{From: from, To: to, Reason: reason})
+	}
+}
+
 func semanticWorkingSetHash(value interface{}) string {
 	return canonicalHash(value)
 }

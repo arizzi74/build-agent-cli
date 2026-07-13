@@ -94,6 +94,8 @@ type statusPolicy struct {
 	DefaultTimeout string          `json:"defaultTimeout,omitempty"`
 	ToolTimeouts   []statusTimeout `json:"toolTimeouts"`
 	Retry          string          `json:"retry"`
+	Attempts       int             `json:"attempts,omitempty"`
+	LastDecision   string          `json:"lastDecision,omitempty"`
 	Status         string          `json:"status"`
 }
 type statusTimeout struct {
@@ -155,6 +157,11 @@ func (c *Client) statusDocument() runtimeStatusDocument {
 	}
 	journal := c.statusJournal()
 	remote := c.statusRemote()
+	attempts := c.retryTelemetry()
+	lastDecision := ""
+	if len(attempts) > 0 {
+		lastDecision = attempts[len(attempts)-1].Decision
+	}
 	timeouts := make([]statusTimeout, 0, len(snapshot.Timeouts))
 	for name, timeout := range snapshot.Timeouts {
 		timeouts = append(timeouts, statusTimeout{Name: safeStatusString(name), Timeout: timeout.String()})
@@ -169,7 +176,7 @@ func (c *Client) statusDocument() runtimeStatusDocument {
 		Servers:    statusServers{Inventory: servers, Generation: safeStatusString(snapshot.MCPGeneration), Hash: safeStatusString(snapshot.MCPHash), Status: statusKnownStatus(len(servers) > 0)},
 		WorkingSet: statusWorkingSet{Count: len(workingSet), Hash: workingHash, Status: "healthy"},
 		Runtime:    statusRuntime{Provider: safeStatusString(snapshot.Model.Provider), Model: safeStatusString(snapshot.Model.LargeModel), Skill: safeStatusString(snapshot.Model.SkillID), Status: "healthy"},
-		Policy:     statusPolicy{DefaultTimeout: snapshot.DefaultTimeout.String(), ToolTimeouts: timeouts, Retry: safeStatusString(snapshot.RetryPolicy), Status: "healthy"}, Journal: journal, Remote: remote,
+		Policy:     statusPolicy{DefaultTimeout: snapshot.DefaultTimeout.String(), ToolTimeouts: timeouts, Retry: "safe_reads_bounded", Attempts: len(attempts), LastDecision: safeStatusString(lastDecision), Status: "healthy"}, Journal: journal, Remote: remote,
 	}
 }
 

@@ -78,6 +78,8 @@ type turnRetry struct {
 type turnTelemetry struct {
 	FailureCount int      `json:"failureCount"`
 	Components   []string `json:"components"`
+	Attempts     int      `json:"attempts,omitempty"`
+	LastDecision string   `json:"lastDecision,omitempty"`
 	State        string   `json:"state"`
 }
 type turnJournalInfo struct {
@@ -192,9 +194,16 @@ func (c *Client) turnDocument() turnDocument {
 		components = append(components, safeSnapshotString(failure.Component))
 	}
 	sort.Strings(components)
-	doc.Turn.Telemetry = turnTelemetry{FailureCount: len(components), Components: components, State: "none"}
+	attempts := c.turnRetryTelemetry(active)
+	lastDecision := ""
+	if len(attempts) > 0 {
+		lastDecision = attempts[len(attempts)-1].Decision
+	}
+	doc.Turn.Telemetry = turnTelemetry{FailureCount: len(components), Components: components, Attempts: len(attempts), LastDecision: safeSnapshotString(lastDecision), State: "none"}
 	if len(components) > 0 {
 		doc.Turn.Telemetry.State = "failed"
+	} else if len(attempts) > 0 {
+		doc.Turn.Telemetry.State = "observed"
 	}
 	return doc
 }
@@ -308,9 +317,15 @@ func redactedSemanticDetails(event SemanticEvent) map[string]interface{} {
 		out["transport"] = safeSnapshotString(p.Transport)
 		out["attempt"] = p.Attempt
 		out["category"] = safeSnapshotString(p.Category)
+	case RetryPayload:
+		out["operation"] = safeSnapshotString(p.Operation)
+		out["attempt"] = p.Attempt
+		out["category"] = safeSnapshotString(p.Category)
+		out["delayMillis"] = p.DelayMillis
 	case TransportFallbackPayload:
 		out["from"] = safeSnapshotString(p.From)
 		out["to"] = safeSnapshotString(p.To)
+		out["reason"] = safeSnapshotString(p.Reason)
 	case TurnCancelledPayload:
 		out["reason"] = safeSnapshotString(p.Reason)
 	case TurnFailedPayload:

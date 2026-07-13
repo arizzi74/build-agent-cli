@@ -486,6 +486,8 @@ func decodeSemanticJournalEvent(event SemanticEvent) (SemanticEvent, error) {
 		target = &ConversationUpdatedPayload{}
 	case EventTransportRetry:
 		target = &TransportRetryPayload{}
+	case EventRetryScheduled, EventRetryAttempted, EventRetryExhausted:
+		target = &RetryPayload{}
 	case EventTransportFallback:
 		target = &TransportFallbackPayload{}
 	case EventTurnCancelled:
@@ -529,6 +531,8 @@ func decodeSemanticJournalEvent(event SemanticEvent) (SemanticEvent, error) {
 	case *ConversationUpdatedPayload:
 		event.Payload = *value
 	case *TransportRetryPayload:
+		event.Payload = *value
+	case *RetryPayload:
 		event.Payload = *value
 	case *TransportFallbackPayload:
 		event.Payload = *value

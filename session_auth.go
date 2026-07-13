@@ -320,25 +320,18 @@ func (c *Client) validateWebSession(ctx context.Context) error {
 }
 
 func (c *Client) sessionValidationGET(ctx context.Context, path string) ([]byte, int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.cfg.InstanceURL, "/")+path, nil)
+	result, err := c.retryGETResult(ctx, strings.TrimRight(c.cfg.InstanceURL, "/")+path, "session_validation", "http", 2*1024*1024, func(req *http.Request) {
+		c.setGatewayHeaders(req)
+		req.Header.Set("Accept", "application/json,text/html;q=0.8,*/*;q=0.5")
+	})
+	body, status := result.Body, result.Status
 	if err != nil {
-		return nil, 0, err
-	}
-	c.setGatewayHeaders(req)
-	req.Header.Set("Accept", "application/json,text/html;q=0.8,*/*;q=0.5")
-	res, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer res.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(res.Body, 2*1024*1024))
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return body, res.StatusCode, fmt.Errorf("session validation GET %s failed (%d): %s", path, res.StatusCode, trimBody(body))
+		return body, status, err
 	}
 	if looksLikeLoginPage(body) || isUserNotAuthenticated(body) {
-		return body, res.StatusCode, errInvalidWebSession
+		return body, status, errInvalidWebSession
 	}
-	return body, res.StatusCode, nil
+	return body, status, nil
 }
 
 func isUnauthenticatedSession(status int, body []byte) bool {

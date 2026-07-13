@@ -643,24 +643,13 @@ func appFromWebWorkspaceFolders(folders []WebWorkspaceFolder) *AppScope {
 }
 
 func (c *Client) getRaw(ctx context.Context, endpoint, accept string) ([]byte, string, int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, "", 0, err
-	}
-	c.setGliderWebHeaders(req)
-	if accept != "" {
-		req.Header.Set("Accept", accept)
-	}
-	res, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, "", 0, err
-	}
-	defer res.Body.Close()
-	body, _ := io.ReadAll(res.Body)
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return body, res.Header.Get("Content-Type"), res.StatusCode, fmt.Errorf("GET %s failed (%d): %s", endpoint, res.StatusCode, trimBody(body))
-	}
-	return body, res.Header.Get("Content-Type"), res.StatusCode, nil
+	result, err := c.retryGETResult(ctx, endpoint, "workspace_discovery", "http", 1<<20, func(req *http.Request) {
+		c.setGliderWebHeaders(req)
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
+	})
+	return result.Body, result.ContentType, result.Status, err
 }
 
 func (c *Client) postMultipart(ctx context.Context, endpoint string, build func(*multipart.Writer) error) ([]byte, string, int, error) {

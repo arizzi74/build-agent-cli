@@ -111,6 +111,10 @@ type Client struct {
 	semanticEventIDSequence uint64
 	semanticLifecycleID     string
 	semanticJournalSequence uint64
+	remoteRetryPolicy       RetryPolicy
+	attemptTelemetryMu      sync.Mutex
+	attemptTelemetry        []AttemptTelemetry
+	turnAttemptOffset       int
 
 	connected chan error
 	turnDone  chan error
@@ -592,6 +596,9 @@ func (c *Client) beginActiveTurn(parent context.Context) context.Context {
 	c.activeTurnCancel = cancel
 	c.activeTurnStopping = false
 	c.activeServerTurnID = ""
+	c.attemptTelemetryMu.Lock()
+	c.turnAttemptOffset = len(c.attemptTelemetry)
+	c.attemptTelemetryMu.Unlock()
 	if c.cancelledServerTurnIDs == nil {
 		c.cancelledServerTurnIDs = map[string]struct{}{}
 	}
@@ -1131,22 +1138,78 @@ func instanceNameFromURL(raw string) string {
 }
 
 func (c *Client) getJSON(ctx context.Context, endpoint string) ([]byte, int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, 0, err
+	result, err := c.retryGETResult(ctx, endpoint, "metadata_read", "http", 1<<20, func(req *http.Request) { c.setGatewayHeaders(req); req.Header.Set("Accept", "application/json") })
+	return result.Body, result.Status, err
+}
+
+func (c *Client) retryGET(ctx context.Context, endpoint, operation, transport string, headers func(*http.Request)) ([]byte, int, error) {
+	result, err := c.retryGETResult(ctx, endpoint, operation, transport, 1<<20, headers)
+	return result.Body, result.Status, err
+}
+
+func (c *Client) retryGETResult(ctx context.Context, endpoint, operation, transport string, maxBody int64, headers func(*http.Request)) (retryGETResult, error) {
+	policy := c.retryPolicy()
+	started := policy.Now()
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return retryGETResult{}, err
+		}
+		began := policy.Now()
+		c.emitRetryAttempted(operation, attempt, "")
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if requestErr == nil {
+			headers(req)
+		}
+		var body []byte
+		status := 0
+		contentType := ""
+		retryAfter := ""
+		transportErr := requestErr
+		if requestErr == nil {
+			res, err := c.httpClient.Do(req)
+			transportErr = err
+			if res != nil {
+				retryAfter = res.Header.Get("Retry-After")
+				contentType = safeTelemetryLabel(res.Header.Get("Content-Type"))
+				body, err = io.ReadAll(io.LimitReader(res.Body, maxBody+1))
+				closeErr := res.Body.Close()
+				if err != nil {
+					transportErr = err
+				} else if int64(len(body)) > maxBody {
+					body = nil
+					transportErr = errRetryBodyTooLarge{Limit: maxBody}
+				} else if closeErr != nil {
+					transportErr = closeErr
+				}
+				status = res.StatusCode
+			}
+		}
+		decision := policy.Decide(started, attempt, status, transportErr, retryAfter)
+		ended := policy.Now()
+		category := retryCategory(status, transportErr)
+		telemetry := AttemptTelemetry{Operation: operation, Attempt: attempt, Endpoint: endpoint, Transport: transport, StartedAt: began, EndedAt: ended, StatusCategory: category, Decision: decision.Reason, RetryDelay: decision.Delay}
+		if transportErr != nil {
+			telemetry.ErrorCategory = category
+		}
+		c.recordAttempt(telemetry)
+		if transportErr == nil && status >= 200 && status < 300 {
+			return retryGETResult{Body: body, Status: status, ContentType: contentType}, nil
+		}
+		responseErr := transportErr
+		if responseErr == nil {
+			responseErr = fmt.Errorf("GET %s failed (%d): %s", safeEndpointLabel(endpoint), status, trimBody(body))
+		}
+		if !decision.Retry {
+			if retryStatus(status) || retryError(transportErr) {
+				c.emitRetryExhausted(operation, attempt, category, decision.Reason)
+			}
+			return retryGETResult{Body: body, Status: status, ContentType: contentType}, responseErr
+		}
+		c.emitRetryScheduled(operation, attempt, category, decision.Delay)
+		if err := policy.Sleep(ctx, decision.Delay); err != nil {
+			return retryGETResult{Body: body, Status: status, ContentType: contentType}, err
+		}
 	}
-	c.setGatewayHeaders(req)
-	req.Header.Set("Accept", "application/json")
-	res, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer res.Body.Close()
-	body, _ := io.ReadAll(res.Body)
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return body, res.StatusCode, fmt.Errorf("GET %s failed (%d): %s", endpoint, res.StatusCode, trimBody(body))
-	}
-	return body, res.StatusCode, nil
 }
 
 func (c *Client) nirvanaMCPServerPayload(ctx context.Context) []MCPServer {
@@ -1424,6 +1487,10 @@ func (c *Client) postBuildAgentMessage(ctx context.Context, content string) ([]b
 	if !isMissingRESTResource(status, body) {
 		return body, false, err
 	}
+	fallback := c.canFallback("core-gateway", "legacy-send", "missing_resource")
+	if !fallback.Allowed {
+		return body, false, fmt.Errorf("core gateway fallback prohibited after %s", fallback.Reason)
+	}
 
 	legacyPayload := map[string]interface{}{
 		"payload": map[string]interface{}{
@@ -1438,6 +1505,7 @@ func (c *Client) postBuildAgentMessage(ctx context.Context, content string) ([]b
 	if c.workingSet != nil {
 		legacyPayload["payload"].(map[string]interface{})["workingSet"] = c.workingSet
 	}
+	c.emitTransportFallback("core-gateway", "legacy-send", fallback.Reason)
 	c.responseTransport = "legacy-send"
 	body, _, legacyErr := c.postJSON(ctx, base+"/api/sn_build_agent/build_agent_api/send", legacyPayload)
 	if legacyErr != nil {
