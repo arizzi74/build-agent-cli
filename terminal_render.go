@@ -872,15 +872,19 @@ func animatedStatusText(label string, frame int) string {
 }
 
 var connectingLogoRows = []string{
-	"       .oooo.       ",
-	"    .ooOOOOOOoo.    ",
-	"  .oOO'      'OOo.  ",
-	" oOO'          'OOo ",
-	"OOO              OOO",
-	" oOO.          .OOo ",
-	"  'oOO.      .OOo'  ",
-	"    'ooOOOOOOoo'    ",
-	"       'oooo'       ",
+	"          .+####+.         ",
+	"          +######+         ",
+	"         +########+        ",
+	"       +####++++####+      ",
+	"   .+####+.      .+####+.  ",
+	" +######+          +######+ ",
+	"#######+          +#######+",
+	" +######+          +######+ ",
+	"  '.+####+.      .+####+.'  ",
+	"       +####++++####+      ",
+	"         +########+        ",
+	"          +######+         ",
+	"          '.+##+.'         ",
 }
 
 func animatedConnectingLogo(frame int) string {

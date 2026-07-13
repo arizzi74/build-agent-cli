@@ -190,8 +190,8 @@ func TestAnimatedConnectingLogoMatchesReferenceShapeAndGlows(t *testing.T) {
 	later := animatedConnectingLogo(5)
 	plain := stripANSI(first)
 	rows := strings.Split(plain, "\n")
-	if len(rows) != 9 {
-		t.Fatalf("connecting logo rows = %d, want 9: %q", len(rows), plain)
+	if len(rows) != 13 {
+		t.Fatalf("connecting logo rows = %d, want 13: %q", len(rows), plain)
 	}
 	if first == later || !strings.Contains(first, "38;5;") {
 		t.Fatalf("connecting logo should animate with wasabi glow")
@@ -201,8 +201,8 @@ func TestAnimatedConnectingLogoMatchesReferenceShapeAndGlows(t *testing.T) {
 			t.Fatalf("connecting logo must use ASCII only, found %q", r)
 		}
 	}
-	if len([]rune(rows[0])) > 24 || !strings.Contains(rows[3], "oOO'") || !strings.Contains(rows[4], "OOO              OOO") {
-		t.Fatalf("connecting logo does not preserve the narrow open-center ring silhouette: %q", plain)
+	if len([]rune(rows[0])) != 27 || !strings.Contains(rows[0], ".+####+.") || !strings.Contains(rows[4], ".+####+.      .+####+.") || !strings.Contains(rows[6], "#######+          +#######+") {
+		t.Fatalf("connecting logo does not preserve the reference's caps, stepped shoulders, wings, and center opening: %q", plain)
 	}
 	details := "profile: zaiagents\ntransport: Nirvana websocket\n"
 	frame := stripANSI(connectingScreenFrame(details, 2))
