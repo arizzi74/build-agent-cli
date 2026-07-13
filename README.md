@@ -311,3 +311,7 @@ The CLI can manage multiple configured ServiceNow instances. Each configured ins
 - If saved credentials are expired/rejected, the CLI asks whether to reauthenticate, remove the instance, or cancel. Non-interactive runs default to reauthentication behavior.
 
 Instance and conversation picker menus use ANSI styling in interactive terminals: bold cyan headers, green selected arrows, yellow current markers, cyan instance URLs, green credential/state badges, and red cancel/error/no-credential badges. Plain/non-TTY output remains uncolored.
+
+## Typed slash-command registry
+
+Interactive slash commands are declared once in a typed registry. The registry drives aliases, presentation order, argument/menu behavior, modal output capture, runtime filtering, `/help`, dispatch, and slash-menu suggestions. Suggestions and `/help` reflect the active transport and whether a turn is processing: `/help` and `/exit`/`/quit` remain available during processing, while commands that mutate or switch conversation/workspace/app state are hidden and rejected with a clear processing error. The terminal prompt receives the active client so its menu uses the same availability rules as dispatch.

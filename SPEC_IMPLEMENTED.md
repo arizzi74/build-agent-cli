@@ -789,3 +789,7 @@ The animated `Building...` indicator remains active while assistant output strea
 
 - Instance and conversation selection menus render with ANSI styling in interactive terminals: bold cyan headers, green selected arrows, yellow current markers, cyan URLs, green positive badges (`[oauth]`, `[web-session]`, `[open]`), and red cancel/error/no-credential badges.
 - The picker line helpers remain plain-text-compatible for tests/non-TTY output.
+
+## Typed slash-command registry
+
+Slash commands are implemented through a single typed registry with canonical names, aliases, descriptions/categories, strict presentation order, argument policy, suggestion behavior, runtime availability, active-turn availability, modal/capture policy, and handlers. `/help`, dispatch, completion, capture decisions, and interactive-menu behavior derive from that registry. The interactive prompt receives the active `Client`, so menu suggestions correctly exclude unavailable transport commands and commands blocked while a turn is processing. `/help` and `/exit`/`/quit` remain available while processing; context-changing commands return `cannot run /<command> while a turn is processing`.

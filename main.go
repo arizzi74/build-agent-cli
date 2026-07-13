@@ -151,7 +151,7 @@ func main() {
 	}
 	for {
 		status := client.statusBarState()
-		line, err := promptCommandLine("ba> ", &status)
+		line, err := promptCommandLineForClient("ba> ", &status, client)
 		if err != nil {
 			fmt.Fprintln(os.Stderr)
 			return

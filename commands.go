@@ -14,6 +14,8 @@ import (
 type SlashCommandSuggestion struct {
 	Text        string
 	Description string
+	Aliases     []string
+	Behavior    SlashCommandBehavior
 }
 
 var slashCommandOutputWriter io.Writer = os.Stderr
@@ -57,45 +59,31 @@ func slashCommandOutputCanBeCaptured(line string) bool {
 	if len(fields) == 0 {
 		return false
 	}
-	switch strings.ToLower(fields[0]) {
-	case "/conversation", "/conv":
-		if len(fields) == 1 {
-			return false
-		}
-		switch strings.ToLower(fields[1]) {
-		case "select", "choose", "list", "ls":
-			return false
-		}
-	case "/workspace", "/ws":
-		if len(fields) == 1 {
-			return false
-		}
-		switch strings.ToLower(fields[1]) {
-		case "select", "choose":
-			return false
-		}
-	case "/app", "/application":
-		if len(fields) == 1 {
-			return false
-		}
-		switch strings.ToLower(fields[1]) {
-		case "select", "choose", "list", "ls":
-			return false
-		}
+	command, ok := findSlashCommand(fields[0])
+	if !ok {
+		return true
 	}
-	return true
+	return command.capturesOutput(fields[1:])
 }
 
 func slashCommandSuggestions() []SlashCommandSuggestion {
-	return []SlashCommandSuggestion{
-		{Text: "/help", Description: "show available commands"},
-		{Text: "/conversation", Description: "choose an existing Build Agent conversation or create one"},
-		{Text: "/mcp list", Description: "show MCP servers advertised to Nirvana/Forge"},
-		{Text: "/workspace", Description: "choose an existing Web UI/local workspace"},
-		{Text: "/app", Description: "choose an app from the active workspace"},
-		{Text: "/exit", Description: "quit"},
-		{Text: "/quit", Description: "quit"},
+	return slashCommandSuggestionsForClient(nil)
+}
+
+func slashCommandSuggestionsForClient(c *Client) []SlashCommandSuggestion {
+	suggestions := make([]SlashCommandSuggestion, 0, len(slashCommandRegistry))
+	for _, command := range slashCommandRegistry {
+		if command.Hidden || len(command.Suggestions) == 0 || !command.available(c) {
+			continue
+		}
+		for _, suggestion := range command.Suggestions {
+			suggestions = append(suggestions, SlashCommandSuggestion{
+				Text: suggestion, Description: command.Description, Behavior: command.suggestionBehavior(suggestion),
+				Aliases: command.Aliases,
+			})
+		}
 	}
+	return suggestions
 }
 
 func handleSlashCommand(ctx context.Context, c *Client, line string) (bool, error) {
@@ -104,35 +92,37 @@ func handleSlashCommand(ctx context.Context, c *Client, line string) (bool, erro
 		return false, nil
 	}
 
-	cmd := strings.ToLower(fields[0])
-	switch cmd {
-	case "/help", "/?":
-		printSlashHelp()
-		return true, nil
-	case "/workspace", "/ws":
-		return true, handleWorkspaceCommand(ctx, c, fields[1:])
-	case "/conversation", "/conv":
-		return true, handleConversationCommand(ctx, c, fields[1:])
-	case "/mcp":
-		return true, handleMCPCommand(ctx, c, fields[1:])
-	case "/app", "/application":
-		return true, handleAppCommand(ctx, c, fields[1:])
-	case "/exit", "/quit":
-		return false, nil
-	default:
+	command, ok := findSlashCommand(fields[0])
+	if !ok {
 		slashCommandPrintf("unknown command %s; type /help\n", fields[0])
 		return true, nil
 	}
+	if !command.available(c) {
+		return true, command.unavailableReason(c)
+	}
+	return command.Handler(ctx, c, fields[1:])
 }
 
-func printSlashHelp() {
+func printSlashHelp(c *Client) {
 	slashCommandPrintln("commands:")
-	slashCommandPrintln("  /help")
-	slashCommandPrintln("  /exit | /quit")
-	slashCommandPrintln("  /conversation              (interactive selector; choose existing or New conversation)")
-	slashCommandPrintln("  /mcp list                  (Nirvana: show advertised MCP servers)")
-	slashCommandPrintln("  /workspace                 (interactive selector; choose active workspace)")
-	slashCommandPrintln("  /app                       (interactive selector; choose workspace app)")
+	categories := make([]string, 0)
+	seenCategories := make(map[string]bool)
+	for _, command := range slashCommandRegistry {
+		if command.Hidden || !command.available(c) || seenCategories[command.Category] {
+			continue
+		}
+		seenCategories[command.Category] = true
+		categories = append(categories, command.Category)
+	}
+	for _, category := range categories {
+		slashCommandPrintln("  " + category + ":")
+		for _, command := range slashCommandRegistry {
+			if command.Hidden || !command.available(c) || command.Category != category {
+				continue
+			}
+			slashCommandPrintln("    " + command.helpLine())
+		}
+	}
 }
 
 func handleMCPCommand(ctx context.Context, c *Client, args []string) error {

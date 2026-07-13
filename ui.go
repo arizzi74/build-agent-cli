@@ -80,6 +80,10 @@ func promptPassword(prompt string) (string, error) {
 }
 
 func promptCommandLine(prompt string, status *statusBarState) (string, error) {
+	return promptCommandLineForClient(prompt, status, nil)
+}
+
+func promptCommandLineForClient(prompt string, status *statusBarState, client *Client) (string, error) {
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) {
 		line, err := promptLine(prompt)
 		if err == nil {
@@ -133,7 +137,7 @@ func promptCommandLine(prompt string, status *statusBarState) (string, error) {
 			selected = 0
 			return
 		}
-		menu = filterSlashSuggestions(string(line))
+		menu = filterSlashSuggestionsForClient(string(line), client)
 		if selected >= len(menu) {
 			selected = len(menu) - 1
 		}
@@ -754,16 +758,20 @@ func fitPromptBandText(text string, width int) string {
 }
 
 func filterSlashSuggestions(prefix string) []SlashCommandSuggestion {
+	return filterSlashSuggestionsForClient(prefix, nil)
+}
+
+func filterSlashSuggestionsForClient(prefix string, client *Client) []SlashCommandSuggestion {
 	if !strings.HasPrefix(prefix, "/") {
 		return nil
 	}
-	suggestions := slashCommandSuggestions()
+	suggestions := slashCommandSuggestionsForClient(client)
 	if prefix == "/" {
 		return suggestions
 	}
 	filtered := make([]SlashCommandSuggestion, 0, len(suggestions))
 	for _, s := range suggestions {
-		if strings.HasPrefix(s.Text, prefix) || strings.HasPrefix(strings.TrimSpace(s.Text), prefix) {
+		if strings.HasPrefix(s.Text, prefix) || strings.HasPrefix(strings.TrimSpace(s.Text), prefix) || slashSuggestionHasAliasPrefix(s, prefix) {
 			filtered = append(filtered, s)
 		}
 	}
@@ -807,7 +815,16 @@ func slashMenuInsertText(s SlashCommandSuggestion) string {
 }
 
 func slashMenuEnterSubmits(s SlashCommandSuggestion) bool {
-	return !strings.HasSuffix(s.Text, " ")
+	return s.Behavior != SlashCommandTemplate && !strings.HasSuffix(s.Text, " ")
+}
+
+func slashSuggestionHasAliasPrefix(s SlashCommandSuggestion, prefix string) bool {
+	for _, alias := range s.Aliases {
+		if strings.HasPrefix(alias, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func rememberCommand(line string) {
