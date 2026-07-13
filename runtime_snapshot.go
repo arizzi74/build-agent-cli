@@ -53,7 +53,7 @@ const turnRuntimeCLIVersion = "2.3.3"
 
 var turnRuntimeBuildSHA = ""
 
-var snapshotCredentialPattern = regexp.MustCompile(`(?i)(bearer\s+\S+|basic\s+\S+|(?:oauth[_-]?)?token\s*[:=]\s*\S+|password\s*[:=]\s*\S+|g_ck\s*[:=]\s*\S+|cookie\s*[:=]\s*\S+)`)
+var snapshotCredentialPattern = regexp.MustCompile(`(?i)(authorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?\S+|bearer\s+\S+|basic\s+\S+|(?:oauth[_-]?)?token\s*[:=]\s*\S+|(?:password|secret|api[_-]?key|g_ck|cookie|set-cookie|jsessionid|session(?:[_-]?id)?)\s*[:=]\s*\S+)`)
 
 func (c *Client) captureTurnRuntimeSnapshot(mcpServers []MCPServer) TurnRuntimeSnapshot {
 	instanceURL := strings.TrimRight(strings.TrimSpace(c.cfg.InstanceURL), "/")
@@ -77,19 +77,19 @@ func (c *Client) captureTurnRuntimeSnapshot(mcpServers []MCPServer) TurnRuntimeS
 	if workingSet != nil {
 		workingSet = safeSnapshotValue(workingSet).([]interface{})
 	}
-	servers := safeSnapshotValue(canonicalMCPServers(mcpServers)).([]MCPServer)
-	app := snapshotApp(c.currentApp, c.appScope)
+	servers := canonicalMCPServers(safeMCPServers(mcpServers))
+	app := safeSnapshotApp(snapshotApp(c.currentApp, c.appScope))
 	timeouts := make(map[string]time.Duration, len(c.webStartupConfig.ToolTimeouts))
 	for name, timeout := range c.webStartupConfig.ToolTimeouts {
 		timeouts[name] = timeout
 	}
 	return TurnRuntimeSnapshot{
-		CapturedAt: time.Now().UTC(), Profile: strings.TrimSpace(c.opts.Profile), InstanceURL: instanceURL, InstanceHost: host,
-		Transport: c.turnTransport(), AuthMode: authMode, AuthCapabilities: caps, ConversationID: c.conversationID,
-		Workspace: TurnWorkspaceSnapshot{Name: c.workspaceName, URI: c.workspaceURI, Checksum: c.workspaceChecksum, Folders: append([]WebWorkspaceFolder(nil), c.workspaceFolders...)},
+		CapturedAt: time.Now().UTC(), Profile: safeSnapshotString(strings.TrimSpace(c.opts.Profile)), InstanceURL: safeSnapshotURL(instanceURL), InstanceHost: safeSnapshotString(host),
+		Transport: safeSnapshotString(c.turnTransport()), AuthMode: safeSnapshotString(authMode), AuthCapabilities: safeSnapshotStrings(caps), ConversationID: safeSnapshotString(c.conversationID),
+		Workspace: safeSnapshotWorkspace(TurnWorkspaceSnapshot{Name: c.workspaceName, URI: c.workspaceURI, Checksum: c.workspaceChecksum, Folders: append([]WebWorkspaceFolder(nil), c.workspaceFolders...)}),
 		App:       app, WorkingSet: workingSet, WorkingSetHash: canonicalHash(workingSet), IDEContext: safeSnapshotValue(c.currentIDEContext()).(map[string]interface{}), ConversationHistory: safeSnapshotValue(nirvanaConversationHistory(c.history)).([]interface{}),
-		Model:      TurnModelSnapshot{Provider: c.runtime.Provider, LargeModel: effectiveLargeModel(c), SmallModel: c.runtime.SmallModel, CapabilityID: effectiveCapabilityID(c), SkillID: strings.TrimSpace(c.webAgentConfig.SkillID), LargeMaxOutputTokens: c.runtime.LargeMaxOutputTokens, SmallMaxOutputTokens: c.runtime.SmallMaxOutputTokens, LargeThinkingTokens: c.runtime.LargeThinkingTokens, SmallThinkingTokens: c.runtime.SmallThinkingTokens, LargeTemperature: c.runtime.LargeTemperature, SmallTemperature: c.runtime.SmallTemperature},
-		MCPServers: servers, MCPGeneration: canonicalHash(servers), MCPHash: canonicalHash(servers), Timeouts: timeouts, DefaultTimeout: c.webStartupConfig.DefaultTimeout, RetryPolicy: "transport-managed", CLIVersion: turnRuntimeCLIVersion, BuildSHA: strings.TrimSpace(turnRuntimeBuildSHA),
+		Model:      TurnModelSnapshot{Provider: safeSnapshotString(c.runtime.Provider), LargeModel: safeSnapshotString(effectiveLargeModel(c)), SmallModel: safeSnapshotString(c.runtime.SmallModel), CapabilityID: safeSnapshotString(effectiveCapabilityID(c)), SkillID: safeSnapshotString(strings.TrimSpace(c.webAgentConfig.SkillID)), LargeMaxOutputTokens: c.runtime.LargeMaxOutputTokens, SmallMaxOutputTokens: c.runtime.SmallMaxOutputTokens, LargeThinkingTokens: c.runtime.LargeThinkingTokens, SmallThinkingTokens: c.runtime.SmallThinkingTokens, LargeTemperature: c.runtime.LargeTemperature, SmallTemperature: c.runtime.SmallTemperature},
+		MCPServers: servers, MCPGeneration: canonicalHash(servers), MCPHash: canonicalHash(servers), Timeouts: safeSnapshotTimeouts(timeouts), DefaultTimeout: c.webStartupConfig.DefaultTimeout, RetryPolicy: safeSnapshotString("transport-managed"), CLIVersion: turnRuntimeCLIVersion, BuildSHA: safeSnapshotString(strings.TrimSpace(turnRuntimeBuildSHA)),
 	}
 }
 
@@ -135,6 +135,57 @@ func canonicalMCPServers(servers []MCPServer) []MCPServer {
 	})
 	return out
 }
+
+func safeMCPServers(servers []MCPServer) []MCPServer {
+	out := cloneMCPServers(servers)
+	for i := range out {
+		out[i].ServerID = safeSnapshotString(out[i].ServerID)
+		out[i].Name = safeSnapshotString(out[i].Name)
+		out[i].Transport = safeSnapshotString(out[i].Transport)
+		out[i].Source = safeSnapshotString(out[i].Source)
+		out[i].URL = safeSnapshotURL(out[i].URL)
+	}
+	return out
+}
+
+func safeSnapshotApp(app *AppScope) *AppScope {
+	if app == nil {
+		return nil
+	}
+	out := *app
+	out.ScopeID = safeSnapshotString(out.ScopeID)
+	out.Scope = safeSnapshotString(out.Scope)
+	out.ScopeName = safeSnapshotString(out.ScopeName)
+	out.AppSysID = safeSnapshotString(out.AppSysID)
+	return &out
+}
+
+func safeSnapshotWorkspace(workspace TurnWorkspaceSnapshot) TurnWorkspaceSnapshot {
+	workspace.Name = safeSnapshotString(workspace.Name)
+	workspace.URI = safeSnapshotString(workspace.URI)
+	workspace.Checksum = safeSnapshotString(workspace.Checksum)
+	for i := range workspace.Folders {
+		workspace.Folders[i].Name = safeSnapshotString(workspace.Folders[i].Name)
+		workspace.Folders[i].URI = safeSnapshotString(workspace.Folders[i].URI)
+	}
+	return workspace
+}
+
+func safeSnapshotStrings(values []string) []string {
+	out := make([]string, len(values))
+	for i := range values {
+		out[i] = safeSnapshotString(values[i])
+	}
+	return out
+}
+
+func safeSnapshotTimeouts(values map[string]time.Duration) map[string]time.Duration {
+	out := make(map[string]time.Duration, len(values))
+	for name, timeout := range values {
+		out[safeSnapshotString(name)] = timeout
+	}
+	return out
+}
 func canonicalHash(v interface{}) string {
 	raw, _ := json.Marshal(v)
 	sum := sha256.Sum256(raw)
@@ -164,7 +215,7 @@ func safeSnapshotValue(v interface{}) interface{} {
 	case nil:
 		return nil
 	case string:
-		return snapshotCredentialPattern.ReplaceAllString(typed, "[redacted]")
+		return safeSnapshotString(typed)
 	case []interface{}:
 		out := make([]interface{}, len(typed))
 		for i := range typed {
@@ -182,20 +233,20 @@ func safeSnapshotValue(v interface{}) interface{} {
 		}
 		return out
 	case []MCPServer:
-		out := cloneMCPServers(typed)
-		for i := range out {
-			out[i].URL = safeSnapshotURL(out[i].URL)
-		}
-		return out
+		return safeMCPServers(typed)
 	default:
 		return cloneJSONValue(typed)
 	}
 }
 
+func safeSnapshotString(value string) string {
+	return snapshotCredentialPattern.ReplaceAllString(value, "[redacted]")
+}
+
 func safeSnapshotURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return snapshotCredentialPattern.ReplaceAllString(raw, "[redacted]")
+		return safeSnapshotString(raw)
 	}
 	if u.User != nil {
 		u.User = nil
@@ -205,8 +256,17 @@ func safeSnapshotURL(raw string) string {
 		lower := strings.ToLower(key)
 		if strings.Contains(lower, "token") || strings.Contains(lower, "secret") || strings.Contains(lower, "password") || strings.Contains(lower, "auth") {
 			query.Del(key)
+			continue
+		}
+		for i, value := range query[key] {
+			query[key][i] = safeSnapshotString(value)
 		}
 	}
 	u.RawQuery = query.Encode()
-	return u.String()
+	u.Path = safeSnapshotString(u.Path)
+	u.RawPath = ""
+	u.Fragment = safeSnapshotString(u.Fragment)
+	u.RawFragment = ""
+	u.Opaque = safeSnapshotString(u.Opaque)
+	return safeSnapshotString(u.String())
 }

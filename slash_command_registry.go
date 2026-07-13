@@ -134,13 +134,19 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/help"},
 	},
 	{
-		Canonical: "/conversation", Aliases: []string{"/conv"}, Description: "choose an existing Build Agent conversation or create one", Category: "Context", Order: 20,
+		Canonical: "/conversation", Aliases: []string{"/conv"}, Description: "choose an existing Build Agent conversation or create one", Category: "Context", Order: 15,
 		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandModal, Runtime: SlashCommandRuntimeNoCodeAssistWS,
 		CapturePolicy: SlashCommandDoNotCaptureModal, Suggestions: []string{"/conversation"},
 		IsModal: func(args []string) bool { return commandArgsStartModal(args, "select", "choose", "list", "ls") },
 		Handler: func(ctx context.Context, c *Client, args []string) (bool, error) {
 			return true, handleConversationCommand(ctx, c, args)
 		},
+	},
+	{
+		Canonical: "/status", Description: "show offline-safe runtime health (/status --json for schema output)", Category: "General", Order: 20,
+		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/status", "/status --json"},
+		Handler: handleStatusCommand,
 	},
 	{
 		Canonical: "/mcp", Description: "show MCP servers advertised to Nirvana/Forge", Category: "Tools", Order: 30,

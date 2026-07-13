@@ -52,6 +52,30 @@ func TestTurnRuntimeSnapshotDeterministicWorkingSetAndMCP(t *testing.T) {
 	}
 }
 
+func TestTurnRuntimeSnapshotSanitizesAllMCPFieldsBeforeHashing(t *testing.T) {
+	c := snapshotTestClient()
+	secrets := []string{"mcp-token-secret", "mcp-bearer-secret", "mcp-cookie-secret", "mcp-password-secret", "mcp-auth-secret"}
+	servers := []MCPServer{{
+		ServerID: "id token=mcp-token-secret", Name: "name Bearer mcp-bearer-secret", Transport: "Authorization: mcp-auth-secret",
+		Source: "cookie=mcp-cookie-secret", URL: "https://user:mcp-password-secret@example.test/mcp?token=mcp-token-secret",
+	}}
+	snapshot := c.captureTurnRuntimeSnapshot(servers)
+	raw := string(mustJSON(t, snapshot))
+	for _, secret := range secrets {
+		if strings.Contains(raw, secret) || strings.Contains(snapshot.MCPGeneration, secret) || strings.Contains(snapshot.MCPHash, secret) {
+			t.Fatalf("MCP secret leaked into snapshot/hash source: %q", raw)
+		}
+	}
+	if !strings.Contains(raw, "[redacted]") {
+		t.Fatalf("MCP fields were not redacted: %q", raw)
+	}
+	first := c.captureTurnRuntimeSnapshot([]MCPServer{{ServerID: "b token=mcp-token-secret"}, {ServerID: "a cookie=mcp-cookie-secret"}})
+	second := c.captureTurnRuntimeSnapshot([]MCPServer{{ServerID: "a cookie=mcp-cookie-secret"}, {ServerID: "b token=mcp-token-secret"}})
+	if first.MCPGeneration != second.MCPGeneration || first.MCPServers[0].ServerID > first.MCPServers[1].ServerID {
+		t.Fatalf("sanitized MCP ordering/hash is not deterministic: %#v %#v", first, second)
+	}
+}
+
 func TestTurnRuntimeSnapshotTurnBoundaryAndNextTurnRefresh(t *testing.T) {
 	c := snapshotTestClient()
 	c.conn = nil // SendMessage must reject before creating a snapshot.
