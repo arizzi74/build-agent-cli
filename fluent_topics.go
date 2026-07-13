@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	posixpath "path"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -75,17 +78,68 @@ func fluentTopicsError(code, message string) map[string]interface{} {
 }
 
 func (c *Client) gliderFileExists(ctx context.Context, uri string) (bool, error) {
-	entries, err := c.fetchGliderStateForURIs(ctx, []string{uri})
+	uri = strings.TrimRight(strings.TrimSpace(uri), "/")
+	if uri == "" {
+		return false, nil
+	}
+	var stateErr error
+	if exists, err := c.gliderFileExistsInState(ctx, []string{uri}, uri); err != nil {
+		stateErr = err
+	} else if exists {
+		return true, nil
+	}
+	// ServiceNow Glider can return an empty state result for an exact file URI even
+	// when root workspace state shows the file. Mirror the Web extension's VFS
+	// behavior by also checking the app root, then fall back to a direct file fetch.
+	if rootURI := gliderRootURIFromFileURI(uri); rootURI != "" && !strings.EqualFold(rootURI, uri) {
+		if exists, err := c.gliderFileExistsInState(ctx, []string{rootURI}, uri); err != nil {
+			stateErr = err
+		} else if exists {
+			return true, nil
+		}
+	}
+	contents, fetchErr := c.fetchV2SyncFiles(ctx, []string{uri})
+	if fetchErr == nil {
+		for _, content := range contents {
+			if len(bytes.TrimSpace(content)) > 0 {
+				return true, nil
+			}
+		}
+	}
+	if stateErr != nil {
+		return false, stateErr
+	}
+	if fetchErr != nil {
+		return false, fetchErr
+	}
+	return false, nil
+}
+
+func (c *Client) gliderFileExistsInState(ctx context.Context, stateURIs []string, targetURI string) (bool, error) {
+	entries, err := c.fetchGliderStateForURIs(ctx, stateURIs)
 	if err != nil {
 		return false, err
 	}
-	uri = strings.TrimRight(strings.TrimSpace(uri), "/")
+	targetURI = strings.TrimRight(strings.TrimSpace(targetURI), "/")
 	for _, entry := range entries {
-		if strings.EqualFold(strings.TrimRight(entry.URI, "/"), uri) && gliderStateEntryIsFile(entry) {
+		if strings.EqualFold(strings.TrimRight(entry.URI, "/"), targetURI) && gliderStateEntryIsFile(entry) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+func gliderRootURIFromFileURI(uri string) string {
+	uri = strings.TrimRight(strings.TrimSpace(uri), "/")
+	if !strings.HasPrefix(uri, "now-file:/") {
+		return ""
+	}
+	rel := strings.TrimPrefix(uri, "now-file:/")
+	parts := strings.SplitN(rel, "/", 2)
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return ""
+	}
+	return "now-file:/" + strings.TrimSpace(parts[0])
 }
 
 func (c *Client) loadFluentTopicCatalog(ctx context.Context, workspaceURI string) (fluentCatalogResult, error) {
@@ -99,7 +153,7 @@ func (c *Client) loadFluentTopicCatalog(ctx context.Context, workspaceURI string
 		return fluentCatalogResult{}, err
 	}
 	if len(entries) == 0 {
-		return fluentCatalogResult{OK: false, Reason: "no_fluent_project"}, nil
+		return c.loadLocalFluentTopicCatalog(ctx, workspaceURI)
 	}
 	docsURI := sdkURI + "/docs"
 	docEntries := fluentDocMarkdownEntries(entries, docsURI)
@@ -111,6 +165,108 @@ func (c *Client) loadFluentTopicCatalog(ctx context.Context, workspaceURI string
 		return fluentCatalogResult{}, err
 	}
 	return fluentCatalogResult{OK: true, Topics: topics}, nil
+}
+
+func (c *Client) loadLocalFluentTopicCatalog(ctx context.Context, workspaceURI string) (fluentCatalogResult, error) {
+	appID := fluentTopicsWorkspaceAppID(workspaceURI)
+	if build := c.lastGliderBuild; build != nil && build.TempDir != "" && strings.EqualFold(strings.TrimSpace(build.AppID), appID) {
+		catalog, err := scanLocalFluentDocTopics(filepath.Join(build.TempDir, "node_modules", "@servicenow", "sdk", "docs"))
+		if err != nil || catalog.OK {
+			return catalog, err
+		}
+	}
+
+	project, cleanup, err := c.syncGliderBuildProjectToTemp(ctx, workspaceURI)
+	if err != nil {
+		return fluentCatalogResult{}, err
+	}
+	defer cleanup()
+
+	pkgPath := project.Files["package.json"]
+	if pkgPath == "" {
+		return fluentCatalogResult{OK: false, Reason: "no_fluent_project"}, nil
+	}
+	pkgRaw, err := os.ReadFile(pkgPath)
+	if err != nil {
+		return fluentCatalogResult{}, err
+	}
+	pkg := parsePackageJSONInfo(pkgRaw)
+	if !packageHasDependency(pkg, "@servicenow/sdk") {
+		return fluentCatalogResult{OK: false, Reason: "no_fluent_project"}, nil
+	}
+	if missing := missingNodeDependencies(project.Dir, []string{"@servicenow/sdk"}); len(missing) > 0 {
+		if err := c.installProjectDependencies(ctx, project.Dir, missing); err != nil {
+			return fluentCatalogResult{}, err
+		}
+	}
+	return scanLocalFluentDocTopics(filepath.Join(project.Dir, "node_modules", "@servicenow", "sdk", "docs"))
+}
+
+func packageHasDependency(pkg packageJSONInfo, name string) bool {
+	for _, deps := range []map[string]string{pkg.Dependencies, pkg.DevDependencies, pkg.OptionalDependencies} {
+		if _, ok := deps[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func scanLocalFluentDocTopics(docsDir string) (fluentCatalogResult, error) {
+	docsDir = filepath.Clean(strings.TrimSpace(docsDir))
+	if docsDir == "." || docsDir == "" {
+		return fluentCatalogResult{OK: false, Reason: "no_fluent_project"}, nil
+	}
+	if info, err := os.Stat(docsDir); err != nil {
+		sdkPackage := filepath.Join(filepath.Dir(docsDir), "package.json")
+		if _, pkgErr := os.Stat(sdkPackage); pkgErr == nil {
+			return fluentCatalogResult{OK: false, Reason: "sdk_version_too_old"}, nil
+		}
+		if os.IsNotExist(err) {
+			return fluentCatalogResult{OK: false, Reason: "no_fluent_project"}, nil
+		}
+		return fluentCatalogResult{}, err
+	} else if !info.IsDir() {
+		return fluentCatalogResult{OK: false, Reason: "sdk_version_too_old"}, nil
+	}
+
+	seen := map[string]string{}
+	topics := []fluentTopic{}
+	if err := filepath.WalkDir(docsDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() || !strings.HasSuffix(strings.ToLower(d.Name()), ".md") {
+			return nil
+		}
+		name := strings.TrimSuffix(d.Name(), filepath.Ext(d.Name()))
+		if previous, ok := seen[name]; ok {
+			return fmt.Errorf("duplicate doc topic name %q — both %s and %s resolve to it", name, previous, path)
+		}
+		seen[name] = path
+		if !fluentTopicIncluded(name) {
+			return nil
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		topics = append(topics, fluentTopic{Name: name, Summary: fluentDocSummary(string(content))})
+		return nil
+	}); err != nil {
+		return fluentCatalogResult{}, err
+	}
+	sort.Slice(topics, func(i, j int) bool { return topics[i].Name < topics[j].Name })
+	return fluentCatalogResult{OK: true, Topics: topics}, nil
+}
+
+func fluentTopicsWorkspaceAppID(workspaceURI string) string {
+	workspaceURI = strings.TrimRight(strings.TrimSpace(workspaceURI), "/")
+	workspaceURI = strings.TrimPrefix(workspaceURI, "now-file:")
+	workspaceURI = strings.Trim(workspaceURI, "/")
+	if slash := strings.Index(workspaceURI, "/"); slash >= 0 {
+		workspaceURI = workspaceURI[:slash]
+	}
+	return workspaceURI
 }
 
 func fluentDocMarkdownEntries(entries []gliderChangeEntry, docsURI string) []gliderChangeEntry {

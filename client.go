@@ -43,46 +43,66 @@ type Client struct {
 	ambSubscribed       bool
 	ambUnavailable      bool
 	ambCancel           context.CancelFunc
+	nirvanaPingCancel   context.CancelFunc
 
-	conversationID         string
-	conversationTitle      string
-	conversationState      string
-	serverConversation     bool
-	history                []interface{}
-	usageInputTokens       int64
-	usageOutputTokens      int64
-	usageThinkingTokens    int64
-	appScope               interface{}
-	currentApp             *AppScope
-	workingSet             interface{}
-	workspaceName          string
-	workspaceURI           string
-	workspaceChecksum      string
-	workspaceDescription   string
-	workspaceFolders       []WebWorkspaceFolder
-	streamTypes            map[string]string
-	webAgentConfig         WebAgentConfig
-	webStreamID            string
-	webStreamType          string
-	webStreamText          string
-	webStreamTS            string
-	webStreamRows          int
-	webStreamPlain         bool
-	webStreamBulletStarted bool
-	nirvanaMCPServers      []MCPServer
-	nirvanaMCPServersReady bool
-	toolCallNames          map[string]string
-	turnCompletedByAMB     bool
-	responseTransport      string
-	warnedLegacySend       bool
-	pendingUserContent     string
-	nirvanaThinkingText    string
-	nirvanaThinkingStarted time.Time
-	nirvanaThinkingDone    bool
-	turnStatusActive       bool
-	turnStatusStop         chan struct{}
-	turnStatusDone         chan struct{}
-	statusMu               sync.Mutex
+	conversationID          string
+	conversationTitle       string
+	conversationState       string
+	serverConversation      bool
+	history                 []interface{}
+	usageInputTokens        int64
+	usageOutputTokens       int64
+	usageThinkingTokens     int64
+	appScope                interface{}
+	currentApp              *AppScope
+	workingSet              interface{}
+	workspaceName           string
+	workspaceURI            string
+	workspaceChecksum       string
+	workspaceDescription    string
+	workspaceFolders        []WebWorkspaceFolder
+	streamTypes             map[string]string
+	webAgentConfig          WebAgentConfig
+	webStreamID             string
+	webStreamType           string
+	webStreamText           string
+	webStreamTS             string
+	webStreamRows           int
+	webStreamTranscriptText string
+	webStreamPlain          bool
+	webStreamBulletStarted  bool
+	nirvanaMCPServers       []MCPServer
+	nirvanaMCPServersReady  bool
+	toolCallNames           map[string]string
+	toolCallInputs          map[string]interface{}
+	toolCallStarted         map[string]time.Time
+	lastUserMessageSysID    string
+	lastUserMessageContent  RichUserContent
+	richWebPersistence      bool
+	turnStartedAt           time.Time
+	turnTelemetry           *BuildAgentTelemetryState
+	turnToolTelemetry       []BuildAgentToolTelemetry
+	turnStopPersisted       bool
+	lastGliderBuild         *gliderBuildState
+	buildOperationMu        sync.Mutex
+	metadataSyncMu          sync.Mutex
+	turnCompletedByAMB      bool
+	responseTransport       string
+	warnedLegacySend        bool
+	pendingUserContent      string
+	nirvanaThinkingText     string
+	nirvanaThinkingStarted  time.Time
+	nirvanaThinkingDone     bool
+	turnStatusActive        bool
+	turnStatusStop          chan struct{}
+	turnStatusDone          chan struct{}
+	statusMu                sync.Mutex
+	activeTurnMu            sync.Mutex
+	activeTurnCtx           context.Context
+	activeTurnCancel        context.CancelFunc
+	activeTurnStopping      bool
+	activeServerTurnID      string
+	cancelledServerTurnIDs  map[string]struct{}
 
 	connected chan error
 	turnDone  chan error
@@ -115,14 +135,16 @@ func NewClient(cfg CLIConfig, opts Options) (*Client, error) {
 		return nil, err
 	}
 	c := &Client{
-		cfg:           cfg,
-		opts:          opts,
-		runtime:       runtimeCfg,
-		streamTypes:   map[string]string{},
-		toolCallNames: map[string]string{},
-		connected:     make(chan error, 1),
-		closed:        make(chan struct{}),
-		debug:         opts.Debug,
+		cfg:             cfg,
+		opts:            opts,
+		runtime:         runtimeCfg,
+		streamTypes:     map[string]string{},
+		toolCallNames:   map[string]string{},
+		toolCallInputs:  map[string]interface{}{},
+		toolCallStarted: map[string]time.Time{},
+		connected:       make(chan error, 1),
+		closed:          make(chan struct{}),
+		debug:           opts.Debug,
 	}
 	if err := c.loadInitialState(); err != nil {
 		return nil, err
@@ -323,6 +345,9 @@ func (c *Client) absorbAppScope(v interface{}) {
 }
 
 func (c *Client) Connect(ctx context.Context) error {
+	// The browser loads these values before opening Nirvana. Keep this
+	// best-effort so older instances and non-browser auth remain usable.
+	_ = c.loadWebStartupConfig(ctx)
 	if !c.opts.Nirvana {
 		return c.connectGateway(ctx)
 	}
@@ -365,6 +390,9 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	select {
 	case err := <-c.connected:
+		if err == nil {
+			c.startNirvanaPingLoop()
+		}
 		return err
 	case <-ctx.Done():
 		_ = c.Close()
@@ -373,6 +401,30 @@ func (c *Client) Connect(ctx context.Context) error {
 		_ = c.Close()
 		return errors.New("connection handshake timed out after 30s")
 	}
+}
+
+func (c *Client) startNirvanaPingLoop() {
+	if c.conn == nil || c.nirvanaPingCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.nirvanaPingCancel = cancel
+	go func() {
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-c.closed:
+				return
+			case <-ticker.C:
+				if err := c.writeJSON(map[string]interface{}{"type": "ping"}); err != nil {
+					return
+				}
+			}
+		}
+	}()
 }
 
 func (c *Client) prepareNirvanaConversationSelection(ctx context.Context) error {
@@ -391,6 +443,10 @@ func (c *Client) prepareNirvanaConversationSelection(ctx context.Context) error 
 }
 
 func (c *Client) Close() error {
+	if c.nirvanaPingCancel != nil {
+		c.nirvanaPingCancel()
+		c.nirvanaPingCancel = nil
+	}
 	if c.ambCancel != nil {
 		c.ambCancel()
 		c.ambCancel = nil
@@ -453,8 +509,18 @@ func (c *Client) SendMessage(ctx context.Context, content string) error {
 	if err := c.ensureWebConversationWithTitle(ctx, content); err != nil {
 		return err
 	}
-	if err := c.persistWebUserMessage(ctx, content); err != nil {
-		return err
+	userRow := NewRichUserContent("", content)
+	c.lastUserMessageContent = userRow
+	c.turnStartedAt = time.Now()
+	c.turnTelemetry = c.StartBuildAgentTelemetry(ctx, content)
+	c.turnToolTelemetry = nil
+	c.turnStopPersisted = false
+	c.lastUserMessageSysID = c.BestEffortPersistRichWebMessageContent(ctx, c.conversationID, userRow)
+	c.richWebPersistence = c.lastUserMessageSysID != ""
+	if c.lastUserMessageSysID == "" {
+		if err := c.persistWebUserMessage(ctx, content); err != nil {
+			return err
+		}
 	}
 	payload["conversation_id"] = c.conversationID
 	if attrs := asMap(invokeOptions["attributes"]); attrs != nil {
@@ -465,6 +531,8 @@ func (c *Client) SendMessage(ctx context.Context, content string) error {
 	c.turnDone = make(chan error, 1)
 	c.processing = true
 	if err := c.writeJSON(payload); err != nil {
+		c.ErrorBuildAgentTelemetry(ctx, c.turnTelemetry)
+		c.turnTelemetry = nil
 		c.processing = false
 		c.pendingUserContent = ""
 		return err
@@ -492,6 +560,113 @@ func (c *Client) WaitTurn(ctx context.Context) error {
 	case <-c.closed:
 		return errors.New("connection closed")
 	}
+}
+
+func (c *Client) beginActiveTurn(parent context.Context) context.Context {
+	ctx, cancel := context.WithCancel(parent)
+	c.activeTurnMu.Lock()
+	c.activeTurnCtx = ctx
+	c.activeTurnCancel = cancel
+	c.activeTurnStopping = false
+	c.activeServerTurnID = ""
+	if c.cancelledServerTurnIDs == nil {
+		c.cancelledServerTurnIDs = map[string]struct{}{}
+	}
+	c.activeTurnMu.Unlock()
+	return ctx
+}
+
+func (c *Client) endActiveTurn() {
+	c.activeTurnMu.Lock()
+	if c.activeTurnCancel != nil {
+		c.activeTurnCancel()
+	}
+	// Preserve a cancelled context after the prompt is released. The server can
+	// deliver late elicitations and already-running local handlers can finish
+	// after WaitTurn returns; they must still see cancellation and stay silent.
+	if !c.activeTurnStopping {
+		c.activeTurnCtx = nil
+	}
+	c.activeTurnCancel = nil
+	c.activeTurnMu.Unlock()
+}
+
+func (c *Client) activeTurnCancelled() bool {
+	c.activeTurnMu.Lock()
+	defer c.activeTurnMu.Unlock()
+	return c.activeTurnStopping || (c.activeTurnCtx != nil && c.activeTurnCtx.Err() != nil)
+}
+
+func (c *Client) activeTurnContext() context.Context {
+	c.activeTurnMu.Lock()
+	defer c.activeTurnMu.Unlock()
+	if c.activeTurnCtx != nil {
+		return c.activeTurnCtx
+	}
+	return context.Background()
+}
+
+func (c *Client) cancelActiveTurn() bool {
+	c.activeTurnMu.Lock()
+	if c.activeTurnCancel == nil || c.activeTurnStopping {
+		c.activeTurnMu.Unlock()
+		return false
+	}
+	c.activeTurnStopping = true
+	if c.activeServerTurnID != "" {
+		if c.cancelledServerTurnIDs == nil {
+			c.cancelledServerTurnIDs = map[string]struct{}{}
+		}
+		c.cancelledServerTurnIDs[c.activeServerTurnID] = struct{}{}
+	}
+	cancel := c.activeTurnCancel
+	conversationID := c.conversationID
+	c.activeTurnMu.Unlock()
+
+	if c.conn != nil && conversationID != "" {
+		_ = c.writeJSON(map[string]interface{}{"type": "stop", "conversation_id": conversationID})
+	}
+	cancel()
+	c.clearTurnStatus()
+	// Allow the REPL to start a fresh turn immediately. The cancelled context
+	// and stopping latch remain intact so handlers from the old turn still see
+	// cancellation and cannot emit progress or elicitation responses.
+	c.processing = false
+	if c.richWebPersistence && !c.turnStopPersisted {
+		ctx, done := context.WithTimeout(context.Background(), 45*time.Second)
+		c.BestEffortPersistRichWebMessageContent(ctx, c.conversationID, NewRichStopContent())
+		done()
+		c.turnStopPersisted = true
+	}
+	c.CancelBuildAgentTelemetry(context.Background(), c.turnTelemetry)
+	if c.turnTelemetry != nil {
+		for i := range c.turnToolTelemetry {
+			c.turnToolTelemetry[i].EventID = c.turnTelemetry.SysID
+		}
+	}
+	c.PostBuildAgentToolTelemetry(context.Background(), c.turnToolTelemetry)
+	c.turnTelemetry = nil
+	c.turnToolTelemetry = nil
+	c.pendingUserContent = ""
+	if c.turnDone != nil {
+		select {
+		case c.turnDone <- context.Canceled:
+		default:
+		}
+	}
+	showTerminalFooterTempMessageWithStyle(c.statusBarState(), "Cancelling action…", 0, ansiYellow+ansiBold)
+	return true
+}
+
+func (c *Client) shouldIgnoreCancelledTurnEvent(event map[string]interface{}) bool {
+	turnID := strings.TrimSpace(stringify(event["turn_id"]))
+	c.activeTurnMu.Lock()
+	defer c.activeTurnMu.Unlock()
+	if turnID != "" {
+		_, cancelled := c.cancelledServerTurnIDs[turnID]
+		return cancelled
+	}
+	return c.activeTurnStopping && c.activeTurnCtx != nil && c.activeTurnCtx.Err() != nil
 }
 
 func (c *Client) connectGateway(ctx context.Context) error {
@@ -2103,7 +2278,7 @@ func (c *Client) finishGatewayStreamOutput() {
 	}
 	if c.webStreamRows > 0 {
 		c.commitAssistantStreamRows(true)
-		terminalRecordAssistantText(assistantText)
+		c.recordActiveStreamTranscriptDelta()
 		redrawPendingFooterPromptFromState()
 		return
 	}
@@ -2121,6 +2296,29 @@ func (c *Client) finishGatewayStreamOutput() {
 		return
 	}
 	printAssistantText(assistantText)
+}
+
+func (c *Client) recordActiveStreamTranscriptDelta() {
+	text := strings.TrimSpace(c.webStreamText)
+	if text == "" || text == c.webStreamTranscriptText {
+		return
+	}
+	delta := text
+	if c.webStreamTranscriptText != "" && strings.HasPrefix(text, c.webStreamTranscriptText) {
+		delta = strings.TrimSpace(strings.TrimPrefix(text, c.webStreamTranscriptText))
+	}
+	if delta != "" {
+		terminalRecordAssistantText(delta)
+	}
+	c.webStreamTranscriptText = text
+}
+
+func (c *Client) flushActiveStreamForTerminalInterruption() {
+	if strings.TrimSpace(c.webStreamText) == "" {
+		return
+	}
+	c.commitAssistantStreamRows(true)
+	c.recordActiveStreamTranscriptDelta()
 }
 
 func extractTagContent(s, tag string) []string {
@@ -2270,6 +2468,7 @@ func (c *Client) resetWebStream() {
 	c.webStreamText = ""
 	c.webStreamTS = ""
 	c.webStreamRows = 0
+	c.webStreamTranscriptText = ""
 	c.webStreamPlain = false
 	c.webStreamBulletStarted = false
 	c.turnCompletedByAMB = false
@@ -2536,6 +2735,18 @@ func (c *Client) resetTurnToolTracking() {
 	for key := range c.toolCallNames {
 		delete(c.toolCallNames, key)
 	}
+	if c.toolCallInputs == nil {
+		c.toolCallInputs = map[string]interface{}{}
+	}
+	if c.toolCallStarted == nil {
+		c.toolCallStarted = map[string]time.Time{}
+	}
+	for key := range c.toolCallInputs {
+		delete(c.toolCallInputs, key)
+	}
+	for key := range c.toolCallStarted {
+		delete(c.toolCallStarted, key)
+	}
 }
 
 func (c *Client) recordToolCall(event map[string]interface{}) (string, string) {
@@ -2548,7 +2759,15 @@ func (c *Client) recordToolCall(event map[string]interface{}) (string, string) {
 		if c.toolCallNames == nil {
 			c.toolCallNames = map[string]string{}
 		}
+		if c.toolCallInputs == nil {
+			c.toolCallInputs = map[string]interface{}{}
+		}
+		if c.toolCallStarted == nil {
+			c.toolCallStarted = map[string]time.Time{}
+		}
 		c.toolCallNames[callID] = name
+		c.toolCallInputs[callID] = eventToolInput(event)
+		c.toolCallStarted[callID] = time.Now()
 	}
 	return name, callID
 }
@@ -2568,7 +2787,19 @@ func (c *Client) recordToolResult(event map[string]interface{}) (string, string,
 	return name, callID, eventToolSuccess(event), eventToolSummary(event)
 }
 
+func eventToolInput(event map[string]interface{}) interface{} {
+	for _, m := range eventCandidateMaps(event) {
+		for _, key := range []string{"input", "inputs", "arguments", "tool_input", "toolInput"} {
+			if value, ok := m[key]; ok {
+				return value
+			}
+		}
+	}
+	return map[string]interface{}{}
+}
+
 func (c *Client) printToolResultStatus(name string, success bool, summary string) {
+	c.flushActiveStreamForTerminalInterruption()
 	display := toolResultDisplay(name, summary)
 	if terminalRecordToolResultAndAppend(display, success, c.statusBarState()) {
 		return
@@ -2782,6 +3013,9 @@ func (c *Client) handleEvent(data []byte) error {
 		return err
 	}
 	typeName, _ := event["type"].(string)
+	if c.shouldIgnoreCancelledTurnEvent(event) {
+		return nil
+	}
 	switch typeName {
 	case "connected":
 		if !c.suppressInteractiveStartupScrollback() {
@@ -2792,6 +3026,9 @@ func (c *Client) handleEvent(data []byte) error {
 		default:
 		}
 	case "turn_start":
+		c.activeTurnMu.Lock()
+		c.activeServerTurnID = strings.TrimSpace(stringify(event["turn_id"]))
+		c.activeTurnMu.Unlock()
 		c.resetTurnToolTracking()
 		c.showTurnStatus()
 	case "turn_resumed":
@@ -2817,6 +3054,27 @@ func (c *Client) handleEvent(data []byte) error {
 		}
 	case "tool_result":
 		name, callID, success, summary := c.recordToolResult(event)
+		started := c.toolCallStarted[callID]
+		input := c.toolCallInputs[callID]
+		delete(c.toolCallStarted, callID)
+		delete(c.toolCallInputs, callID)
+		eventID := ""
+		if c.turnTelemetry != nil {
+			eventID = c.turnTelemetry.SysID
+		}
+		c.turnToolTelemetry = append(c.turnToolTelemetry, NewBuildAgentToolTelemetry(name, started, success, summary, eventID))
+		if c.richWebPersistence {
+			duration := time.Duration(0)
+			if !started.IsZero() {
+				duration = time.Since(started)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			c.BestEffortPersistRichAssistantToolMessage(ctx, c.conversationID, RichAssistantToolContentOptions{
+				ToolUseID: callID, ToolName: name, ToolActualName: name, ToolInput: input,
+				Success: success, Result: summary, StartTime: started, Duration: duration,
+			})
+			cancel()
+		}
 		if c.debug {
 			c.debugf("\n[tool result] %s success=%v\n", callID, success)
 		}
@@ -2839,8 +3097,14 @@ func (c *Client) handleEvent(data []byte) error {
 		assistantText := strings.TrimSpace(c.webStreamText)
 		if assistantText != "" {
 			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-			if err := c.persistWebAssistantMessage(ctx, assistantText); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not persist assistant message: %v\n", err)
+			duration := time.Duration(0)
+			if !c.turnStartedAt.IsZero() {
+				duration = time.Since(c.turnStartedAt)
+			}
+			if !c.richWebPersistence || c.BestEffortPersistRichAssistantFinalMessage(ctx, c.conversationID, "", assistantText, duration, c.turnStartedAt) == "" {
+				if err := c.persistWebAssistantMessage(ctx, assistantText); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: could not persist assistant message: %v\n", err)
+				}
 			}
 			cancel()
 		}
@@ -2864,6 +3128,15 @@ func (c *Client) handleEvent(data []byte) error {
 			fmt.Fprintf(os.Stderr, "warning: could not save workspace %q: %v\n", c.workspaceName, err)
 		}
 		c.processing = false
+		c.CompleteBuildAgentTelemetry(context.Background(), c.turnTelemetry)
+		if c.turnTelemetry != nil {
+			for i := range c.turnToolTelemetry {
+				c.turnToolTelemetry[i].EventID = c.turnTelemetry.SysID
+			}
+		}
+		c.PostBuildAgentToolTelemetry(context.Background(), c.turnToolTelemetry)
+		c.turnTelemetry = nil
+		c.turnToolTelemetry = nil
 		if c.turnDone != nil {
 			select {
 			case c.turnDone <- nil:
@@ -2875,6 +3148,15 @@ func (c *Client) handleEvent(data []byte) error {
 		c.clearTurnStatus()
 		fmt.Fprintf(os.Stderr, "\n%s\n", err)
 		c.processing = false
+		c.ErrorBuildAgentTelemetry(context.Background(), c.turnTelemetry)
+		if c.turnTelemetry != nil {
+			for i := range c.turnToolTelemetry {
+				c.turnToolTelemetry[i].EventID = c.turnTelemetry.SysID
+			}
+		}
+		c.PostBuildAgentToolTelemetry(context.Background(), c.turnToolTelemetry)
+		c.turnTelemetry = nil
+		c.turnToolTelemetry = nil
 		if c.turnDone != nil {
 			select {
 			case c.turnDone <- err:
@@ -2963,6 +3245,11 @@ func (c *Client) handleNirvanaStreamEnd(_ string, contentType string) {
 			c.debugf("Finished thinking after %.1f seconds\n", duration.Seconds())
 		}
 		c.nirvanaThinkingDone = true
+		if c.richWebPersistence {
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			c.BestEffortPersistRichAssistantThinkingMessage(ctx, c.conversationID, "", text, duration, c.nirvanaThinkingStarted)
+			cancel()
+		}
 	}
 }
 
@@ -3074,6 +3361,26 @@ func (c *Client) buildInvokePayload(ctx context.Context, silentAuth bool) (map[s
 }
 
 func (c *Client) clientCapabilities() map[string]interface{} {
+	if c.opts.Nirvana {
+		// Keep this list byte-for-byte equivalent in shape to current Glider Web
+		// UI HAR captures. Advertising extension-only capabilities that the CLI
+		// does not implement can cause Forge to issue unsupported elicitations.
+		return map[string]interface{}{
+			"client_ide":              map[string]interface{}{},
+			"elicitation":             map[string]interface{}{},
+			"fluent_docs":             map[string]interface{}{},
+			"glob_and_grep":           map[string]interface{}{},
+			"interview_choice_picker": map[string]interface{}{},
+			"keyword_search":          map[string]interface{}{"preview_available": true},
+			"plan_approval":           map[string]interface{}{},
+			"product_availability":    map[string]interface{}{},
+			"semantic_search":         map[string]interface{}{},
+			"server_tools":            map[string]interface{}{},
+			"streaming":               map[string]interface{}{"receive": true},
+			"sub_agents":              map[string]interface{}{},
+			"tools":                   map[string]interface{}{"execute": true},
+		}
+	}
 	caps := map[string]interface{}{
 		"change_log":              map[string]interface{}{},
 		"interview_choice_picker": map[string]interface{}{},
@@ -3086,19 +3393,6 @@ func (c *Client) clientCapabilities() map[string]interface{} {
 		"product_availability":    map[string]interface{}{},
 		"atf_with_app":            map[string]interface{}{},
 	}
-	if c.opts.Nirvana {
-		// Match the Glider Build Agent web client closely enough for the
-		// websocket runtime to send the same streaming/tool event family observed
-		// in Chrome HARs. Only specific safe client actions are implemented; the
-		// CLI does not execute arbitrary local filesystem tools.
-		caps["client_ide"] = map[string]interface{}{}
-		caps["elicitation"] = map[string]interface{}{}
-		caps["fluent_docs"] = map[string]interface{}{}
-		caps["glob_and_grep"] = map[string]interface{}{}
-		caps["keyword_search"] = map[string]interface{}{"preview_available": true}
-		caps["tools"] = map[string]interface{}{"execute": true}
-		return caps
-	}
 	// Deliberately do not advertise tools.execute by default. This first Go CLI
 	// is meant to use instance-side/server tools (including instance-defined MCP),
 	// not execute local filesystem/build tools like the TypeScript CLI.
@@ -3110,6 +3404,10 @@ func (c *Client) clientCapabilities() map[string]interface{} {
 }
 
 func (c *Client) handleElicitation(event map[string]interface{}) error {
+	turnCtx := c.activeTurnContext()
+	if turnCtx.Err() != nil {
+		return nil
+	}
 	elicitationID, _ := event["elicitation_id"].(string)
 	action, _ := event["action"].(string)
 	payload, _ := event["payload"].(map[string]interface{})
@@ -3166,19 +3464,24 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 			return c.answerGliderRunDiagnostics(ctx, payload)
 		})
 	case "build", "install", "install_dependencies", "build_install":
-		result, status = c.answerGliderBuild(payload)
+		ctx, cancel := context.WithTimeout(turnCtx, 20*time.Minute)
+		defer cancel()
+		result, status = c.answerGliderBuild(ctx, action, payload)
 	case "instance_skills_list":
 		result, status = map[string]interface{}{"content": "[]"}, "complete"
 	case "fluent_topics_list":
-		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
-			return c.answerFluentTopicsList(ctx, payload)
-		})
+		ctx, cancel := context.WithTimeout(turnCtx, 5*time.Minute)
+		defer cancel()
+		result, status = c.answerFluentTopicsList(ctx, payload)
 	default:
 		result, status, err = c.answerUnknownElicitation(action, payload)
 	}
 	if err != nil {
 		result = map[string]interface{}{"error": err.Error(), "code": "CLI_INPUT_ERROR"}
 		status = "error"
+	}
+	if turnCtx.Err() != nil || c.activeTurnCancelled() {
+		return nil
 	}
 	if len(c.toolCallNames) == 0 {
 		c.printToolResultStatus(action, status == "complete", summarizeToolValue(result, 0))
@@ -3218,6 +3521,9 @@ func (c *Client) answerApproval(action string, payload map[string]interface{}) (
 	if c.opts.AutoApprove || emptyWebUIApproval(action, payload) {
 		return map[string]interface{}{"approved": true}, "complete", nil
 	}
+	// The picker replaces the managed viewport. Commit and record everything
+	// streamed before it so replay restores the same semantic ordering.
+	c.flushActiveStreamForTerminalInterruption()
 	c.clearTurnStatus()
 	message := stringify(payload["message"])
 	if message == "" && action == "plan_approval" {

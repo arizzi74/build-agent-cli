@@ -12,6 +12,12 @@ import (
 	"golang.org/x/term"
 )
 
+// terminalRenderMu serializes multi-escape terminal transactions. The TUI has
+// several writers (stream handling, footer animation, input capture, and temp
+// message timers); without one render boundary their ANSI sequences can splice
+// together and move output into reserved footer/picker rows.
+var terminalRenderMu sync.Mutex
+
 const (
 	ansiReset   = "\x1b[0m"
 	ansiBold    = "\x1b[1m"
@@ -522,7 +528,7 @@ func showTerminalFooterTempMessage(status statusBarState, message string, durati
 
 func showTerminalFooterTempMessageWithStyle(status statusBarState, message string, duration time.Duration, code string) bool {
 	message = strings.TrimSpace(message)
-	if message == "" || !interactiveTerminalUIEnabled() {
+	if message == "" || !interactiveTerminalUIEnabled() || terminalPickerActive() {
 		return false
 	}
 	expires := time.Time{}
@@ -536,12 +542,14 @@ func showTerminalFooterTempMessageWithStyle(status statusBarState, message strin
 	terminalFooterTempStatus.code = code
 	terminalFooterTempStatus.expires = expires
 	terminalFooterTempStatus.Unlock()
+	terminalRenderMu.Lock()
 	metrics, ok := activateTerminalFooter(status)
 	if ok {
 		fmt.Fprint(os.Stderr, "\x1b[s")
 		drawTerminalFooterTempLine(metrics, message, code)
 		fmt.Fprint(os.Stderr, "\x1b[u")
 	}
+	terminalRenderMu.Unlock()
 	if duration > 0 {
 		time.AfterFunc(duration, func() {
 			terminalFooterTempStatus.Lock()
@@ -553,6 +561,11 @@ func showTerminalFooterTempMessageWithStyle(status statusBarState, message strin
 			terminalFooterTempStatus.code = ""
 			terminalFooterTempStatus.expires = time.Time{}
 			terminalFooterTempStatus.Unlock()
+			terminalRenderMu.Lock()
+			defer terminalRenderMu.Unlock()
+			if terminalPickerActive() {
+				return
+			}
 			metrics, ok := terminalFooterMetricsForTTY()
 			if !ok {
 				return
@@ -572,6 +585,11 @@ func clearTerminalFooterTempMessage() {
 	terminalFooterTempStatus.code = ""
 	terminalFooterTempStatus.expires = time.Time{}
 	terminalFooterTempStatus.Unlock()
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	if terminalPickerActive() {
+		return
+	}
 	metrics, ok := terminalFooterMetricsForTTY()
 	if !ok {
 		return
@@ -618,9 +636,15 @@ func replayManagedViewportFromLastStatusWith(rebuildScrollback bool) bool {
 }
 
 func redrawPendingFooterPromptFromState() bool {
-	if !interactiveTerminalUIEnabled() {
+	if !interactiveTerminalUIEnabled() || terminalPickerActive() {
 		return false
 	}
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	return redrawPendingFooterPromptFromStateUnlocked()
+}
+
+func redrawPendingFooterPromptFromStateUnlocked() bool {
 	line, _ := peekPendingCommandInput()
 	lastTerminalFooterStatus.Lock()
 	status, ok := lastTerminalFooterStatus.state, lastTerminalFooterStatus.set
@@ -628,7 +652,7 @@ func redrawPendingFooterPromptFromState() bool {
 	if !ok {
 		return placeTerminalFooterPromptCursor("ba> ", len([]rune(line)))
 	}
-	return drawTerminalFooterPrompt("ba> ", line, len([]rune(line)), status)
+	return drawTerminalFooterPromptUnlocked("ba> ", line, len([]rune(line)), status)
 }
 
 func placeTerminalFooterPromptCursor(prompt string, cursor int) bool {
@@ -657,6 +681,11 @@ func prepareTerminalScrollbackOutput() bool {
 }
 
 func drawTerminalFooterWorkingLine(text string, status statusBarState) bool {
+	if terminalPickerActive() {
+		return false
+	}
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
 	metrics, ok := activateTerminalFooter(status)
 	if !ok {
 		return false
@@ -670,6 +699,11 @@ func drawTerminalFooterWorkingLine(text string, status statusBarState) bool {
 }
 
 func clearTerminalFooterWorkingLine(status statusBarState) bool {
+	if terminalPickerActive() {
+		return false
+	}
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
 	metrics, ok := activateTerminalFooter(status)
 	if !ok {
 		return false

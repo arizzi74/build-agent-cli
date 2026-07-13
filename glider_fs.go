@@ -13,7 +13,7 @@ import (
 )
 
 func (c *Client) withGliderFSTimeout(fn func(context.Context) (map[string]interface{}, string)) (map[string]interface{}, string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(c.activeTurnContext(), 90*time.Second)
 	defer cancel()
 	return fn(ctx)
 }
@@ -208,18 +208,8 @@ func (c *Client) answerGliderLocalSearch(ctx context.Context, payload map[string
 	return map[string]interface{}{"files": files, "ideContext": c.currentIDEContext()}, "complete"
 }
 
-func (c *Client) answerGliderBuild(payload map[string]interface{}) (map[string]interface{}, string) {
-	path := payloadPath(payload)
-	if path == "" {
-		path = "."
-	}
-	return map[string]interface{}{
-		"message":    "Build request acknowledged; files are synced to the Glider workspace. Go CLI does not run the browser-side SDK build/install pipeline yet.",
-		"path":       path,
-		"errors":     []interface{}{},
-		"warnings":   []interface{}{"Browser-side SDK build/install is not implemented in Go CLI yet."},
-		"ideContext": c.currentIDEContext(),
-	}, "complete"
+func (c *Client) answerGliderBuild(ctx context.Context, action string, payload map[string]interface{}) (map[string]interface{}, string) {
+	return c.answerBuildInstallParity(ctx, action, payload)
 }
 
 func (c *Client) activeAppRootURI() string {

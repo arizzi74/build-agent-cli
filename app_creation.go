@@ -120,6 +120,9 @@ func (c *Client) createServiceNowAppLikeWebUI(ctx context.Context, req appCreati
 	if err := c.patchConversationApplication(ctx, app); err != nil {
 		return createdServiceNowApp{}, err
 	}
+	if err := c.PatchAppCreatedCheckpoint(ctx, c.lastUserMessageSysID, c.lastUserMessageContent, app.ScopeID, app.Name); err != nil && c.debug {
+		c.debugf("warning: could not annotate APP_CREATED checkpoint: %v\n", err)
+	}
 	c.absorbCreatedApp(app)
 	return app, nil
 }

@@ -30,15 +30,33 @@ func TestNirvanaCapabilitiesMatchStreamingWebClient(t *testing.T) {
 	if keywordSearch == nil || keywordSearch["preview_available"] != true {
 		t.Fatalf("keyword_search capability = %#v, want preview_available=true", caps["keyword_search"])
 	}
-	for _, key := range []string{"client_ide", "elicitation", "fluent_docs", "glob_and_grep", "server_tools", "sub_agents"} {
+	for _, key := range []string{"client_ide", "elicitation", "fluent_docs", "glob_and_grep", "semantic_search", "server_tools", "sub_agents"} {
 		if _, ok := caps[key]; !ok {
 			t.Fatalf("missing Nirvana web-client capability %q in %#v", key, caps)
+		}
+	}
+	wantKeys := []string{"client_ide", "elicitation", "fluent_docs", "glob_and_grep", "interview_choice_picker", "keyword_search", "plan_approval", "product_availability", "semantic_search", "server_tools", "streaming", "sub_agents", "tools"}
+	if len(caps) != len(wantKeys) {
+		t.Fatalf("Nirvana capability count = %d, want %d: %#v", len(caps), len(wantKeys), caps)
+	}
+	for _, key := range wantKeys {
+		if _, ok := caps[key]; !ok {
+			t.Fatalf("missing HAR-observed capability %q", key)
 		}
 	}
 
 	defaultCaps := (&Client{}).clientCapabilities()
 	if _, ok := defaultCaps["tools"]; ok {
 		t.Fatalf("default web gateway capabilities should not advertise tools.execute: %#v", defaultCaps["tools"])
+	}
+}
+
+func TestNirvanaCapabilitiesExcludeUnobservedExtensionOnlyKeys(t *testing.T) {
+	caps := (&Client{opts: Options{Nirvana: true}}).clientCapabilities()
+	for _, key := range []string{"change_log", "working_set", "app_picker", "atf_with_app", "memfs"} {
+		if _, ok := caps[key]; ok {
+			t.Fatalf("unexpected non-HAR Nirvana capability %q in %#v", key, caps)
+		}
 	}
 }
 
@@ -70,6 +88,64 @@ func TestElicitationResponseRequestsWorkingStatusDuringActiveTurn(t *testing.T) 
 	c.processing = false
 	if c.ensureTurnStatusVisible() {
 		t.Fatalf("Building redraw must not be requested after the turn is no longer processing")
+	}
+}
+
+func TestRecordActiveStreamTranscriptDeltaIsIdempotent(t *testing.T) {
+	terminalTranscript.Lock()
+	previousEntries := terminalTranscript.entries
+	previousActive := terminalTranscript.activeAssistant
+	terminalTranscript.entries = nil
+	terminalTranscript.activeAssistant = ""
+	terminalTranscript.Unlock()
+	defer func() {
+		terminalTranscript.Lock()
+		terminalTranscript.entries = previousEntries
+		terminalTranscript.activeAssistant = previousActive
+		terminalTranscript.Unlock()
+	}()
+
+	c := &Client{webStreamText: "first"}
+	c.recordActiveStreamTranscriptDelta()
+	c.recordActiveStreamTranscriptDelta()
+	c.webStreamText = "first second"
+	c.recordActiveStreamTranscriptDelta()
+
+	entries := terminalTranscriptSnapshot()
+	if len(entries) != 2 || entries[0].Text != "first" || entries[1].Text != "second" {
+		t.Fatalf("unexpected stream transcript entries: %#v", entries)
+	}
+}
+
+func TestCancelActiveTurnReleasesProcessingButKeepsCancellationLatched(t *testing.T) {
+	c := &Client{
+		conversationID:     "conversation-1",
+		processing:         true,
+		pendingUserContent: "cancel me",
+		turnDone:           make(chan error, 1),
+	}
+	turnCtx := c.beginActiveTurn(context.Background())
+	if !c.cancelActiveTurn() {
+		t.Fatal("expected active turn cancellation")
+	}
+	if c.processing {
+		t.Fatal("processing remained true after cancellation")
+	}
+	if c.pendingUserContent != "" {
+		t.Fatalf("pendingUserContent = %q, want empty", c.pendingUserContent)
+	}
+	if !c.activeTurnCancelled() || turnCtx.Err() == nil {
+		t.Fatal("cancelled turn was not kept latched")
+	}
+}
+
+func TestCancelledTurnEventsStayIgnoredAfterNextTurnBegins(t *testing.T) {
+	c := &Client{cancelledServerTurnIDs: map[string]struct{}{"turn-old": {}}}
+	if !c.shouldIgnoreCancelledTurnEvent(map[string]interface{}{"type": "stream_delta", "turn_id": "turn-old"}) {
+		t.Fatal("late event from cancelled turn was accepted")
+	}
+	if c.shouldIgnoreCancelledTurnEvent(map[string]interface{}{"type": "stream_delta", "turn_id": "turn-new"}) {
+		t.Fatal("event from new turn was incorrectly ignored")
 	}
 }
 

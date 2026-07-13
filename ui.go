@@ -41,6 +41,17 @@ var terminalAppScreenState = struct {
 	active bool
 }{}
 
+var terminalPickerState = struct {
+	sync.Mutex
+	active bool
+}{}
+
+func terminalPickerActive() bool {
+	terminalPickerState.Lock()
+	defer terminalPickerState.Unlock()
+	return terminalPickerState.active
+}
+
 func promptLine(prompt string) (string, error) {
 	stdinState.Lock()
 	defer stdinState.Unlock()
@@ -648,6 +659,15 @@ func (l *fixedPromptLayout) clear() {
 }
 
 func drawTerminalFooterPrompt(prompt, line string, cursor int, status statusBarState) bool {
+	if terminalPickerActive() {
+		return false
+	}
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	return drawTerminalFooterPromptUnlocked(prompt, line, cursor, status)
+}
+
+func drawTerminalFooterPromptUnlocked(prompt, line string, cursor int, status statusBarState) bool {
 	metrics, ok := activateTerminalFooter(status)
 	if !ok {
 		return false
@@ -997,13 +1017,14 @@ type processingInputCapture struct {
 	stop     chan struct{}
 	done     chan struct{}
 	stopOnce sync.Once
+	cancel   func() bool
 }
 
-func startProcessingInputCapture(prompt string, status *statusBarState) *processingInputCapture {
+func startProcessingInputCapture(prompt string, status *statusBarState, cancel func() bool) *processingInputCapture {
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) || status == nil {
 		return nil
 	}
-	capture := &processingInputCapture{stop: make(chan struct{}), done: make(chan struct{})}
+	capture := &processingInputCapture{stop: make(chan struct{}), done: make(chan struct{}), cancel: cancel}
 	setProcessingInputCapture(capture)
 	go capture.run(prompt, *status)
 	return capture
@@ -1032,6 +1053,7 @@ func (c *processingInputCapture) run(prompt string, status statusBarState) {
 	defer func() { _ = syscall.SetNonblock(fd, false) }()
 
 	line, submitted := peekPendingCommandInput()
+	var escapeArmedUntil time.Time
 	buf := make([]byte, 32)
 	draw := func() {
 		drawTerminalFooterPrompt(prompt, line, len([]rune(line)), status)
@@ -1050,6 +1072,17 @@ func (c *processingInputCapture) run(prompt string, status statusBarState) {
 			changed := false
 			for _, b := range buf[:n] {
 				switch b {
+				case 27:
+					now := time.Now()
+					if !escapeArmedUntil.IsZero() && now.Before(escapeArmedUntil) {
+						escapeArmedUntil = time.Time{}
+						if c.cancel != nil {
+							c.cancel()
+						}
+					} else {
+						escapeArmedUntil = now.Add(2 * time.Second)
+						showTerminalFooterTempMessageWithStyle(status, "Press Esc again within 2 seconds to cancel action", 2*time.Second, ansiYellow+ansiBold)
+					}
 				case '\r', '\n':
 					submitted = true
 					changed = true
@@ -1060,9 +1093,10 @@ func (c *processingInputCapture) run(prompt string, status statusBarState) {
 						changed = true
 					}
 				case 3:
-					line = ""
-					submitted = false
-					changed = true
+					escapeArmedUntil = time.Time{}
+					if c.cancel != nil {
+						c.cancel()
+					}
 				default:
 					if b >= 32 && !submitted {
 						line += string(rune(b))
@@ -1654,6 +1688,11 @@ func clearTerminalAppScrollback() {
 }
 
 func enterAlternatePickerScreen() {
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	terminalPickerState.Lock()
+	terminalPickerState.active = true
+	terminalPickerState.Unlock()
 	// Conversation selection is an overlay-style UI. Outside the REPL app screen,
 	// use the terminal alternate screen so closing/canceling restores the previous
 	// scrollback. Inside the app alternate screen, do not nest 1049 screens;
@@ -1666,13 +1705,20 @@ func enterAlternatePickerScreen() {
 }
 
 func leaveAlternatePickerScreen() {
+	terminalPickerState.Lock()
+	terminalPickerState.active = false
+	terminalPickerState.Unlock()
 	if terminalAppScreenActive() {
 		if !replayManagedViewportFromLastStatus() {
+			terminalRenderMu.Lock()
 			fmt.Fprint(os.Stderr, "\x1b[r\x1b[H\x1b[2J")
+			terminalRenderMu.Unlock()
 		}
 		return
 	}
+	terminalRenderMu.Lock()
 	fmt.Fprint(os.Stderr, "\x1b[?1049l")
+	terminalRenderMu.Unlock()
 }
 
 func readPendingEscapeSequence() []byte {

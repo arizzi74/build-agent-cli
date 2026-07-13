@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -176,10 +177,15 @@ func main() {
 			}
 		}
 		client.printLiveUserTurn(line)
-		capture := startProcessingInputCapture("ba> ", &status)
+		capture := startProcessingInputCapture("ba> ", &status, client.cancelActiveTurn)
 		err = runPrompt(ctx, client, line, opts.TurnTimeout)
 		capture.Stop()
-		if err != nil {
+		if errors.Is(err, context.Canceled) {
+			clearTerminalFooterTempMessage()
+			if !terminalRecordSystemTextAndAppend("Action", "Cancelled", status) {
+				fmt.Fprintln(os.Stderr, "Action cancelled")
+			}
+		} else if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		}
 	}
@@ -284,12 +290,14 @@ func parseFlags() Options {
 }
 
 func runPrompt(ctx context.Context, client *Client, prompt string, timeout time.Duration) error {
-	if err := client.SendMessage(ctx, prompt); err != nil {
+	turnCtx := client.beginActiveTurn(ctx)
+	defer client.endActiveTurn()
+	if err := client.SendMessage(turnCtx, prompt); err != nil {
 		return err
 	}
-	turnCtx, cancel := context.WithTimeout(ctx, timeout)
+	waitCtx, cancel := context.WithTimeout(turnCtx, timeout)
 	defer cancel()
-	return client.WaitTurn(turnCtx)
+	return client.WaitTurn(waitCtx)
 }
 
 func fatal(err error) {

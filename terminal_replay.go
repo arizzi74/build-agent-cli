@@ -198,6 +198,8 @@ func terminalAppendRowsToScrollback(rows []string, status statusBarState) bool {
 	if len(rows) == 0 {
 		return true
 	}
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
 	metrics, ok := terminalFooterMetricsForTTY()
 	if !ok {
 		return false
@@ -212,7 +214,7 @@ func terminalAppendRowsToScrollback(rows []string, status statusBarState) bool {
 	}
 	lastTerminalFooterMetrics.set = false
 	if _, ok := activateTerminalFooter(status); ok {
-		redrawPendingFooterPromptFromState()
+		redrawPendingFooterPromptFromStateUnlocked()
 	}
 	return true
 }

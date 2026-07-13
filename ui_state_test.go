@@ -40,3 +40,25 @@ func TestSuspendProcessingInputCaptureStopsRegisteredCapture(t *testing.T) {
 		t.Fatal("suspendProcessingInputCapture returned true after capture was cleared")
 	}
 }
+
+func TestTerminalPickerStateTracksOverlayLifetime(t *testing.T) {
+	terminalPickerState.Lock()
+	previous := terminalPickerState.active
+	terminalPickerState.active = false
+	terminalPickerState.Unlock()
+	defer func() {
+		terminalPickerState.Lock()
+		terminalPickerState.active = previous
+		terminalPickerState.Unlock()
+	}()
+
+	if terminalPickerActive() {
+		t.Fatal("picker should start inactive")
+	}
+	terminalPickerState.Lock()
+	terminalPickerState.active = true
+	terminalPickerState.Unlock()
+	if !terminalPickerActive() {
+		t.Fatal("picker should report active while overlay owns the terminal")
+	}
+}

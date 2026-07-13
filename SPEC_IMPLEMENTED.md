@@ -46,11 +46,11 @@ sha256sum build-agent-go-cli
 
 `ldd` is expected to report `not a dynamic executable`. Per the active build policy, do not produce `build-agent-go-cli-linux-arm64` or dynamic/non-stripped release binaries unless a temporary debugging exception is explicitly requested.
 
-Latest known rebuilt binary after `fluent_topics_list` parity work:
+Latest known rebuilt binary after `fluent_topics_list` local-doc fallback and `now-sdk pack` build artifact fix:
 
 ```text
 build-agent-go-cli
-sha256 4889d90fafb9c622fdd51d109608d35f85968f998e206bcde516bae59792b478
+sha256 431c00004d9f6b5d9a47a288998e8f08491d9dd991179a879f098f9d1c3c7a7d
 ```
 
 ## 3. Command-line flags
@@ -174,6 +174,8 @@ Implemented connect/message parity:
 - Uses ServiceNow user sys_id from provider config when available.
 - Keeps `instanceUrl` in HAR-compatible trailing-slash form.
 - Uses compact 32-hex Glider conversation ids, not hyphenated UUIDs, in Nirvana mode.
+- Advertises the exact capability set observed in the current Web UI HAR captures: `client_ide`, `elicitation`, `fluent_docs`, `glob_and_grep`, `interview_choice_picker`, `keyword_search.preview_available`, `plan_approval`, `product_availability`, `semantic_search`, `server_tools`, `streaming.receive`, `sub_agents`, and `tools.execute`. Extension-only keys not observed in the current Web UI connect frame are not advertised in Nirvana mode.
+- Sends application-level Nirvana `{ "type": "ping" }` keepalives every 25 seconds after the `connected` frame, matching the browser client's observed JSON ping/pong behavior.
 
 Implemented message payload fields include:
 
@@ -237,7 +239,9 @@ Debug mode behavior:
 Turn lifecycle:
 
 - `SendMessage` starts a turn and writes the message payload.
-- `WaitTurn` waits for `turn_end`, AMB completion, error, timeout, or connection close.
+- `WaitTurn` waits for `turn_end`, AMB completion, error, timeout, cancellation, or connection close.
+- During an active turn, the first Esc arms cancellation for two seconds and the second Esc sends the Web UI-compatible `{ "type": "stop", "conversation_id": "..." }` frame; Ctrl-C performs the same graceful cancellation immediately.
+- Cancellation is correlated to the server `turn_id`, so late events from a cancelled turn stay suppressed even after a new turn starts, without suppressing the new turn's events.
 - `--turn-timeout` controls max wait per turn.
 
 Normal-mode noise removed:
@@ -619,7 +623,28 @@ Implemented client-side elicitation handling includes:
   - `fs_stat`
   - `fs_glob`
   - `local_search`
-- `build`, `install`, `install_dependencies`, and `build_install` acknowledgements for backend/server-mediated build/install paths; the Go CLI does not yet run the browser-side SDK build/install pipeline locally.
+- `build`, `install`, `install_dependencies`, and `build_install` Web UI-parity client actions for the active Glider app.
+
+Implemented local Fluent build/install parity:
+
+- Resolves app context from the active app/app id, reads `now.config.json` and `package.json` through Glider sync, and uses the active app sys_id as the `now-file:/<app_sys_id>` project root.
+- Syncs the Glider app workspace to a temporary local project while skipping heavyweight/generated directories such as `node_modules`, `dist`, `target`, and `.git`.
+- Validates dependencies from `dependencies`, `devDependencies`, and `optionalDependencies`, ignoring `eslint` like the Web extension.
+- Installs missing dependencies locally with `npm install --no-audit --no-fund`; missing `node` or `npm` is reported visibly on the terminal and through structured error codes.
+- Runs the app-local `node_modules/.bin/now-sdk build` command; missing `now-sdk` or build failures return terminal-visible structured errors.
+- Persists generated Fluent source changes back to Glider, especially `src/fluent/generated/**`, using `/api/sn_glider/v2/sync/changes/apply` with non-null array parts.
+- Runs app-local `node_modules/.bin/now-sdk pack` after build so the installable ZIP is actually emitted.
+- Locates the package ZIP under configured `packOutputDir`, `target`, or `dist` and keeps the successful build temp project for a same-session `install` call.
+- Enforces an install precondition: `install` requires a successful build for the same active app in the current CLI session.
+- Checks `.now/.app-data.json` before build and, when metadata sync is needed, silently refreshes the selected profile OAuth token and runs the project-local ServiceNow SDK incremental transform with the exact `lastSync` timestamp.
+- Atomically marks metadata sync complete only after transform success, persists transform-created/updated/removed source files plus `.app-data.json` to Glider, verifies optimistic checksums and post-write state, then rebuilds and packs from the synchronized project.
+- Invalidates an older same-session package when a new build begins, so a failed sync/build cannot leave stale output installable.
+- Performs install prechecks against `sys_upgrade_history` and `sys_scope`.
+- Uploads the package ZIP to `sn_appclient_upload_processor.do` with `sysparm_track_fluent_install=true`, `sysparm_async_fluent_install=false`, scope id/name/version query params, multipart `upload_type=file`, `load_demo=true`, `sysparm_ck`, and `attachFile=blob`.
+- Requires a browser-session CSRF token (`sysparm_ck` / `X-UserToken`) for upload; if unavailable, returns `CSRF_TOKEN_NOT_FOUND` and tells the user to authenticate with cookie/form web-session auth.
+- Polls `/api/sn_cicd/progress/<executionTracker>` until success/failure/timeout, with a `sys_upgrade_history` fallback when the upload response does not include an execution tracker.
+- Queries Build Agent `runQuery` endpoints for `sys_ui_page` and `sys_db_object` artifacts and formats installed table links as `<instance>/<table>_list.do?sysparm_clear_stack=true`.
+- Prints concise terminal progress lines for project sync, dependency install, SDK build, generated-file sync, upload, progress polling, and artifact discovery.
 
 Glider VFS behavior:
 
@@ -640,9 +665,10 @@ Implemented `run_diagnostics` behavior:
 Implemented `fluent_topics_list` parity path:
 
 - Resolves `payload.appId` or the active app id to `now-file:/<app_sys_id>`.
-- Checks for a Fluent project through `now.config.json`.
+- Checks for a Fluent project through `now.config.json`; when exact-file Glider state misses the file, falls back to root app state and then direct `/sync/files` content lookup.
 - Scans Glider state under `node_modules/@servicenow/sdk/docs`.
-- Reads Markdown docs through Glider sync files.
+- If SDK docs are not present in Glider state, falls back to the last same-app local build/dependency temp project or syncs the Glider project to temp, installs `@servicenow/sdk` from `package.json`, and scans local SDK docs.
+- Reads Markdown docs through Glider sync files or the local SDK package.
 - Extracts a topic name from each Markdown basename and a summary from the first paragraph after the first heading.
 - Returns JSON `[{"name":"...","summary":"..."}]` in `content` for `fluent-overview` and `*-guide` topics.
 - Returns Web-extension-style errors such as `NO_FLUENT_PROJECT` and `SDK_VERSION_TOO_OLD` for missing project/old SDK docs cases.
@@ -686,9 +712,12 @@ Implemented but intentionally limited:
 
 - Glider filesystem actions operate on the remote ServiceNow app workspace (`now-file:/<app_sys_id>`), not arbitrary local host paths.
 - `--advertise-local-tools` remains experimental and should stay off for normal backend/MCP use.
-- `build`/`install` client elicitations are currently acknowledged for the backend/server-mediated flow; the Go CLI does not yet run the browser-side SDK build/install pipeline locally.
+- Local `build`/`install` parity shells out to local Node/npm and the app-local Fluent SDK. It does not emulate the Web IDE package-manager internals or sync full `node_modules` into Glider.
+- Upload/install uses the browser-style upload processor and therefore needs a valid web-session CSRF token (`sysparm_ck` / `X-UserToken`); OAuth-only upload support is not assumed.
+- `install` is same-session after a successful `build`; the package ZIP path is not persisted across CLI restarts.
+- Metadata sync requires a refreshable OAuth profile because the Fluent incremental download API is OAuth-backed. If no valid/refreshable OAuth credential is available, build returns `METADATA_SYNC_AUTH_REQUIRED` without clearing the marker or installing stale metadata.
 - `run_diagnostics` depends on a locally available TypeScript compiler in the synced project or on `PATH`; missing `tsc` is reported visibly as `TSC_NOT_FOUND`.
-- `fluent_topics_list` depends on SDK docs being present in the Glider project tree. A current observed bug can falsely return `NO_FLUENT_PROJECT` when exact-file Glider state lookup misses `now.config.json` even though root state shows it; the fix direction is to verify `now.config.json` from root app state or direct file fetch.
+- `fluent_topics_list` first prefers SDK docs in the Glider project tree, then falls back to local same-session build/dependency temp docs or a temporary project dependency install. Missing docs in an installed SDK still reports `SDK_VERSION_TOO_OLD`, but missing Glider `node_modules` no longer falsely reports no Fluent project.
 - Legacy `/send` streaming is not faked when the backend returns blocking JSON.
 - WDF tool schemas are not exposed client-side by `/mcp list`; Forge loads pass-through tools after the Nirvana handshake, matching the web client behavior.
 - Code Assist websocket mode is diagnostic/experimental, not the normal Build Agent path.
@@ -724,6 +753,8 @@ Regression and smoke coverage implemented across the project includes:
 - two-line tool-result terminal rendering
 - `Building...` / `Connecting...` animations
 - `fluent_topics_list` catalog scanning/error cases
+- local build/install helper behavior: dependency merging with `eslint` ignored, scoped node dependency detection, generated-dir resolution, package ZIP discovery, app-local `now-sdk pack`, upload/progress/upgrade-history parsing, artifact-link formatting, and path safety
+- metadata-sync behavior: absent/completed markers, exact millisecond-to-UTC `lastPull`, silent OAuth refresh, secure child input without argv leakage, transform failure preserving app-data, unknown-field-preserving atomic marker updates, create/update/remove Glider diffs, deletion timestamps, optimistic conflict rejection, post-write verification, and no-op sync
 
 Recent manual/PTYS smokes confirmed:
 
