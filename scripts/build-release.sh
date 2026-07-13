@@ -52,4 +52,7 @@ for target, name in files.items():
 PY
 
 printf 'Release %s built in %s/\n' "$VERSION" "$DIST"
-sha256sum "$DIST"/bacli-* "$DIST"/install.sh "$DIST"/install.ps1 "$DIST"/version.json > "$DIST/SHA256SUMS"
+(
+  cd "$DIST"
+  sha256sum bacli-* install.sh install.ps1 version.json > SHA256SUMS
+)
