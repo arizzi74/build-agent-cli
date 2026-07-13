@@ -149,6 +149,18 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		Handler: handleStatusCommand,
 	},
 	{
+		Canonical: "/turn", Description: "show active or last redacted semantic turn (/turn --json for schema output)", Category: "General", Order: 25,
+		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/turn", "/turn --json"},
+		Handler: handleTurnCommand,
+	},
+	{
+		Canonical: "/debug", Description: "control local redacted diagnostics; inspect semantic journal", Category: "General", Order: 27,
+		Arguments: SlashCommandRequiredSubcommand, Behavior: SlashCommandTemplate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/debug status", "/debug tail", "/debug event "},
+		Handler: handleDebugCommand,
+	},
+	{
 		Canonical: "/mcp", Description: "show MCP servers advertised to Nirvana/Forge", Category: "Tools", Order: 30,
 		Arguments: SlashCommandRequiredSubcommand, Behavior: SlashCommandTemplate, Runtime: SlashCommandRuntimeNirvana,
 		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/mcp list"},

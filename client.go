@@ -117,7 +117,8 @@ type Client struct {
 	closed    chan struct{}
 
 	processing bool
-	debug      bool
+	debug      bool // pre-existing startup trace option
+	debugLocal bool // explicit /debug local state; never persisted or used for protocol logging
 }
 
 type WebAgentConfig struct {
