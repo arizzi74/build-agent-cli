@@ -229,6 +229,14 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		},
 	},
 	{
+		Canonical: "/sync", Description: "safely synchronize persistent local app source with ServiceNow", Category: "Context", Order: 65,
+		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, Suggestions: []string{"/sync", "/sync status", "/sync pull", "/sync push"},
+		Handler: func(ctx context.Context, c *Client, args []string) (bool, error) {
+			return true, handleSyncCommand(ctx, c, args)
+		},
+	},
+	{
 		Canonical: "/exit", Aliases: []string{"/quit"}, Description: "quit", Category: "General", Order: 70,
 		Arguments: SlashCommandNoArguments, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeAny,
 		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/exit", "/quit"},

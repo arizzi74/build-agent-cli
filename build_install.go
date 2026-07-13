@@ -32,6 +32,7 @@ type gliderBuildState struct {
 	Version        string
 	TempDir        string
 	PackageZip     string
+	Persistent     bool
 	BuildSucceeded bool
 	BuiltAt        time.Time
 }
@@ -140,6 +141,7 @@ func (c *Client) answerInstallDependenciesParity(ctx context.Context, payload ma
 		AppName:        ctxInfo.AppName,
 		Version:        ctxInfo.Version,
 		TempDir:        project.Dir,
+		Persistent:     true,
 		BuildSucceeded: false,
 		BuiltAt:        time.Now(),
 	})
@@ -211,6 +213,7 @@ func (c *Client) answerBuildParity(ctx context.Context, payload map[string]inter
 		Version:        ctxInfo.Version,
 		TempDir:        project.Dir,
 		PackageZip:     zipPath,
+		Persistent:     true,
 		BuildSucceeded: true,
 		BuiltAt:        time.Now(),
 	})
@@ -305,8 +308,8 @@ func (c *Client) prepareBuildProject(ctx context.Context, payload map[string]int
 	if err != nil {
 		return buildInstallContext{}, syncedBuildProject{}, func() {}, err
 	}
-	c.buildInstallProgress("build: syncing Glider project for %s", ctxInfo.displayName())
-	project, cleanup, err := c.syncGliderBuildProjectToTemp(ctx, ctxInfo.RootURI)
+	c.buildInstallProgress("build: synchronizing persistent local project for %s", ctxInfo.displayName())
+	project, cleanup, err := c.syncGliderBuildProjectToPersistent(ctx, ctxInfo.AppID, ctxInfo.RootURI)
 	if err != nil {
 		return buildInstallContext{}, syncedBuildProject{}, func() {}, fmt.Errorf("Error while syncing Glider project for build: %w", err)
 	}
@@ -406,71 +409,36 @@ func firstJSONFileContent(files map[string][]byte, requiredKeys ...string) []byt
 }
 
 func (c *Client) syncGliderBuildProjectToTemp(ctx context.Context, rootURI string) (syncedBuildProject, func(), error) {
-	entries, err := c.fetchGliderState(ctx, rootURI)
-	if err != nil {
-		return syncedBuildProject{}, func() {}, err
-	}
-	tmp, err := os.MkdirTemp("", "ba-glider-build-*")
-	if err != nil {
-		return syncedBuildProject{}, func() {}, err
-	}
-	cleanup := func() { _ = os.RemoveAll(tmp) }
-	project := syncedBuildProject{Dir: tmp, RootURI: rootURI, Entries: map[string]gliderChangeEntry{}, Files: map[string]string{}, Original: map[string][]byte{}}
+	return c.syncGliderBuildProjectToPersistent(ctx, c.activeAppSysID(), rootURI)
+}
 
-	fileEntries := make([]gliderChangeEntry, 0, len(entries))
-	for _, entry := range entries {
-		if !gliderStateEntryIsFile(entry) {
-			continue
-		}
-		rel := gliderRelFromRootURI(rootURI, entry.URI)
+func (c *Client) syncGliderBuildProjectToPersistent(ctx context.Context, appID, rootURI string) (syncedBuildProject, func(), error) {
+	// Kept under the historical wrapper name for compatibility, but projects now
+	// live persistently under the process launch directory. Internal build tools
+	// may run while a turn is processing, so they bypass only the interactive
+	// slash-command availability guard while retaining conflict detection.
+	result, err := c.syncPersistentAppForBuild(ctx, appID, rootURI, persistentSyncAuto)
+	if err != nil {
+		return syncedBuildProject{}, func() {}, err
+	}
+	entries, remoteFiles, err := c.fetchPersistentRemoteFiles(ctx, rootURI)
+	if err != nil {
+		return syncedBuildProject{}, func() {}, err
+	}
+	project := syncedBuildProject{Dir: result.LocalDir, RootURI: rootURI, Entries: map[string]gliderChangeEntry{}, Files: map[string]string{}, Original: map[string][]byte{}}
+	for rel, entry := range entries {
 		if !includeBuildProjectFile(rel) {
 			continue
 		}
-		project.Entries[entry.URI] = entry
-		fileEntries = append(fileEntries, entry)
-	}
-	sort.Slice(fileEntries, func(i, j int) bool { return fileEntries[i].URI < fileEntries[j].URI })
-
-	const batchSize = 60
-	for start := 0; start < len(fileEntries); start += batchSize {
-		end := start + batchSize
-		if end > len(fileEntries) {
-			end = len(fileEntries)
-		}
-		batch := fileEntries[start:end]
-		uris := make([]string, 0, len(batch))
-		for _, entry := range batch {
-			uris = append(uris, entry.URI)
-		}
-		contents, err := c.fetchV2SyncFiles(ctx, uris)
+		localPath, err := safeBuildLocalPath(project.Dir, rel)
 		if err != nil {
-			cleanup()
 			return syncedBuildProject{}, func() {}, err
 		}
-		for _, entry := range batch {
-			rel := gliderRelFromRootURI(rootURI, entry.URI)
-			content, ok := gliderFetchedContentForEntry(contents, entry)
-			if !ok {
-				continue
-			}
-			localPath, err := safeBuildLocalPath(tmp, rel)
-			if err != nil {
-				cleanup()
-				return syncedBuildProject{}, func() {}, err
-			}
-			if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
-				cleanup()
-				return syncedBuildProject{}, func() {}, err
-			}
-			if err := os.WriteFile(localPath, content, 0o644); err != nil {
-				cleanup()
-				return syncedBuildProject{}, func() {}, err
-			}
-			project.Files[rel] = localPath
-			project.Original[rel] = append([]byte(nil), content...)
-		}
+		project.Entries[entry.URI] = entry
+		project.Files[rel] = localPath
+		project.Original[rel] = append([]byte(nil), remoteFiles[rel]...)
 	}
-	return project, cleanup, nil
+	return project, func() {}, nil
 }
 
 func includeBuildProjectFile(rel string) bool {
@@ -734,9 +702,15 @@ func (c *Client) persistGeneratedBuildFiles(ctx context.Context, project syncedB
 				break
 			}
 		}
-		if allMatch {
-			return []interface{}{"Glider sync returned an error after persisting generated files; verified remote content matches."}, nil
+		if !allMatch {
+			return nil, err
 		}
+		if manifestErr := refreshPersistentSyncManifest(project.Dir, ctxInfo.AppID, project.RootURI); manifestErr != nil {
+			return nil, manifestErr
+		}
+		return []interface{}{"Glider sync returned an error after persisting generated files; verified remote content matches."}, nil
+	}
+	if err := refreshPersistentSyncManifest(project.Dir, ctxInfo.AppID, project.RootURI); err != nil {
 		return nil, err
 	}
 	return nil, nil
@@ -1187,7 +1161,7 @@ func uniqueStrings(in []string) []string {
 }
 
 func (c *Client) replaceLastGliderBuild(next *gliderBuildState) {
-	if c.lastGliderBuild != nil && c.lastGliderBuild.TempDir != "" && (next == nil || c.lastGliderBuild.TempDir != next.TempDir) {
+	if c.lastGliderBuild != nil && !c.lastGliderBuild.Persistent && c.lastGliderBuild.TempDir != "" && (next == nil || c.lastGliderBuild.TempDir != next.TempDir) {
 		_ = os.RemoveAll(c.lastGliderBuild.TempDir)
 	}
 	c.lastGliderBuild = next
