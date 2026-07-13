@@ -105,6 +105,62 @@ func newSyncTestServer(t *testing.T, remote *syncTestRemote) *httptest.Server {
 	}))
 }
 
+func TestFetchPersistentRemoteFilesRetriesOmittedBatchFileIndividually(t *testing.T) {
+	files := map[string][]byte{"src/a.ts": []byte("a"), "src/client/app.jsx": []byte("app")}
+	var singleRetry bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/sn_glider/v2/sync/state":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"files": []map[string]interface{}{
+				{"uri": "now-file:/app/src/a.ts", "checksum": sha1Hex(files["src/a.ts"]), "type": "file", "size": 1},
+				{"uri": "now-file:/app/src/client/app.jsx", "checksum": sha1Hex(files["src/client/app.jsx"]), "type": "file", "size": 3},
+			}})
+		case "/api/sn_glider/v2/sync/files":
+			mr, err := r.MultipartReader()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var uris []string
+			for {
+				part, err := mr.NextPart()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				raw, _ := io.ReadAll(part)
+				if part.FormName() == "uris" {
+					_ = json.Unmarshal(raw, &uris)
+				}
+			}
+			out := []map[string]string{}
+			for _, uri := range uris {
+				rel := strings.TrimPrefix(uri, "now-file:/app/")
+				if len(uris) > 1 && rel == "src/client/app.jsx" {
+					continue
+				}
+				if len(uris) == 1 && rel == "src/client/app.jsx" {
+					singleRetry = true
+				}
+				out = append(out, map[string]string{"checksum": sha1Hex(files[rel]), "content": string(files[rel])})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"files": out})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	c := &Client{cfg: CLIConfig{InstanceURL: server.URL}, httpClient: server.Client()}
+	_, contents, err := c.fetchPersistentRemoteFiles(context.Background(), "now-file:/app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !singleRetry || string(contents["src/client/app.jsx"]) != "app" {
+		t.Fatalf("singleRetry=%v contents=%q", singleRetry, contents["src/client/app.jsx"])
+	}
+}
+
 func testSyncClient(server *httptest.Server) *Client {
 	return &Client{cfg: CLIConfig{InstanceURL: server.URL}, httpClient: server.Client(), workspaceName: "My Workspace", currentApp: &AppScope{ScopeID: "app", AppSysID: "app"}}
 }

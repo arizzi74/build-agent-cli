@@ -291,7 +291,22 @@ func (c *Client) fetchPersistentRemoteFiles(ctx context.Context, rootURI string)
 		}
 		for _, uri := range uris[start:end] {
 			rel := strings.TrimPrefix(uri, prefix)
-			content, ok := gliderFetchedContentForEntry(fetched, remoteEntries[rel])
+			entry := remoteEntries[rel]
+			content, ok := gliderFetchedContentForEntry(fetched, entry)
+			if !ok {
+				// Some Glider versions omit one file from a multi-URI multipart
+				// response while returning it correctly when requested alone.
+				one, fetchErr := c.fetchV2SyncFiles(ctx, []string{uri})
+				if fetchErr != nil {
+					return nil, nil, fetchErr
+				}
+				content, ok = gliderFetchedContentForEntry(one, entry)
+				if !ok && len(one) == 1 {
+					for _, only := range one {
+						content, ok = only, true
+					}
+				}
+			}
 			if !ok {
 				return nil, nil, fmt.Errorf("Glider did not return content for %s", rel)
 			}
