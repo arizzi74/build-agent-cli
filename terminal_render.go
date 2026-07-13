@@ -871,8 +871,77 @@ func animatedStatusText(label string, frame int) string {
 	return out.String()
 }
 
+var connectingLogoRows = []string{
+	"            ▄████▄            ",
+	"        ▄████████████▄        ",
+	"    ▄██████▀      ▀██████▄    ",
+	"▄████████▀          ▀████████▄",
+	"█████████            █████████",
+	"▀████████▄          ▄████████▀",
+	"    ▀██████▄      ▄██████▀    ",
+	"        ▀████████████▀        ",
+	"            ▀████▀            ",
+}
+
+func animatedConnectingLogo(frame int) string {
+	colors := []int{28, 34, 40, 46, 82, 118, 154, 190}
+	var out strings.Builder
+	for rowIndex, row := range connectingLogoRows {
+		for columnIndex, r := range []rune(row) {
+			if r == ' ' {
+				out.WriteRune(r)
+				continue
+			}
+			wave := (frame + columnIndex + rowIndex*2) % (len(colors)*2 - 2)
+			if wave >= len(colors) {
+				wave = len(colors)*2 - 2 - wave
+			}
+			fmt.Fprintf(&out, "\x1b[1;38;5;%dm%c%s", colors[wave], r, ansiReset)
+		}
+		if rowIndex < len(connectingLogoRows)-1 {
+			out.WriteByte('\n')
+		}
+	}
+	return out.String()
+}
+
+func connectingScreenFrame(frame int) string {
+	return animatedConnectingLogo(frame) + "\n\n" + animatedConnectingStatus(frame)
+}
+
 func startTerminalConnectingStatus() func() {
-	return startTerminalInlineAnimatedStatus("Connecting...")
+	if !terminalStatusANSIEnabled() {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(110 * time.Millisecond)
+		defer ticker.Stop()
+		frame := 0
+		for {
+			terminalRenderMu.Lock()
+			fmt.Fprintf(os.Stderr, "\x1b[H\x1b[2J%s", connectingScreenFrame(frame))
+			terminalRenderMu.Unlock()
+			frame++
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+			terminalRenderMu.Lock()
+			fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
+			terminalRenderMu.Unlock()
+		})
+	}
 }
 
 func startTerminalInlineAnimatedStatus(label string) func() {

@@ -185,6 +185,26 @@ func TestLiveUserPromptPrintsThreeRowPromptBlock(t *testing.T) {
 	}
 }
 
+func TestAnimatedConnectingLogoMatchesReferenceShapeAndGlows(t *testing.T) {
+	first := animatedConnectingLogo(0)
+	later := animatedConnectingLogo(5)
+	plain := stripANSI(first)
+	rows := strings.Split(plain, "\n")
+	if len(rows) != 9 {
+		t.Fatalf("connecting logo rows = %d, want 9: %q", len(rows), plain)
+	}
+	if first == later || !strings.Contains(first, "38;5;") {
+		t.Fatalf("connecting logo should animate with wasabi glow")
+	}
+	if !strings.Contains(rows[3], "▄████████▀") || !strings.Contains(rows[4], "█████████") || !strings.Contains(rows[4], "            ") {
+		t.Fatalf("connecting logo does not preserve the open-center ring silhouette: %q", plain)
+	}
+	frame := stripANSI(connectingScreenFrame(2))
+	if !strings.HasPrefix(frame, rows[0]) || !strings.Contains(frame, "\n\nConnecting...") {
+		t.Fatalf("connecting screen should put the logo above the status: %q", frame)
+	}
+}
+
 func TestAnimatedBuildingAndConnectingStatusBounceAndUseWasabiPalette(t *testing.T) {
 	first := animatedBuildingStatus(0)
 	later := animatedBuildingStatus(5)
