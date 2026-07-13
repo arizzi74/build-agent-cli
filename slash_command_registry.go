@@ -161,7 +161,19 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		Handler: handleSupportBundleCommand,
 	},
 	{
-		Canonical: "/debug", Description: "control local redacted diagnostics; inspect semantic journal", Category: "General", Order: 27,
+		Canonical: "/search", Description: "search offline-safe local metadata and redacted events", Category: "General", Order: 27,
+		Arguments: SlashCommandRequiredSubcommand, Behavior: SlashCommandTemplate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/search tool", "/search --json tool"},
+		Handler: handleSearchCommand,
+	},
+	{
+		Canonical: "/export", Description: "create a local redacted conversation export", Category: "General", Order: 28,
+		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/export", "/export --json"},
+		Handler: handleExportCommand,
+	},
+	{
+		Canonical: "/debug", Description: "control local redacted diagnostics; inspect semantic journal", Category: "General", Order: 29,
 		Arguments: SlashCommandRequiredSubcommand, Behavior: SlashCommandTemplate, Runtime: SlashCommandRuntimeAny,
 		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/debug status", "/debug tail", "/debug event "},
 		Handler: handleDebugCommand,
