@@ -9,10 +9,6 @@ import (
 
 var errWindowsTerminalWouldBlock = errors.New("terminal read would block")
 
-func setTerminalNonblock(fd int, enabled bool) error {
-	return nil
-}
-
 func readTerminalFD(fd int, buffer []byte) (int, error) {
 	file := os.NewFile(uintptr(fd), "terminal-input")
 	if file == nil {

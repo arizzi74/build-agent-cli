@@ -2468,7 +2468,7 @@ func (c *Client) clearTurnStatus() bool {
 		if interactiveTerminalUIEnabled() {
 			clearTerminalFooterWorkingLine(c.statusBarState())
 		} else {
-			fmt.Fprint(os.Stderr, "\r\x1b[2K")
+			fmt.Fprintf(os.Stderr, "\r%s", ansiEraseLine)
 		}
 	}
 	c.statusMu.Unlock()
@@ -2494,7 +2494,7 @@ func (c *Client) animateTurnStatus(stop <-chan struct{}, done chan<- struct{}) {
 			if interactiveTerminalUIEnabled() {
 				drawTerminalFooterWorkingLine(animatedWorkingStatus(frame), c.statusBarState())
 			} else {
-				fmt.Fprintf(os.Stderr, "\r\x1b[2K%s", animatedWorkingStatus(frame))
+				fmt.Fprintf(os.Stderr, "\r%s%s", ansiEraseLine, animatedWorkingStatus(frame))
 			}
 		}
 		c.statusMu.Unlock()

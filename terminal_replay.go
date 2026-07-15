@@ -192,10 +192,12 @@ func terminalReplayManagedViewport(status statusBarState) (terminalFooterMetrics
 	// Rebuild the visible managed viewport from transcript state instead of trying
 	// to preserve stale pixels. This row-in-place path avoids full-screen erases so
 	// routine stream/menu/final redraws do not push repeated frames into terminals
-	// that expose alternate-screen history.
-	fmt.Fprint(os.Stderr, "\x1b[s")
+	// that expose alternate-screen history. Disable delayed autowrap while writing
+	// exact-width transcript rows: otherwise iTerm2 may consume the next cursor
+	// address as a wrap/scroll, which smears a prompt background into later rows.
+	fmt.Fprint(os.Stderr, "\x1b[s\x1b[?7l")
 	for row := 1; row <= metrics.TempRow; row++ {
-		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K", row)
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", row, ansiEraseLine)
 	}
 	for i, row := range rows {
 		if i+1 > metrics.ScrollBottom {
@@ -203,7 +205,7 @@ func terminalReplayManagedViewport(status statusBarState) (terminalFooterMetrics
 		}
 		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", i+1, row)
 	}
-	fmt.Fprint(os.Stderr, "\x1b[u")
+	fmt.Fprint(os.Stderr, "\x1b[?7h\x1b[u")
 	lastTerminalFooterMetrics.set = false
 	metrics, ok = activateTerminalFooter(status)
 	return metrics, ok
@@ -222,11 +224,14 @@ func terminalAppendRowsToScrollback(rows []string, status statusBarState) bool {
 	// opencode-style commit: append only new stable rows to the terminal's real
 	// scrollback, instead of replaying the whole semantic transcript. The fixed
 	// footer owns mutable UI; committed transcript rows flow through the scroll
-	// region naturally.
-	fmt.Fprintf(os.Stderr, "\x1b[1;%dr", metrics.ScrollBottom)
+	// region naturally. Keep DECAWM off for the transaction: a full-width gray
+	// prompt row otherwise leaves iTerm2 in pending-wrap and its CR/LF can scroll
+	// twice, producing repeated/corrupted background bands.
+	fmt.Fprintf(os.Stderr, "\x1b[?7l\x1b[1;%dr", metrics.ScrollBottom)
 	for _, row := range rows {
-		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K%s\r\n", metrics.ScrollBottom, row)
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s\r\n", metrics.ScrollBottom, ansiEraseLine, row)
 	}
+	fmt.Fprint(os.Stderr, "\x1b[?7h")
 	lastTerminalFooterMetrics.set = false
 	if _, ok := activateTerminalFooter(status); ok {
 		redrawPendingFooterPromptFromStateUnlocked()
@@ -235,44 +240,12 @@ func terminalAppendRowsToScrollback(rows []string, status statusBarState) bool {
 }
 
 func terminalReplayManagedViewportWithScrollback(status statusBarState) (terminalFooterMetrics, bool) {
-	metrics, ok := terminalFooterMetricsForTTY()
-	if !ok {
-		return terminalFooterMetrics{}, false
-	}
-	if !terminalAppScreenActive() {
-		return terminalReplayManagedViewport(status)
-	}
-	rows := terminalReplayRows(metrics.Width)
-	footerRows := maxInt(metrics.Height-metrics.ScrollBottom, 0)
-	// Resize can leave the terminal's alternate-screen scrollback out of sync with
-	// the semantic transcript: the current visible top rows may also exist just
-	// above the viewport, so scrolling up shows duplicated content. On resize only,
-	// rebuild alternate-screen history from the transcript: clear the alt-screen
-	// scrollback, print semantic rows once with footer padding, then redraw the
-	// fixed footer. This preserves useful scrollback without retaining stale repaint
-	// frames from previous sizes.
-	fmt.Fprint(os.Stderr, "\x1b[r\x1b[?7l\x1b[H\x1b[2J\x1b[3J")
-	total := len(rows) + footerRows
-	written := 0
-	for _, row := range rows {
-		written++
-		writeReplayScrollbackLine(row, written == total)
-	}
-	for i := 0; i < footerRows; i++ {
-		written++
-		writeReplayScrollbackLine("", written == total)
-	}
-	fmt.Fprint(os.Stderr, "\x1b[?7h")
-	lastTerminalFooterMetrics.set = false
-	metrics, ok = activateTerminalFooter(status)
-	return metrics, ok
-}
-
-func writeReplayScrollbackLine(row string, last bool) {
-	fmt.Fprintf(os.Stderr, "\r%s\x1b[K", row)
-	if !last {
-		fmt.Fprint(os.Stderr, "\r\n")
-	}
+	// Semantic content may already exist when this path is reached (for example
+	// after resize). Do not use ED2/ED3 here: those are intentionally reserved
+	// for blank-screen transitions, before the first transcript row. Replaying
+	// the current viewport row-by-row preserves the transcript and keeps iTerm2
+	// alternate-screen history free of destructive repaint frames.
+	return terminalReplayManagedViewport(status)
 }
 
 func terminalReplayRows(width int) []string {

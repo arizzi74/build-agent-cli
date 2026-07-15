@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,17 +21,21 @@ import (
 var terminalRenderMu sync.Mutex
 
 const (
-	ansiReset   = "\x1b[0m"
-	ansiBold    = "\x1b[1m"
-	ansiDim     = "\x1b[2m"
-	ansiBlue    = "\x1b[34m"
-	ansiRed     = "\x1b[31m"
-	ansiCyan    = "\x1b[36m"
-	ansiGreen   = "\x1b[32m"
-	ansiYellow  = "\x1b[33m"
-	ansiMagenta = "\x1b[35m"
-	ansiGrayFG  = "\x1b[38;5;250m"
-	ansiUserBG  = "\x1b[48;5;236m"
+	ansiReset = "\x1b[0m"
+	// ANSI erase commands inherit the active background color on BCE terminals
+	// such as iTerm2. Non-prompt clears must therefore establish the default
+	// rendition first; prompt bands deliberately use their own final-cell EL.
+	ansiEraseLine = ansiReset + "\x1b[2K"
+	ansiBold      = "\x1b[1m"
+	ansiDim       = "\x1b[2m"
+	ansiBlue      = "\x1b[34m"
+	ansiRed       = "\x1b[31m"
+	ansiCyan      = "\x1b[36m"
+	ansiGreen     = "\x1b[32m"
+	ansiYellow    = "\x1b[33m"
+	ansiMagenta   = "\x1b[35m"
+	ansiGrayFG    = "\x1b[38;5;250m"
+	ansiUserBG    = "\x1b[48;5;236m"
 	// Bright wasabi-ish green for transient status text.
 	ansiWasabiGreen = "\x1b[1;38;5;118m"
 )
@@ -80,7 +85,7 @@ func renderAssistantStreamLive(text string, previousRows int) int {
 	color := terminalANSIEnabled()
 	formatted := formatAssistantResponseTerminal(text, color, width)
 	if previousRows > 0 {
-		fmt.Printf("\x1b[%dA\r\x1b[J", previousRows)
+		fmt.Printf("\x1b[%dA\r%s\x1b[J", previousRows, ansiReset)
 	}
 	fmt.Print(formatted)
 	redrawPendingFooterPromptFromState()
@@ -292,11 +297,29 @@ func formatUserPromptBlock(input string, color bool, width int) string {
 			writeBlankLine(&out)
 		}
 		middle := " › " + strings.TrimRight(line, " \t")
-		writeLine(&out, ansiUserBG+fitPromptBandText("", width)+ansiReset)
-		writeLine(&out, ansiUserBG+ansiGrayFG+fitPromptBandText(middle, width)+ansiReset)
-		writeLine(&out, ansiUserBG+fitPromptBandText("", width)+ansiReset)
+		writeLine(&out, formatPromptBandRow("", "", width))
+		writeLine(&out, formatPromptBandRow(middle, ansiGrayFG, width))
+		writeLine(&out, formatPromptBandRow("", "", width))
 	}
 	return out.String()
+}
+
+// formatPromptBandRow paints the final terminal cell with EL instead of a
+// literal space. Writing exactly terminal-width glyphs leaves terminals in a
+// delayed-autowrap state; iTerm2 can then wrap the next CR/LF or cursor move
+// into the scroll region, duplicating the gray prompt band. EL uses the active
+// background rendition without advancing the cursor, and the reset is emitted
+// on every physical row so the background cannot leak into later transcript
+// rows.
+func formatPromptBandRow(text, foreground string, width int) string {
+	// Reset before setting the band too: replay can follow arbitrary styled
+	// assistant content, and EL inherits the current rendition.
+	prefix := ansiReset + ansiUserBG + foreground
+	if width <= 0 {
+		return prefix + text + ansiReset
+	}
+	contentWidth := maxInt(width-1, 0)
+	return prefix + fitPromptBandText(text, contentWidth) + "\x1b[K" + ansiReset
 }
 
 func formatAssistantResponseTerminal(input string, color bool, width int) string {
@@ -479,7 +502,7 @@ func clearStaleFooterAfterResize(metrics terminalFooterMetrics) {
 	}
 	fmt.Fprint(os.Stderr, "\x1b[s")
 	for row := top; row <= bottom; row++ {
-		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K", row)
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", row, ansiEraseLine)
 	}
 	fmt.Fprint(os.Stderr, "\x1b[u")
 }
@@ -501,7 +524,7 @@ func drawTerminalFooterStatusAt(metrics terminalFooterMetrics, status statusBarS
 
 func drawTerminalFooterStatusLine(metrics terminalFooterMetrics, status statusBarState) {
 	line := formatStatusBar(status, true, metrics.Width)
-	fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K%s", metrics.StatusRow, line)
+	fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", metrics.StatusRow, ansiEraseLine, line)
 }
 
 func drawTerminalFooterTempLine(metrics terminalFooterMetrics, message, code string) {
@@ -511,12 +534,12 @@ func drawTerminalFooterTempLine(metrics terminalFooterMetrics, message, code str
 	} else if code != "" {
 		line = style(line, code, true)
 	}
-	fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K%s", metrics.TempRow, line)
+	fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", metrics.TempRow, ansiEraseLine, line)
 }
 
 func drawTerminalFooterSecondaryLine(metrics terminalFooterMetrics) {
 	if line := terminalFooterSubagentLine(metrics.Width, true); line != "" {
-		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K%s", metrics.TempRow, line)
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", metrics.TempRow, ansiEraseLine, line)
 		return
 	}
 	message, code := currentTerminalFooterTempMessage()
@@ -795,7 +818,7 @@ func prepareTerminalScrollbackOutput() bool {
 	// Position normal stdout output at the bottom of the active scroll region.
 	// This keeps transcript turns above the reserved footer instead of letting
 	// terminal state from the prompt/status rows leak into assistant output.
-	fmt.Fprintf(os.Stderr, "\x1b[1;%dr\x1b[%d;1H\x1b[2K", metrics.ScrollBottom, metrics.ScrollBottom)
+	fmt.Fprintf(os.Stderr, "\x1b[1;%dr\x1b[%d;1H%s", metrics.ScrollBottom, metrics.ScrollBottom, ansiEraseLine)
 	return true
 }
 
@@ -811,9 +834,9 @@ func drawTerminalFooterWorkingLine(text string, status statusBarState) bool {
 		return false
 	}
 	fmt.Fprintf(os.Stderr, "\x1b[s")
-	fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K", metrics.TurnTop)
-	fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K%s", metrics.TurnRow, fitPromptLine(text, metrics.Width))
-	fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K", metrics.TurnBottom)
+	fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", metrics.TurnTop, ansiEraseLine)
+	fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", metrics.TurnRow, ansiEraseLine, fitPromptLine(text, metrics.Width))
+	fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", metrics.TurnBottom, ansiEraseLine)
 	fmt.Fprintf(os.Stderr, "\x1b[u")
 	return true
 }
@@ -830,7 +853,7 @@ func clearTerminalFooterWorkingLine(status statusBarState) bool {
 	}
 	fmt.Fprintf(os.Stderr, "\x1b[s")
 	for row := metrics.TurnTop; row <= metrics.TurnBottom; row++ {
-		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K", row)
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", row, ansiEraseLine)
 	}
 	fmt.Fprintf(os.Stderr, "\x1b[u")
 	return true
@@ -847,7 +870,7 @@ func restoreTerminalFooter() {
 	lastTerminalFooterStatus.set = false
 	lastTerminalFooterStatus.Unlock()
 	for row := metrics.TurnTop; row <= metrics.TempRow; row++ {
-		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K", row)
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", row, ansiEraseLine)
 	}
 	fmt.Fprintf(os.Stderr, "\x1b[%d;1H", metrics.TempRow)
 }
@@ -1078,14 +1101,140 @@ func terminalCRLF(text string) string {
 	return strings.ReplaceAll(text, "\n", "\r\n")
 }
 
+// writeTerminalString completes a terminal transaction even when a custom
+// writer reports a successful partial write. Terminal file descriptors remain
+// blocking; input capture must never change their shared open-file flags.
+func writeTerminalString(writer io.Writer, text string) error {
+	for len(text) > 0 {
+		n, err := io.WriteString(writer, text)
+		if n > 0 {
+			text = text[n:]
+		}
+		if err != nil && err != io.ErrShortWrite {
+			return err
+		}
+		if n == 0 {
+			if err != nil {
+				return err
+			}
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
 func connectingScreenTerminalFrame(details string, frame int) string {
 	return terminalCRLF(connectingScreenFrame(details, frame))
+}
+
+// connectingScreenTerminalFrameForViewport keeps the complete logo visible on
+// short terminal windows. The old fixed frame could exceed the terminal height;
+// writing past the last row scrolls the alternate screen and leaves only part
+// of the logo visible. Details are expendable, so trim them before the logo or
+// connection status.
+func connectingScreenRowsForViewport(details string, frame, width, height int) []string {
+	if height <= 0 {
+		return strings.Split(connectingScreenFrame(details, frame), "\n")
+	}
+	rows := append([]string(nil), strings.Split(animatedConnectingLogo(frame), "\n")...)
+	status := animatedConnectingStatus(frame) + "  " + connectingCancelHint()
+	details = strings.TrimSpace(details)
+	detailRows := []string(nil)
+	if details != "" {
+		for _, line := range strings.Split(details, "\n") {
+			detailRows = append(detailRows, wrapReplayLine(line, maxInt(width, 1))...)
+		}
+	}
+	// Reserve one status row whenever possible and add visual spacing only when
+	// it fits. This produces at most height rows, so no connecting frame scrolls.
+	remaining := height - len(rows) - 1
+	if remaining < 0 {
+		return rows[:maxInt(height, 0)]
+	}
+	if len(detailRows) > remaining {
+		detailRows = detailRows[:remaining]
+	}
+	if len(detailRows) > 0 && len(rows)+len(detailRows)+2 <= height {
+		rows = append(rows, "")
+	}
+	rows = append(rows, detailRows...)
+	if len(detailRows) > 0 && len(rows)+1 < height {
+		rows = append(rows, "")
+	}
+	return append(rows, status)
+}
+
+func connectingScreenTerminalFrameForViewport(details string, frame, width, height int) string {
+	return terminalCRLF(strings.Join(connectingScreenRowsForViewport(details, frame, width, height), "\n"))
+}
+
+// terminalViewportClearSequence clears rows in place without ED2. iTerm2 can
+// save ED2 redraws as separate alternate-screen scrollback frames, which makes
+// an animation appear as a corrupted stack when the user scrolls upward.
+func terminalViewportClearSequence(height int) string {
+	if height <= 0 {
+		return ""
+	}
+	var out strings.Builder
+	for row := 1; row <= height; row++ {
+		fmt.Fprintf(&out, "\x1b[%d;1H%s", row, ansiEraseLine)
+	}
+	return out.String()
+}
+
+// terminalFullScreenClearAndPurgeHistorySequence is reserved for transitions
+// before a semantic transcript exists. iTerm2 may retain alternate-screen
+// content, so ED2 must be immediately followed by ED3 to remove the pre-bacli
+// shell/help screen as well as the visible cells.
+func terminalFullScreenClearAndPurgeHistorySequence() string {
+	return ansiReset + "\x1b[H\x1b[2J\x1b[3J"
+}
+
+// terminalConnectingExitClearSequence resets the connecting-mode terminal
+// state before the REPL creates its first semantic transcript row.
+func terminalConnectingExitClearSequence() string {
+	return "\x1b[?7l\x1b[r" + terminalFullScreenClearAndPurgeHistorySequence() + "\x1b[?7h"
+}
+
+// connectingScreenRepaintSequence updates the connecting screen only by
+// addressing/erasing individual rows. It deliberately contains neither ED2 nor
+// CR/LF, so a terminal that preserves alternate-screen history cannot turn
+// animation frames into scrollback entries.
+func connectingScreenRepaintSequence(details string, frame, width, height int) string {
+	if width <= 0 {
+		width = 100
+	}
+	if height <= 0 {
+		height = 24
+	}
+	rows := connectingScreenRowsForViewport(details, frame, width, height)
+	var out strings.Builder
+	out.WriteString("\x1b[?7l")
+	out.WriteString(terminalViewportClearSequence(height))
+	for index, row := range rows {
+		fmt.Fprintf(&out, "\x1b[%d;1H%s%s%s", index+1, ansiEraseLine, row, ansiReset)
+	}
+	out.WriteString("\x1b[?7h")
+	return out.String()
 }
 
 func startTerminalConnectingStatus(details string) func() {
 	if !terminalStatusANSIEnabled() {
 		return func() {}
 	}
+	render := func(frame int) {
+		width, height, err := term.GetSize(terminalStderrFD())
+		if err != nil || width <= 0 || height <= 0 {
+			width, height = 100, 24
+		}
+		// Complete the whole row-addressed frame if a writer returns a short
+		// write; input polling keeps the underlying PTY output blocking.
+		_ = writeTerminalString(os.Stderr, connectingScreenRepaintSequence(details, frame, width, height))
+	}
+	terminalRenderMu.Lock()
+	render(0) // Paint one complete frame before Connect can finish.
+	terminalRenderMu.Unlock()
+
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	var once sync.Once
@@ -1093,17 +1242,17 @@ func startTerminalConnectingStatus(details string) func() {
 		defer close(done)
 		ticker := time.NewTicker(110 * time.Millisecond)
 		defer ticker.Stop()
-		frame := 0
+		frame := 1
 		for {
-			terminalRenderMu.Lock()
-			fmt.Fprintf(os.Stderr, "\x1b[H\x1b[2J%s", connectingScreenTerminalFrame(details, frame))
-			terminalRenderMu.Unlock()
-			frame++
 			select {
 			case <-stop:
 				return
 			case <-ticker.C:
 			}
+			terminalRenderMu.Lock()
+			render(frame)
+			terminalRenderMu.Unlock()
+			frame++
 		}
 	}()
 	return func() {
@@ -1111,7 +1260,7 @@ func startTerminalConnectingStatus(details string) func() {
 			close(stop)
 			<-done
 			terminalRenderMu.Lock()
-			fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
+			fmt.Fprint(os.Stderr, terminalConnectingExitClearSequence())
 			terminalRenderMu.Unlock()
 		})
 	}
@@ -1130,7 +1279,7 @@ func startTerminalInlineAnimatedStatus(label string) func() {
 		defer ticker.Stop()
 		frame := 0
 		for {
-			fmt.Fprintf(os.Stderr, "\r\x1b[2K%s", animatedStatusText(label, frame))
+			fmt.Fprintf(os.Stderr, "\r%s%s", ansiEraseLine, animatedStatusText(label, frame))
 			frame++
 			select {
 			case <-stop:
@@ -1143,7 +1292,7 @@ func startTerminalInlineAnimatedStatus(label string) func() {
 		once.Do(func() {
 			close(stop)
 			<-done
-			fmt.Fprint(os.Stderr, "\r\x1b[2K")
+			fmt.Fprintf(os.Stderr, "\r%s", ansiEraseLine)
 		})
 	}
 }

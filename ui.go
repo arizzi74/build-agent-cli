@@ -149,8 +149,8 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 			layout.redraw(prompt, string(line), cursor, slashMenuLines(menuOpen, menu, selected))
 			return
 		}
-		fmt.Fprintf(os.Stderr, "\r\x1b[2K%s", commandInputLine(prompt, string(line)))
-		fmt.Fprint(os.Stderr, "\x1b[J")
+		fmt.Fprintf(os.Stderr, "\r%s%s", ansiEraseLine, commandInputLine(prompt, string(line)))
+		fmt.Fprintf(os.Stderr, "%s\x1b[J", ansiReset)
 		lines := boundedSlashMenuLines(slashMenuLines(menuOpen, menu, selected), terminalSlashMenuMaxRows())
 		for _, menuLine := range lines {
 			fmt.Fprintf(os.Stderr, "\r\n%s", menuLine)
@@ -450,7 +450,7 @@ func (l *fixedPromptLayout) redraw(prompt, line string, cursor int, menuLines []
 	}
 	menuTop := l.promptTop - len(menuLines)
 	for i, menuLine := range menuLines {
-		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K%s", menuTop+i, fitPromptLine(menuLine, l.width))
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", menuTop+i, ansiEraseLine, fitPromptLine(menuLine, l.width))
 	}
 	l.drawPromptWithSeparator(prompt, line, cursor, len(menuLines) == 0)
 	l.drawnMenuRows = len(menuLines)
@@ -473,7 +473,7 @@ func (l *fixedPromptLayout) clearResizedFooterRows(oldTurnTop, oldTempRow int) {
 	}
 	fmt.Fprint(os.Stderr, "\x1b[s")
 	for row := top; row <= bottom; row++ {
-		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K", row)
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", row, ansiEraseLine)
 	}
 	fmt.Fprint(os.Stderr, "\x1b[u")
 }
@@ -489,11 +489,11 @@ func (l *fixedPromptLayout) drawPromptWithSeparator(prompt, line string, cursor 
 	// When a slash menu is open, that row belongs to the menu; clearing it here
 	// would erase the only matching command for filtered menus such as `/w`.
 	if clearSeparator && l.promptTop > 1 {
-		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K", l.promptTop-1)
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", l.promptTop-1, ansiEraseLine)
 	}
 	rows := commandInputBandRows(prompt, line, l.width)
 	for i, rowText := range rows {
-		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K%s", l.promptTop+i, rowText)
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", l.promptTop+i, ansiEraseLine, rowText)
 	}
 	col := commandInputCursorColumn(prompt, cursor)
 	if col > l.width {
@@ -528,7 +528,7 @@ func (l *fixedPromptLayout) drawTempMessage(message string) {
 	if terminalStatusANSIEnabled() {
 		line = style(line, ansiYellow+ansiBold, true)
 	}
-	fmt.Fprintf(os.Stderr, "\x1b[s\x1b[%d;1H\x1b[2K%s\x1b[u", l.tempRow, line)
+	fmt.Fprintf(os.Stderr, "\x1b[s\x1b[%d;1H%s%s\x1b[u", l.tempRow, ansiEraseLine, line)
 }
 
 func (l *fixedPromptLayout) clearTempMessage() {
@@ -540,7 +540,7 @@ func (l *fixedPromptLayout) clearTempMessage() {
 	if !l.enabled {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\x1b[s\x1b[%d;1H\x1b[2K\x1b[u", l.tempRow)
+	fmt.Fprintf(os.Stderr, "\x1b[s\x1b[%d;1H%s\x1b[u", l.tempRow, ansiEraseLine)
 }
 
 func (l *fixedPromptLayout) clearMenu(rows int) {
@@ -552,7 +552,7 @@ func (l *fixedPromptLayout) clearMenu(rows int) {
 	}
 	top := l.promptTop - rows
 	for row := top; row < l.promptTop; row++ {
-		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K", row)
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", row, ansiEraseLine)
 	}
 }
 
@@ -639,7 +639,7 @@ func drawTerminalFooterPromptUnlocked(prompt, line string, cursor int, status st
 	}
 	rows := commandInputBandRows(prompt, line, metrics.Width)
 	for i, rowText := range rows {
-		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K%s", metrics.PromptTop+i, rowText)
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", metrics.PromptTop+i, ansiEraseLine, rowText)
 	}
 	col := commandInputCursorColumn(prompt, cursor)
 	if col > metrics.Width {
@@ -687,7 +687,7 @@ func formatCommandInputBandRows(prompt, line string, color bool, width int) []st
 	if !color {
 		return []string{formatCommandInputLine(prompt, line, false, 0)}
 	}
-	blank := ansiUserBG + fitPromptBandText("", width) + ansiReset
+	blank := formatPromptBandRow("", "", width)
 	middle := formatCommandInputLine(prompt, line, true, width)
 	return []string{blank, middle, blank}
 }
@@ -699,7 +699,7 @@ func formatCommandInputLine(prompt, line string, color bool, width int) string {
 	}
 	text := " " + visible
 	if width > 0 {
-		text = fitPromptBandText(text, width)
+		return formatPromptBandRow(text, ansiGrayFG, width)
 	}
 	return ansiUserBG + ansiGrayFG + text + ansiReset
 }
@@ -926,7 +926,7 @@ func promptApprovalTable(rows [][2]string, message string, defaultYes bool) (boo
 	defer leaveAlternatePickerScreen()
 
 	redraw := func() {
-		fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
+		fmt.Fprint(os.Stderr, ansiReset+"\x1b[H\x1b[2J")
 		printApprovalTable(rows, selected)
 	}
 	redraw()
@@ -1069,17 +1069,12 @@ func startConnectingInputCapture(cancel func()) func() {
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) || cancel == nil {
 		return func() {}
 	}
-	// Prepare raw/nonblocking input synchronously so the first rendered frame
+	// Prepare raw input synchronously so the first rendered frame
 	// never advertises Esc cancellation before stdin is actually ready.
 	stdinState.Lock()
 	fd := int(os.Stdin.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
-		stdinState.Unlock()
-		return func() {}
-	}
-	if err := setTerminalNonblock(fd, true); err != nil {
-		_ = term.Restore(fd, oldState)
 		stdinState.Unlock()
 		return func() {}
 	}
@@ -1092,7 +1087,6 @@ func (c *connectingInputCapture) Stop() {
 	c.stopOnce.Do(func() { close(c.stop) })
 	<-c.done
 	c.cleanupOnce.Do(func() {
-		_ = setTerminalNonblock(c.fd, false)
 		_ = term.Restore(c.fd, c.oldState)
 		stdinState.Unlock()
 	})
@@ -1157,8 +1151,6 @@ func (c *processingInputCapture) run(prompt string, status statusBarState) {
 	}
 	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
 	fd := int(os.Stdin.Fd())
-	_ = setTerminalNonblock(fd, true)
-	defer func() { _ = setTerminalNonblock(fd, false) }()
 
 	line, submitted := peekPendingCommandInput()
 	var escapeArmedUntil time.Time
@@ -1344,7 +1336,7 @@ func promptInstanceSelection(instances []ProfileInfo, currentProfile string) (st
 	defer leaveAlternatePickerScreen()
 
 	redraw := func() {
-		fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
+		fmt.Fprint(os.Stderr, ansiReset+"\x1b[H\x1b[2J")
 		lines := instancePickerLines(options, selected)
 		_, height, sizeErr := term.GetSize(terminalStderrFD())
 		maxLines := len(lines)
@@ -1435,7 +1427,7 @@ func promptConversationSelection(conversations []WebConversation, currentID stri
 	defer leaveAlternatePickerScreen()
 
 	redraw := func() {
-		fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
+		fmt.Fprint(os.Stderr, ansiReset+"\x1b[H\x1b[2J")
 		lines := conversationPickerLines(options, selected)
 		_, height, sizeErr := term.GetSize(terminalStderrFD())
 		maxLines := len(lines)
@@ -1589,7 +1581,7 @@ func promptWorkspaceSelection(choices []WorkspaceChoice) (string, error) {
 	defer leaveAlternatePickerScreen()
 
 	redraw := func() {
-		fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
+		fmt.Fprint(os.Stderr, ansiReset+"\x1b[H\x1b[2J")
 		lines := workspacePickerLines(options, selected)
 		_, height, sizeErr := term.GetSize(terminalStderrFD())
 		maxLines := len(lines)
@@ -1693,7 +1685,7 @@ func promptAppSelection(choices []AppChoice) (string, error) {
 	defer leaveAlternatePickerScreen()
 
 	redraw := func() {
-		fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J")
+		fmt.Fprint(os.Stderr, ansiReset+"\x1b[H\x1b[2J")
 		lines := appPickerLines(options, selected)
 		_, height, sizeErr := term.GetSize(terminalStderrFD())
 		maxLines := len(lines)
@@ -1761,16 +1753,21 @@ func enterTerminalAppScreen() bool {
 		return false
 	}
 	terminalAppScreenState.Lock()
-	defer terminalAppScreenState.Unlock()
 	if terminalAppScreenState.active {
+		terminalAppScreenState.Unlock()
 		return false
 	}
 	terminalAppScreenState.active = true
+	terminalAppScreenState.Unlock()
 	// Save the user's current terminal screen and run the interactive REPL inside
 	// the alternate screen. On exit, the original shell screen is restored. Do not
 	// clear alternate-screen scrollback by default: terminals that expose it should
-	// still let the user scroll through the Build Agent transcript.
-	fmt.Fprint(os.Stderr, "\x1b[?1049h\x1b[r\x1b[H\x1b[2J")
+	// still let the user scroll through the Build Agent transcript. Reset the
+	// scrolling region and autowrap only after entering 1049, so iTerm2 cannot
+	// inherit a stale main-screen margin/pending-wrap state into the logo frame.
+	terminalRenderMu.Lock()
+	fmt.Fprintf(os.Stderr, "\x1b[?1049h\x1b[?7h\x1b[r%s", terminalFullScreenClearAndPurgeHistorySequence())
+	terminalRenderMu.Unlock()
 	return true
 }
 
@@ -1782,7 +1779,9 @@ func leaveTerminalAppScreen() {
 	}
 	terminalAppScreenState.active = false
 	terminalAppScreenState.Unlock()
-	fmt.Fprint(os.Stderr, "\x1b[r\x1b[?1049l")
+	terminalRenderMu.Lock()
+	fmt.Fprint(os.Stderr, "\x1b[?7h\x1b[r\x1b[?1049l")
+	terminalRenderMu.Unlock()
 }
 
 func terminalAppScreenActive() bool {
@@ -1793,7 +1792,7 @@ func terminalAppScreenActive() bool {
 
 func clearTerminalAppScrollback() {
 	if terminalAppScreenActive() && os.Getenv("BA_CLI_CLEAR_ALT_SCROLLBACK") == "1" {
-		fmt.Fprint(os.Stderr, "\x1b[3J")
+		fmt.Fprint(os.Stderr, ansiReset+"\x1b[3J")
 	}
 }
 
@@ -1808,10 +1807,10 @@ func enterAlternatePickerScreen() {
 	// scrollback. Inside the app alternate screen, do not nest 1049 screens;
 	// clear the app screen and let leaveAlternatePickerScreen replay the app UI.
 	if terminalAppScreenActive() {
-		fmt.Fprint(os.Stderr, "\x1b[r\x1b[H\x1b[2J")
+		fmt.Fprint(os.Stderr, ansiReset+"\x1b[r\x1b[H\x1b[2J")
 		return
 	}
-	fmt.Fprint(os.Stderr, "\x1b[?1049h\x1b[r\x1b[H\x1b[2J")
+	fmt.Fprint(os.Stderr, ansiReset+"\x1b[?1049h\x1b[r\x1b[H\x1b[2J")
 }
 
 func leaveAlternatePickerScreen() {
@@ -1821,7 +1820,7 @@ func leaveAlternatePickerScreen() {
 	if terminalAppScreenActive() {
 		if !replayManagedViewportFromLastStatus() {
 			terminalRenderMu.Lock()
-			fmt.Fprint(os.Stderr, "\x1b[r\x1b[H\x1b[2J")
+			fmt.Fprint(os.Stderr, ansiReset+"\x1b[r\x1b[H\x1b[2J")
 			terminalRenderMu.Unlock()
 		}
 		return
@@ -1834,13 +1833,12 @@ func leaveAlternatePickerScreen() {
 func readPendingEscapeSequence() []byte {
 	// In raw mode, arrow keys arrive as ESC-prefixed byte sequences, while a
 	// plain Escape key arrives as a lone 0x1b. A blocking read for the next byte
-	// makes Escape feel hung. Briefly switch stdin non-blocking so a standalone
-	// Escape can close menus immediately, while still accepting already-arrived
-	// arrow-key sequences such as "[A" / "[B".
+	// makes Escape feel hung. Briefly wait for already-arrived bytes so a
+	// standalone Escape can close menus immediately, while still accepting
+	// arrow-key sequences such as "[A" / "[B". readTerminalFD performs a
+	// readiness poll without changing shared PTY descriptor flags.
 	time.Sleep(10 * time.Millisecond)
 	fd := int(os.Stdin.Fd())
-	_ = setTerminalNonblock(fd, true)
-	defer func() { _ = setTerminalNonblock(fd, false) }()
 	buf := make([]byte, 8)
 	seq := make([]byte, 0, len(buf))
 	for len(seq) < cap(seq) {
