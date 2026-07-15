@@ -31,6 +31,7 @@ build darwin arm64 bacli-darwin-arm64
 build windows amd64 bacli-windows-amd64.exe
 build windows arm64 bacli-windows-arm64.exe
 chmod 755 "$DIST/install.sh" "$DIST/bacli-linux-arm64" "$DIST/bacli-linux-amd64" "$DIST/bacli-darwin-amd64" "$DIST/bacli-darwin-arm64"
+chmod 644 "$DIST/install.ps1" "$DIST/bacli-windows-amd64.exe" "$DIST/bacli-windows-arm64.exe"
 
 python3 - "$VERSION" "$BASE_URL" "$DIST" <<'PY'
 import hashlib, json, pathlib, sys
@@ -56,3 +57,4 @@ printf 'Release %s built in %s/\n' "$VERSION" "$DIST"
   cd "$DIST"
   sha256sum bacli-* install.sh install.ps1 version.json > SHA256SUMS
 )
+chmod 644 "$DIST/version.json" "$DIST/SHA256SUMS"
