@@ -211,6 +211,15 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		},
 	},
 	{
+		Canonical: "/instance", Aliases: []string{"/instances"}, Description: "switch to a configured ServiceNow instance", Category: "Context", Order: 45,
+		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandModal, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandDoNotCaptureModal, Suggestions: []string{"/instance"},
+		IsModal: func(args []string) bool { return commandArgsStartModal(args, "select", "choose") },
+		Handler: func(ctx context.Context, c *Client, args []string) (bool, error) {
+			return true, handleInstanceCommand(ctx, c, args)
+		},
+	},
+	{
 		Canonical: "/workspace", Aliases: []string{"/ws"}, Description: "choose an existing Web UI/local workspace", Category: "Context", Order: 50,
 		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandModal, Runtime: SlashCommandRuntimeAny,
 		CapturePolicy: SlashCommandDoNotCaptureModal, Suggestions: []string{"/workspace"},
@@ -234,6 +243,14 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		CapturePolicy: SlashCommandCaptureOutput, Suggestions: []string{"/sync", "/sync status", "/sync pull", "/sync push"},
 		Handler: func(ctx context.Context, c *Client, args []string) (bool, error) {
 			return true, handleSyncCommand(ctx, c, args)
+		},
+	},
+	{
+		Canonical: "/project", Aliases: []string{"/projects"}, Description: "manage local app project checkouts", Category: "Context", Order: 66,
+		Arguments: SlashCommandRequiredSubcommand, Behavior: SlashCommandTemplate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, Suggestions: []string{"/project help", "/project current", "/project list", "/project use ", "/project clone-here", "/project primary ", "/project forget "},
+		Handler: func(ctx context.Context, c *Client, args []string) (bool, error) {
+			return true, handleProjectCommand(ctx, c, args)
 		},
 	},
 	{

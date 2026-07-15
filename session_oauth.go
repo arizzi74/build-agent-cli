@@ -32,14 +32,19 @@ var authConfirm = func(prompt string) (bool, error) {
 }
 
 func (c *Client) getNirvanaAccessToken(ctx context.Context, silent bool) (TokenResponse, error) {
-	if tok, ok := loadCachedToken(c.opts.Profile); ok {
+	var refreshErr error
+	tok, hadCachedToken := loadCachedToken(c.opts.Profile)
+	if hadCachedToken {
 		if tok.InstanceURL != "" && !sameInstance(tok.InstanceURL, c.cfg.InstanceURL) {
-			deleteCachedToken(c.opts.Profile)
+			// This profile's token belongs to another instance, so it cannot be
+			// used for this connection. Leave it on disk until recovery is chosen.
+			refreshErr = errors.New("cached OAuth token belongs to a different instance")
 		} else if !tokenExpired(tok) {
 			c.oauthAccessToken = tok.AccessToken
 			return tok, nil
 		} else if tok.RefreshToken != "" {
-			if refreshed, err := refreshAccessToken(ctx, oauthConfig(c.cfg), tok.RefreshToken); err == nil {
+			refreshed, err := c.refreshNirvanaAccessToken(ctx, tok.RefreshToken)
+			if err == nil {
 				refreshed.IssuedAt, refreshed.InstanceURL = time.Now().UnixMilli(), c.cfg.InstanceURL
 				if refreshed.RefreshToken == "" {
 					refreshed.RefreshToken = tok.RefreshToken
@@ -48,11 +53,81 @@ func (c *Client) getNirvanaAccessToken(ctx context.Context, silent bool) (TokenR
 				c.oauthAccessToken = refreshed.AccessToken
 				return refreshed, nil
 			}
-			deleteCachedToken(c.opts.Profile)
+			refreshErr = err
+		} else {
+			refreshErr = errors.New("cached OAuth token is expired and has no refresh token")
 		}
 	}
+	if !hadCachedToken {
+		if silent {
+			tok, err := c.trySavedSessionOAuth(ctx, true)
+			if err != nil {
+				return TokenResponse{}, fmt.Errorf("noninteractive Nirvana authentication failed: saved-session recovery: %s", safeAuthRecoveryDetail(err))
+			}
+			return c.saveNirvanaAccessToken(tok)
+		}
+		return c.getNirvanaInteractiveAccessToken(ctx, silent)
+	}
+
+	// An expired token must first try refresh, then the matching saved browser
+	// session. Neither credential is deleted merely because an earlier fallback
+	// failed; users choose what to discard only after both recovery paths fail.
+	tok, sessionErr := c.trySavedSessionOAuth(ctx, silent)
+	if sessionErr == nil {
+		return c.saveNirvanaAccessToken(tok)
+	}
+	recoveryErr := combinedNirvanaRecoveryError(refreshErr, sessionErr)
 	if silent {
-		return TokenResponse{}, errors.New("no valid cached OAuth token and interactive auth is disabled")
+		return TokenResponse{}, fmt.Errorf("noninteractive Nirvana authentication failed: %w", recoveryErr)
+	}
+
+	mode, err := normalizeAuthMode(c.opts.AuthMode)
+	if err != nil {
+		return TokenResponse{}, err
+	}
+	if mode == authModeBasic {
+		return TokenResponse{}, errors.New("--auth basic is only supported with --web-gateway; Nirvana requires a reusable ServiceNow web session (--auth form or --auth cookie)")
+	}
+	action, err := c.chooseNirvanaCredentialRecovery(recoveryErr)
+	if err != nil {
+		return TokenResponse{}, err
+	}
+	switch action {
+	case credentialRecoveryRemove:
+		if err := deleteConfiguredInstance(c.opts.Profile); err != nil {
+			return TokenResponse{}, err
+		}
+		return TokenResponse{}, fmt.Errorf("removed instance %q", c.opts.Profile)
+	case credentialRecoveryCancel:
+		return TokenResponse{}, fmt.Errorf("authentication canceled for instance %q", c.opts.Profile)
+	case credentialRecoveryReauth:
+		// The cached token is known unusable. A saved session is only removed
+		// after the user explicitly chooses reauthentication; configureGatewayAuth
+		// then performs one normal interactive authentication attempt.
+		deleteCachedToken(c.opts.Profile)
+		if _, ok := loadMatchingWebSession(c.opts.Profile, c.cfg.InstanceURL); ok {
+			if err := deleteWebSession(c.opts.Profile); err != nil {
+				return TokenResponse{}, err
+			}
+		}
+		c.clearWebSession()
+		c.connectionAuthPrepared = false
+		tok, err := c.getNirvanaInteractiveAccessToken(ctx, false)
+		if err != nil {
+			return TokenResponse{}, fmt.Errorf("reauthentication failed: %w", err)
+		}
+		return tok, nil
+	default:
+		return TokenResponse{}, errors.New("unknown credential recovery choice")
+	}
+}
+
+// getNirvanaInteractiveAccessToken is deliberately a one-shot normal auth
+// path. It never presents the credential-recovery chooser, so selecting
+// reauthenticate cannot loop back into that chooser.
+func (c *Client) getNirvanaInteractiveAccessToken(ctx context.Context, silent bool) (TokenResponse, error) {
+	if silent {
+		return TokenResponse{}, errors.New("no valid cached OAuth token or saved web session and interactive auth is disabled")
 	}
 	mode, err := normalizeAuthMode(c.opts.AuthMode)
 	if err != nil {
@@ -61,13 +136,16 @@ func (c *Client) getNirvanaAccessToken(ctx context.Context, silent bool) (TokenR
 	if mode == authModeBasic {
 		return TokenResponse{}, errors.New("--auth basic is only supported with --web-gateway; Nirvana requires a reusable ServiceNow web session (--auth form or --auth cookie)")
 	}
-	if err := c.configureGatewayAuth(ctx); err != nil {
-		return TokenResponse{}, err
+	if !c.connectionAuthPrepared {
+		if err := c.configureNirvanaInteractiveAuth(ctx); err != nil {
+			return TokenResponse{}, err
+		}
+		c.connectionAuthPrepared = true
 	}
 	if err := c.checkSessionTimeout(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "warning: could not inspect web session timeout; continuing OAuth")
 	}
-	tok, err := c.runSessionOAuthPKCE(ctx)
+	tok, err := c.runNirvanaSessionOAuth(ctx, true)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "warning: web-session OAuth could not complete; using manual authorization flow")
 		tok, err = runOAuthPKCEFlow(ctx, oauthConfig(c.cfg), c.opts.NoOpen)
@@ -75,12 +153,91 @@ func (c *Client) getNirvanaAccessToken(ctx context.Context, silent bool) (TokenR
 	if err != nil {
 		return TokenResponse{}, err
 	}
+	return c.saveNirvanaAccessToken(tok)
+}
+
+func (c *Client) refreshNirvanaAccessToken(ctx context.Context, refreshToken string) (TokenResponse, error) {
+	if c.oauthRefresh != nil {
+		return c.oauthRefresh(ctx, oauthConfig(c.cfg), refreshToken)
+	}
+	return refreshAccessToken(ctx, oauthConfig(c.cfg), refreshToken)
+}
+
+func (c *Client) runNirvanaSessionOAuth(ctx context.Context, interactive bool) (TokenResponse, error) {
+	if c.oauthSessionPKCE != nil {
+		return c.oauthSessionPKCE(ctx, interactive)
+	}
+	return c.runSessionOAuthPKCEWithInteraction(ctx, interactive)
+}
+
+func (c *Client) configureNirvanaInteractiveAuth(ctx context.Context) error {
+	if c.oauthConfigure != nil {
+		return c.oauthConfigure(ctx)
+	}
+	return c.configureGatewayAuth(ctx)
+}
+
+func (c *Client) chooseNirvanaCredentialRecovery(cause error) (string, error) {
+	if c.oauthRecoveryChoice != nil {
+		return c.oauthRecoveryChoice(c.opts.Profile, c.cfg.InstanceURL, "OAuth and saved web session", cause)
+	}
+	if !credentialRecoveryInteractive() {
+		return "", errors.New("Nirvana credential recovery requires an interactive terminal; no saved credentials were changed")
+	}
+	return promptCredentialRecovery(c.opts.Profile, c.cfg.InstanceURL, "OAuth and saved web session", cause)
+}
+
+func (c *Client) trySavedSessionOAuth(ctx context.Context, silent bool) (TokenResponse, error) {
+	session, ok := loadMatchingWebSession(c.opts.Profile, c.cfg.InstanceURL)
+	if !ok {
+		return TokenResponse{}, errors.New("no matching saved web session")
+	}
+	if c.httpClient == nil {
+		if err := c.initGatewayHTTPClient(); err != nil {
+			return TokenResponse{}, err
+		}
+	}
+	c.gatewayAuth = session.AuthMode
+	if err := c.applyAndValidateWebSession(ctx, session); err != nil {
+		return TokenResponse{}, fmt.Errorf("saved web session validation failed: %w", err)
+	}
+	c.connectionAuthPrepared = true
+	tok, err := c.runNirvanaSessionOAuth(ctx, !silent)
+	if err != nil {
+		return TokenResponse{}, fmt.Errorf("saved web-session OAuth failed: %w", err)
+	}
+	return tok, nil
+}
+
+func (c *Client) saveNirvanaAccessToken(tok TokenResponse) (TokenResponse, error) {
 	tok.IssuedAt, tok.InstanceURL = time.Now().UnixMilli(), c.cfg.InstanceURL
 	if err := saveCachedToken(c.opts.Profile, tok); err != nil {
 		fmt.Fprintln(os.Stderr, "warning: could not cache OAuth token")
 	}
 	c.oauthAccessToken = tok.AccessToken
 	return tok, nil
+}
+
+func combinedNirvanaRecoveryError(refreshErr, sessionErr error) error {
+	refreshDetail := "no usable cached OAuth token"
+	if refreshErr != nil {
+		refreshDetail = safeAuthRecoveryDetail(refreshErr)
+	}
+	sessionDetail := "no matching saved web session"
+	if sessionErr != nil {
+		sessionDetail = safeAuthRecoveryDetail(sessionErr)
+	}
+	return fmt.Errorf("OAuth refresh: %s; saved-session recovery: %s", refreshDetail, sessionDetail)
+}
+
+func safeAuthRecoveryDetail(err error) string {
+	if err == nil {
+		return "not attempted"
+	}
+	if safeTelemetryLabel(err.Error()) == "redacted" {
+		return "failed (sensitive details redacted)"
+	}
+	return err.Error()
 }
 
 func sameOriginInstance(instance, raw string) bool {
@@ -131,6 +288,10 @@ func readLimited(res *http.Response) ([]byte, error) {
 }
 
 func (c *Client) runSessionOAuthPKCE(ctx context.Context) (TokenResponse, error) {
+	return c.runSessionOAuthPKCEWithInteraction(ctx, true)
+}
+
+func (c *Client) runSessionOAuthPKCEWithInteraction(ctx context.Context, interactive bool) (TokenResponse, error) {
 	cfg := oauthConfig(c.cfg)
 	verifier, state := randomBase64URL(32), randomHex(16)
 	u, err := url.Parse(cfg.AuthorizationEndpoint)
@@ -162,7 +323,7 @@ func (c *Client) runSessionOAuthPKCE(ctx context.Context) (TokenResponse, error)
 		return TokenResponse{}, errors.New("OAuth state did not match")
 	}
 	if code == "" && explicitConsentPage(string(body)) {
-		if c.opts.AutoApprove {
+		if !interactive || c.opts.AutoApprove {
 			return TokenResponse{}, errors.New("OAuth consent requires interactive approval")
 		}
 		approved, err := authConfirm("Allow this ServiceNow session to authorize Build Agent CLI?")

@@ -38,6 +38,8 @@ type TokenResponse struct {
 	InstanceURL  string `json:"instance_url,omitempty"`
 }
 
+var tokenNow = time.Now
+
 func oauthConfig(cfg CLIConfig) OAuthConfig {
 	return OAuthConfig{
 		ClientID:              cfg.OAuthClientID,
@@ -103,9 +105,9 @@ func tokenExpired(tok TokenResponse) bool {
 	if tok.AccessToken == "" || tok.IssuedAt == 0 || tok.ExpiresIn == 0 {
 		return true
 	}
-	const expirationBuffer = int64(15 * 60 * 1000)
+	const expirationBuffer = int64(5 * 60 * 1000)
 	expiresAt := tok.IssuedAt + tok.ExpiresIn*1000
-	return time.Now().UnixMilli() > expiresAt-expirationBuffer
+	return tokenNow().UnixMilli() >= expiresAt-expirationBuffer
 }
 
 func noRedirectTokenClient(hc *http.Client) *http.Client {

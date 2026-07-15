@@ -113,11 +113,16 @@ func TestCreateServiceNowAppLikeWebUIOrchestratesREST(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	statusChecks := 0
 	client := &Client{
-		cfg:               CLIConfig{InstanceURL: srv.URL},
-		opts:              Options{Profile: "default", Nirvana: true},
-		httpClient:        srv.Client(),
-		conversationID:    "conv123",
+		cfg:            CLIConfig{InstanceURL: srv.URL},
+		opts:           Options{Profile: "default", Nirvana: true},
+		httpClient:     srv.Client(),
+		conversationID: "conv123",
+		postSelectionStatus: func(context.Context) error {
+			statusChecks++
+			return nil
+		},
 		conversationTitle: "create application TRACE_CLI",
 		workspaceName:     "Default - admin",
 		workspaceURI:      workspaceURI,
@@ -171,6 +176,9 @@ func TestCreateServiceNowAppLikeWebUIOrchestratesREST(t *testing.T) {
 	}
 	if client.CurrentApp() == nil || client.CurrentApp().ScopeID != "newappsysid1234567890" || client.statusBarAppName() != "My Test App" {
 		t.Fatalf("current app not updated: %#v", client.CurrentApp())
+	}
+	if statusChecks != 1 {
+		t.Fatalf("post-selection status checks = %d, want 1", statusChecks)
 	}
 }
 

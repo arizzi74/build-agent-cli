@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -26,6 +29,100 @@ func TestDeriveWSURL(t *testing.T) {
 	}
 }
 
+func TestCanonicalProjectRootDefaultExpansionAndValidation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if got, err := canonicalProjectRoot(""); err != nil || got != filepath.Join(home, "BA") {
+		t.Fatalf("default root = %q, %v", got, err)
+	}
+	if got, err := canonicalProjectRoot("~/projects/bacli"); err != nil || got != filepath.Join(home, "projects", "bacli") {
+		t.Fatalf("expanded root = %q, %v", got, err)
+	}
+	for _, raw := range []string{"relative/projects", "~other/projects"} {
+		if _, err := canonicalProjectRoot(raw); err == nil {
+			t.Fatalf("unsafe root %q accepted", raw)
+		}
+	}
+	real := filepath.Join(home, "real")
+	if err := os.MkdirAll(filepath.Join(real, "projects"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(home, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := canonicalProjectRoot(filepath.Join(home, "linked", "projects")); err == nil {
+		t.Fatal("symlink project root ancestor accepted")
+	}
+}
+
+func TestProjectRootProfilePersistenceAndFlagOverride(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	profile := "dev"
+	if err := saveProfileConfig(profile, CLIConfig{InstanceURL: "https://dev.example.test"}); err != nil {
+		t.Fatal(err)
+	}
+	requested := filepath.Join(home, "work", "bacli-projects")
+	opts := Options{Profile: profile, ProfileExplicit: true, ProjectRoot: requested}
+	cfg, err := resolveConfig(&opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ProjectRoot != requested {
+		t.Fatalf("resolved project root = %q, want %q", cfg.ProjectRoot, requested)
+	}
+	saved, ok := loadProfileConfig(profile)
+	if !ok || saved.ProjectRoot != requested {
+		t.Fatalf("saved profile = %#v, ok=%v", saved, ok)
+	}
+	// Existing config files without projectRoot remain compatible and resolve to
+	// the historical ~/BA root instead of requiring a migration.
+	if err := os.MkdirAll(profileDir("legacy"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(profileConfigFile("legacy"), []byte(`{"instanceUrl":"https://legacy.example.test"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyOpts := Options{Profile: "legacy", ProfileExplicit: true}
+	legacyResolved, err := resolveConfig(&legacyOpts)
+	if err != nil || legacyResolved.ProjectRoot != filepath.Join(home, "BA") {
+		t.Fatalf("legacy config root = %q, err=%v", legacyResolved.ProjectRoot, err)
+	}
+}
+
+func TestSetupPreservesExistingProjectRootWhenOmitted(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	profile := "dev"
+	root := filepath.Join(home, "custom-projects")
+	if err := saveProfileConfig(profile, CLIConfig{InstanceURL: "https://old.example.test", ProjectRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+
+	stdinState.Lock()
+	oldReader := stdinState.reader
+	stdinState.reader = bufio.NewReader(strings.NewReader("https://new.example.test\n"))
+	stdinState.Unlock()
+	t.Cleanup(func() {
+		stdinState.Lock()
+		stdinState.reader = oldReader
+		stdinState.Unlock()
+	})
+
+	opts := Options{Profile: profile, ProfileExplicit: true, Setup: true}
+	cfg, err := resolveConfig(&opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ProjectRoot != root {
+		t.Fatalf("setup project root = %q, want preserved %q", cfg.ProjectRoot, root)
+	}
+	saved, ok := loadProfileConfig(profile)
+	if !ok || saved.ProjectRoot != root {
+		t.Fatalf("saved profile = %#v, ok=%v", saved, ok)
+	}
+}
+
 func TestExtractAuthCode(t *testing.T) {
 	if got := extractAuthCode("abc123"); got != "abc123" {
 		t.Fatalf("plain code = %q", got)
@@ -42,6 +139,17 @@ func TestNormalizeAuthModeDefaultsToForm(t *testing.T) {
 	}
 	if mode != authModeForm {
 		t.Fatalf("default auth mode = %q, want %q", mode, authModeForm)
+	}
+}
+
+func TestResolveConfigRejectsExplicitDeletedProfileBeforeConnecting(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("INSTANCE_URL", "")
+	t.Setenv("BA_INSTANCE_URL", "")
+	opts := Options{Profile: "zaiagents", ProfileExplicit: true}
+	_, err := resolveConfig(&opts)
+	if err == nil || !strings.Contains(err.Error(), `profile "zaiagents" is not configured`) || !strings.Contains(err.Error(), "--setup --profile zaiagents") {
+		t.Fatalf("resolveConfig deleted profile error = %v", err)
 	}
 }
 

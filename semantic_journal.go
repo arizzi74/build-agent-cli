@@ -40,6 +40,19 @@ type semanticJournalRecovery struct {
 	IncompleteTurn bool
 }
 
+type semanticJournalBoundaryError struct {
+	Sequence       uint64
+	ConversationID string
+	AfterTerminal  bool
+}
+
+func (e *semanticJournalBoundaryError) Error() string {
+	if e.AfterTerminal {
+		return fmt.Sprintf("semantic journal sequence %d follows a terminal turn without a new safe lifecycle boundary", e.Sequence)
+	}
+	return fmt.Sprintf("semantic journal sequence %d begins after snapshot checkpoint without a safe lifecycle boundary", e.Sequence)
+}
+
 func semanticJournalFile(profile, workspace string) string {
 	return filepath.Join(workspacesDir(profile), workspace+".semantic.jsonl")
 }
@@ -390,12 +403,12 @@ func recoverWorkspaceFromJournal(profile, name string, snapshot WorkspaceState, 
 		key := entry.ConversationID
 		if _, exists := active[key]; !exists {
 			if !semanticRecoveryBoundaryEvent(event) {
-				return semanticJournalRecovery{}, fmt.Errorf("semantic journal sequence %d begins after snapshot checkpoint without a safe lifecycle boundary", entry.Sequence)
+				return semanticJournalRecovery{}, &semanticJournalBoundaryError{Sequence: entry.Sequence, ConversationID: entry.ConversationID}
 			}
 			active[key] = NewSemanticTurnState()
 		} else if active[key].Terminal() {
 			if !semanticRecoveryBoundaryEvent(event) {
-				return semanticJournalRecovery{}, fmt.Errorf("semantic journal sequence %d follows a terminal turn without a new safe lifecycle boundary", entry.Sequence)
+				return semanticJournalRecovery{}, &semanticJournalBoundaryError{Sequence: entry.Sequence, ConversationID: entry.ConversationID, AfterTerminal: true}
 			}
 			active[key] = NewSemanticTurnState()
 		}
@@ -420,6 +433,93 @@ func recoverWorkspaceFromJournal(profile, name string, snapshot WorkspaceState, 
 	// add partial assistant text to conversation history. A locally interrupted
 	// turn is treated as abandoned; the next user prompt starts a clean turn.
 	return semanticJournalRecovery{Workspace: snapshot, LastSequence: last, IncompleteTurn: incomplete}, nil
+}
+
+// autoRecoverStaleSemanticJournal handles only a provably stale local chain:
+// a valid snapshot names one conversation, while every uncheckpointed journal
+// entry belongs to a different non-empty conversation. Ambiguous or same-
+// conversation lifecycle damage remains a hard error rather than being hidden.
+func autoRecoverStaleSemanticJournal(profile, workspace string, snapshot WorkspaceState, snapshotOK bool, recoveryErr error) (semanticJournalRecovery, string, bool, error) {
+	var boundaryErr *semanticJournalBoundaryError
+	if !snapshotOK || snapshot.ConversationID == "" || !errors.As(recoveryErr, &boundaryErr) {
+		return semanticJournalRecovery{}, "", false, recoveryErr
+	}
+	entries, err := readSemanticJournalChain(profile, workspace)
+	if err != nil {
+		return semanticJournalRecovery{}, "", false, recoveryErr
+	}
+	found := false
+	for _, entry := range entries {
+		if entry.Sequence <= snapshot.SemanticJournalSequence {
+			continue
+		}
+		found = true
+		if entry.ConversationID == "" || entry.ConversationID == snapshot.ConversationID {
+			return semanticJournalRecovery{}, "", false, recoveryErr
+		}
+	}
+	if !found || boundaryErr.ConversationID == "" || boundaryErr.ConversationID == snapshot.ConversationID {
+		return semanticJournalRecovery{}, "", false, recoveryErr
+	}
+	quarantinePath, err := quarantineSemanticJournal(profile, workspace)
+	if err != nil {
+		return semanticJournalRecovery{}, "", false, fmt.Errorf("%w; automatic stale-journal quarantine failed: %v", recoveryErr, err)
+	}
+	snapshot.SemanticJournalSequence = 0
+	recovered, err := recoverWorkspaceFromJournal(profile, workspace, snapshot, true)
+	if err != nil {
+		return semanticJournalRecovery{}, quarantinePath, false, fmt.Errorf("stale semantic journal was quarantined at %s but clean recovery failed: %w", quarantinePath, err)
+	}
+	return recovered, quarantinePath, true, nil
+}
+
+func semanticJournalQuarantineDir(profile string) string {
+	return filepath.Join(workspacesDir(profile), "semantic-quarantine")
+}
+
+func quarantineSemanticJournal(profile, workspace string) (string, error) {
+	root := semanticJournalQuarantineDir(profile)
+	if err := ensurePrivateDir(root); err != nil {
+		return "", err
+	}
+	destination, err := os.MkdirTemp(root, workspace+"-"+time.Now().UTC().Format("20060102T150405Z")+"-")
+	if err != nil {
+		return "", err
+	}
+	if err := os.Chmod(destination, 0o700); err != nil {
+		_ = os.Remove(destination)
+		return "", err
+	}
+	paths, err := filepath.Glob(filepath.Join(semanticJournalArchiveDir(profile), workspace+"-*.jsonl"))
+	if err != nil {
+		_ = os.Remove(destination)
+		return "", err
+	}
+	if _, err := os.Stat(semanticJournalFile(profile, workspace)); err == nil {
+		paths = append(paths, semanticJournalFile(profile, workspace))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		_ = os.Remove(destination)
+		return "", err
+	}
+	sort.Strings(paths)
+	if len(paths) == 0 {
+		_ = os.Remove(destination)
+		return "", errors.New("semantic journal disappeared before quarantine")
+	}
+	type movedFile struct{ from, to string }
+	moved := make([]movedFile, 0, len(paths))
+	for _, source := range paths {
+		target := filepath.Join(destination, filepath.Base(source))
+		if err := os.Rename(source, target); err != nil {
+			for i := len(moved) - 1; i >= 0; i-- {
+				_ = os.Rename(moved[i].to, moved[i].from)
+			}
+			_ = os.Remove(destination)
+			return "", err
+		}
+		moved = append(moved, movedFile{from: source, to: target})
+	}
+	return destination, nil
 }
 
 func semanticRecoveryBoundaryEvent(event SemanticEvent) bool {
@@ -474,6 +574,8 @@ func decodeSemanticJournalEvent(event SemanticEvent) (SemanticEvent, error) {
 		target = &ToolStartedPayload{}
 	case EventToolCompleted:
 		target = &ToolCompletedPayload{}
+	case EventSubAgentStarted, EventSubAgentEnded:
+		target = &SubAgentLifecyclePayload{}
 	case EventElicitationRequested:
 		target = &ElicitationRequestedPayload{}
 	case EventUsageUpdated:
@@ -523,6 +625,8 @@ func decodeSemanticJournalEvent(event SemanticEvent) (SemanticEvent, error) {
 	case *ToolStartedPayload:
 		event.Payload = *value
 	case *ToolCompletedPayload:
+		event.Payload = *value
+	case *SubAgentLifecyclePayload:
 		event.Payload = *value
 	case *ElicitationRequestedPayload:
 		event.Payload = *value

@@ -124,6 +124,7 @@ func (c *Client) createServiceNowAppLikeWebUI(ctx context.Context, req appCreati
 		c.debugf("warning: could not annotate APP_CREATED checkpoint: %v\n", err)
 	}
 	c.absorbCreatedApp(app)
+	c.postAppSelectionStatus(ctx)
 	return app, nil
 }
 

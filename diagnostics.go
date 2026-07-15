@@ -56,6 +56,11 @@ func (c *Client) answerGliderRunDiagnostics(ctx context.Context, payload map[str
 		return diagnosticsError(msg, "ALL_FILES_INVALID", map[string]interface{}{"invalidFiles": invalid, "supportedExtensions": supportedDiagnosticExtensions()}), "error"
 	}
 
+	// Diagnostics runs in an isolated, remote-sourced temp project. Reuse an
+	// already-installed dependency tree only when it belongs to this exact active
+	// app; diagnostics must never materialize a checkout or install dependencies.
+	c.attachTrustedDiagnosticsDependencies(ctx, project)
+
 	tscPath := findTSC(project.Dir)
 	if tscPath == "" {
 		msg := "TypeScript compiler 'tsc' was not found in PATH or project node_modules/.bin; local diagnostics could not run."
@@ -336,6 +341,80 @@ func safeDiagnosticLocalPath(root, rel string) (string, error) {
 		return "", fmt.Errorf("path escapes diagnostic project: %s", rel)
 	}
 	return joinedClean, nil
+}
+
+// attachTrustedDiagnosticsDependencies makes an already-present node_modules
+// available to the isolated diagnostics project. It is deliberately best-effort:
+// an absent, stale, or unsupported local tree leaves diagnostics unchanged rather
+// than copying packages or installing anything. The temporary project is removed
+// by its caller, so the symlink cannot alter the source checkout.
+func (c *Client) attachTrustedDiagnosticsDependencies(ctx context.Context, project syncedGliderProject) {
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	target := filepath.Join(project.Dir, "node_modules")
+	if _, err := os.Lstat(target); err == nil {
+		// Remote state may exceptionally include node_modules. Never replace it.
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+
+	for _, source := range c.trustedDiagnosticsDependencySources() {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		nodeModules := filepath.Join(source, "node_modules")
+		if !hasDiagnosticsSDKDependency(nodeModules) {
+			continue
+		}
+		if err := os.Symlink(nodeModules, target); err == nil {
+			return
+		}
+		// Directory symlinks can require additional privileges on Windows. Do not
+		// copy or install as a fallback: local dependencies are optional here and
+		// diagnostics must stay non-materializing and read-only.
+	}
+}
+
+// trustedDiagnosticsDependencySources returns only dependency trees known to
+// belong to the active app. The checkout resolver is read-only: it neither
+// repairs registry state nor changes the selected checkout.
+func (c *Client) trustedDiagnosticsDependencySources() []string {
+	appID := strings.TrimSpace(c.activeAppSysID())
+	if appID == "" {
+		return nil
+	}
+	rootURI := "now-file:/" + strings.TrimLeft(appID, "/")
+	seen := map[string]struct{}{}
+	var sources []string
+	add := func(dir string) {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			return
+		}
+		clean := filepath.Clean(dir)
+		if _, ok := seen[clean]; ok {
+			return
+		}
+		seen[clean] = struct{}{}
+		sources = append(sources, clean)
+	}
+
+	if resolution, err := c.resolveFluentDocsLocalCheckout(appID, c.persistentAppDisplayName(appID), rootURI); err == nil {
+		add(resolution.Dir)
+	}
+	if build := c.lastGliderBuild; build != nil && build.TempDir != "" &&
+		strings.EqualFold(strings.TrimSpace(build.AppID), appID) &&
+		strings.EqualFold(strings.TrimSpace(build.RootURI), rootURI) {
+		add(build.TempDir)
+	}
+	return sources
+}
+
+func hasDiagnosticsSDKDependency(nodeModules string) bool {
+	info, err := os.Stat(filepath.Join(nodeModules, "@servicenow", "sdk", "package.json"))
+	return err == nil && !info.IsDir()
 }
 
 func findTSC(projectDir string) string {

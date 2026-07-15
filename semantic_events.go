@@ -22,6 +22,8 @@ const (
 	EventAssistantCompleted     SemanticEventType = "assistant_completed"
 	EventToolStarted            SemanticEventType = "tool_started"
 	EventToolCompleted          SemanticEventType = "tool_completed"
+	EventSubAgentStarted        SemanticEventType = "sub_agent_started"
+	EventSubAgentEnded          SemanticEventType = "sub_agent_ended"
 	EventElicitationRequested   SemanticEventType = "elicitation_requested"
 	EventUsageUpdated           SemanticEventType = "usage_updated"
 	EventWorkingSetUpdated      SemanticEventType = "working_set_updated"
@@ -86,6 +88,10 @@ type ToolStartedPayload struct {
 type ToolCompletedPayload struct {
 	ToolID  string `json:"toolId"`
 	Success bool   `json:"success"`
+}
+type SubAgentLifecyclePayload struct {
+	AgentID string `json:"agentId"`
+	Name    string `json:"name,omitempty"`
 }
 type ElicitationRequestedPayload struct {
 	Kind string `json:"kind,omitempty"`
@@ -173,6 +179,7 @@ type SemanticTurnState struct {
 	AssistantText      string
 	AssistantCompleted bool
 	Tools              map[string]SemanticToolState
+	SubAgents          map[string]string
 	ElicitationPending bool
 	Usage              UsageUpdatedPayload
 
@@ -188,7 +195,7 @@ type SemanticTurnState struct {
 }
 
 func NewSemanticTurnState() SemanticTurnState {
-	return SemanticTurnState{Status: SemanticTurnIdle, Tools: map[string]SemanticToolState{}, seenEventIDs: map[string]string{}}
+	return SemanticTurnState{Status: SemanticTurnIdle, Tools: map[string]SemanticToolState{}, SubAgents: map[string]string{}, seenEventIDs: map[string]string{}}
 }
 
 func (s SemanticTurnState) Terminal() bool {
@@ -232,6 +239,10 @@ func cloneSemanticTurnState(state SemanticTurnState) SemanticTurnState {
 	for id, tool := range state.Tools {
 		clone.Tools[id] = tool
 	}
+	clone.SubAgents = make(map[string]string, len(state.SubAgents))
+	for id, name := range state.SubAgents {
+		clone.SubAgents[id] = name
+	}
 	clone.TelemetryFailures = append([]TelemetryFailedPayload(nil), state.TelemetryFailures...)
 	clone.seenEventIDs = make(map[string]string, len(state.seenEventIDs))
 	for id, signature := range state.seenEventIDs {
@@ -251,6 +262,9 @@ func Apply(state SemanticTurnState, event SemanticEvent) (SemanticTurnState, err
 	state = cloneSemanticTurnState(state)
 	if state.Tools == nil {
 		state.Tools = map[string]SemanticToolState{}
+	}
+	if state.SubAgents == nil {
+		state.SubAgents = map[string]string{}
 	}
 	if state.seenEventIDs == nil {
 		state.seenEventIDs = map[string]string{}
@@ -387,6 +401,24 @@ func Apply(state SemanticTurnState, event SemanticEvent) (SemanticTurnState, err
 		}
 		tool.Completed, tool.Success = true, p.Success
 		state.Tools[p.ToolID] = tool
+	case EventSubAgentStarted:
+		p, ok := event.Payload.(SubAgentLifecyclePayload)
+		if !ok || strings.TrimSpace(p.AgentID) == "" {
+			return state, payloadTypeError(event.Type)
+		}
+		if state.Status != SemanticTurnStarted {
+			return state, errors.New("sub-agent start outside active turn")
+		}
+		state.SubAgents[p.AgentID] = p.Name
+	case EventSubAgentEnded:
+		p, ok := event.Payload.(SubAgentLifecyclePayload)
+		if !ok || strings.TrimSpace(p.AgentID) == "" {
+			return state, payloadTypeError(event.Type)
+		}
+		if state.Status != SemanticTurnStarted {
+			return state, errors.New("sub-agent end outside active turn")
+		}
+		delete(state.SubAgents, p.AgentID)
 	case EventElicitationRequested:
 		if state.Status != SemanticTurnStarted {
 			return state, errors.New("elicitation outside active turn")
@@ -453,10 +485,13 @@ func Apply(state SemanticTurnState, event SemanticEvent) (SemanticTurnState, err
 		state.FallbackTransport = p.To
 	case EventTurnCancelled:
 		state.Status = SemanticTurnCancelled
+		state.SubAgents = map[string]string{}
 	case EventTurnFailed:
 		state.Status = SemanticTurnFailed
+		state.SubAgents = map[string]string{}
 	case EventTurnCompleted:
 		state.Status = SemanticTurnCompleted
+		state.SubAgents = map[string]string{}
 	case EventTelemetryFailed:
 		p, ok := event.Payload.(TelemetryFailedPayload)
 		if !ok {

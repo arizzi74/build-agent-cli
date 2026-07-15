@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -404,6 +405,13 @@ var terminalFooterTempStatus struct {
 	seq     uint64
 }
 
+var terminalFooterSubagents = struct {
+	sync.Mutex
+	entries map[string]string
+	order   []string
+	frame   int
+}{entries: make(map[string]string)}
+
 func terminalFooterMetricsForTTY() (terminalFooterMetrics, bool) {
 	if !interactiveTerminalUIEnabled() {
 		return terminalFooterMetrics{}, false
@@ -441,8 +449,7 @@ func activateTerminalFooter(status statusBarState) (terminalFooterMetrics, bool)
 	// and status redraw; otherwise the next assistant output can start at row 1.
 	fmt.Fprintf(os.Stderr, "\x1b[s\x1b[1;%dr", metrics.ScrollBottom)
 	drawTerminalFooterStatusLine(metrics, status)
-	message, code := currentTerminalFooterTempMessage()
-	drawTerminalFooterTempLine(metrics, message, code)
+	drawTerminalFooterSecondaryLine(metrics)
 	fmt.Fprint(os.Stderr, "\x1b[u")
 	lastTerminalFooterMetrics.set = true
 	lastTerminalFooterMetrics.metrics = metrics
@@ -507,6 +514,118 @@ func drawTerminalFooterTempLine(metrics terminalFooterMetrics, message, code str
 	fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K%s", metrics.TempRow, line)
 }
 
+func drawTerminalFooterSecondaryLine(metrics terminalFooterMetrics) {
+	if line := terminalFooterSubagentLine(metrics.Width, true); line != "" {
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H\x1b[2K%s", metrics.TempRow, line)
+		return
+	}
+	message, code := currentTerminalFooterTempMessage()
+	drawTerminalFooterTempLine(metrics, message, code)
+}
+
+func terminalFooterSubagentLine(width int, color bool) string {
+	terminalFooterSubagents.Lock()
+	names := make([]string, 0, len(terminalFooterSubagents.order))
+	for _, id := range terminalFooterSubagents.order {
+		if name := strings.TrimSpace(terminalFooterSubagents.entries[id]); name != "" {
+			names = append(names, name)
+		}
+	}
+	frame := terminalFooterSubagents.frame
+	terminalFooterSubagents.Unlock()
+	if len(names) == 0 {
+		return ""
+	}
+	label := fitStatusBarText(" ✦ sub-agent running: "+strings.Join(names, " · ")+" ", width)
+	if !color {
+		return label
+	}
+	content := strings.TrimRight(label, " ")
+	return animatedStatusText(content, frame) + strings.Repeat(" ", maxInt(width-runeLen(content), 0))
+}
+
+func advanceTerminalFooterSubagentFrame() {
+	terminalFooterSubagents.Lock()
+	if len(terminalFooterSubagents.entries) > 0 {
+		terminalFooterSubagents.frame++
+	}
+	terminalFooterSubagents.Unlock()
+}
+
+func setTerminalFooterSubagent(id, name string) {
+	id, name = strings.TrimSpace(id), strings.TrimSpace(name)
+	if id == "" {
+		id = name
+	}
+	if id == "" || name == "" {
+		return
+	}
+	terminalFooterSubagents.Lock()
+	if _, exists := terminalFooterSubagents.entries[id]; !exists {
+		terminalFooterSubagents.order = append(terminalFooterSubagents.order, id)
+	}
+	terminalFooterSubagents.entries[id] = name
+	if len(terminalFooterSubagents.entries) == 1 {
+		terminalFooterSubagents.frame = 0
+	}
+	terminalFooterSubagents.Unlock()
+	redrawTerminalFooterSecondaryLine()
+}
+
+func clearTerminalFooterSubagent(id, name string) {
+	id, name = strings.TrimSpace(id), strings.TrimSpace(name)
+	terminalFooterSubagents.Lock()
+	if id != "" {
+		delete(terminalFooterSubagents.entries, id)
+	} else if name != "" {
+		for _, candidate := range terminalFooterSubagents.order {
+			if terminalFooterSubagents.entries[candidate] == name {
+				delete(terminalFooterSubagents.entries, candidate)
+				break
+			}
+		}
+	}
+	terminalFooterSubagents.order = compactTerminalFooterSubagentOrder(terminalFooterSubagents.order, terminalFooterSubagents.entries)
+	terminalFooterSubagents.Unlock()
+	redrawTerminalFooterSecondaryLine()
+}
+
+func clearTerminalFooterSubagents() {
+	terminalFooterSubagents.Lock()
+	for id := range terminalFooterSubagents.entries {
+		delete(terminalFooterSubagents.entries, id)
+	}
+	terminalFooterSubagents.order = nil
+	terminalFooterSubagents.frame = 0
+	terminalFooterSubagents.Unlock()
+	redrawTerminalFooterSecondaryLine()
+}
+
+func compactTerminalFooterSubagentOrder(order []string, entries map[string]string) []string {
+	kept := order[:0]
+	for _, id := range order {
+		if _, ok := entries[id]; ok {
+			kept = append(kept, id)
+		}
+	}
+	return kept
+}
+
+func redrawTerminalFooterSecondaryLine() {
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	if terminalPickerActive() {
+		return
+	}
+	metrics, ok := terminalFooterMetricsForTTY()
+	if !ok {
+		return
+	}
+	fmt.Fprint(os.Stderr, "\x1b[s")
+	drawTerminalFooterSecondaryLine(metrics)
+	fmt.Fprint(os.Stderr, "\x1b[u")
+}
+
 func currentTerminalFooterTempMessage() (string, string) {
 	terminalFooterTempStatus.Lock()
 	defer terminalFooterTempStatus.Unlock()
@@ -546,7 +665,7 @@ func showTerminalFooterTempMessageWithStyle(status statusBarState, message strin
 	metrics, ok := activateTerminalFooter(status)
 	if ok {
 		fmt.Fprint(os.Stderr, "\x1b[s")
-		drawTerminalFooterTempLine(metrics, message, code)
+		drawTerminalFooterSecondaryLine(metrics)
 		fmt.Fprint(os.Stderr, "\x1b[u")
 	}
 	terminalRenderMu.Unlock()
@@ -571,7 +690,7 @@ func showTerminalFooterTempMessageWithStyle(status statusBarState, message strin
 				return
 			}
 			fmt.Fprint(os.Stderr, "\x1b[s")
-			drawTerminalFooterTempLine(metrics, "", "")
+			drawTerminalFooterSecondaryLine(metrics)
 			fmt.Fprint(os.Stderr, "\x1b[u")
 		})
 	}
@@ -595,7 +714,7 @@ func clearTerminalFooterTempMessage() {
 		return
 	}
 	fmt.Fprint(os.Stderr, "\x1b[s")
-	drawTerminalFooterTempLine(metrics, "", "")
+	drawTerminalFooterSecondaryLine(metrics)
 	fmt.Fprint(os.Stderr, "\x1b[u")
 }
 
@@ -686,6 +805,7 @@ func drawTerminalFooterWorkingLine(text string, status statusBarState) bool {
 	}
 	terminalRenderMu.Lock()
 	defer terminalRenderMu.Unlock()
+	advanceTerminalFooterSubagentFrame()
 	metrics, ok := activateTerminalFooter(status)
 	if !ok {
 		return false
@@ -739,6 +859,7 @@ type statusBarState struct {
 	OutputTokens  int64
 	Workspace     string
 	App           string
+	Project       string
 	Instance      string
 }
 
@@ -759,7 +880,11 @@ func formatStatusBar(state statusBarState, color bool, width int) string {
 	if app == "" {
 		app = "<none>"
 	}
-	text := fmt.Sprintf(" model=%s  input_messages=%d  workspace=%s  app=%s  instance=%s ", model, state.InputMessages, workspace, app, instance)
+	project := compactStatusProjectPath(state.Project)
+	if project == "" {
+		project = "<none>"
+	}
+	text := fmt.Sprintf(" model=%s  input_messages=%d  workspace=%s  app=%s  project=%s  instance=%s ", model, state.InputMessages, workspace, app, project, instance)
 	if !color {
 		return strings.TrimSpace(text)
 	}
@@ -771,10 +896,33 @@ func formatStatusBar(state statusBarState, color bool, width int) string {
 		{"  input_messages=", ansiDim}, {fmt.Sprintf("%d", state.InputMessages), ansiYellow + ansiBold},
 		{"  workspace=", ansiDim}, {workspace, ansiBlue + ansiBold},
 		{"  app=", ansiDim}, {app, ansiMagenta + ansiBold},
+		{"  project=", ansiDim}, {project, ansiCyan + ansiBold},
 		{"  instance=", ansiDim}, {instance, ansiGreen + ansiBold},
 		{" ", ""},
 	}
 	return colorStatusSegments(segments, width)
+}
+
+func compactStatusProjectPath(raw string) string {
+	path := strings.TrimSpace(raw)
+	if path == "" {
+		return ""
+	}
+	path = filepath.Clean(path)
+	if home, err := os.UserHomeDir(); err == nil {
+		home = filepath.Clean(home)
+		if path == home {
+			path = "~"
+		} else if rel, err := filepath.Rel(home, path); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			path = filepath.Join("~", rel)
+		}
+	}
+	const maxProjectRunes = 40
+	runes := []rune(path)
+	if len(runes) <= maxProjectRunes {
+		return path
+	}
+	return "…" + string(runes[len(runes)-(maxProjectRunes-1):])
 }
 
 type statusBarSegment struct {
@@ -833,11 +981,11 @@ func fitStatusBarText(text string, width int) string {
 }
 
 func workingStatusText(color bool) string {
-	return style("Building...", ansiWasabiGreen, color)
+	return style("Working...", ansiWasabiGreen, color)
 }
 
 func animatedWorkingStatus(frame int) string {
-	return animatedBuildingStatus(frame)
+	return animatedStatusText("Working...", frame)
 }
 
 func animatedBuildingStatus(frame int) string {
@@ -911,10 +1059,27 @@ func animatedConnectingLogo(frame int) string {
 
 func connectingScreenFrame(details string, frame int) string {
 	details = strings.TrimRight(details, "\n")
+	status := animatedConnectingStatus(frame) + "  " + connectingCancelHint()
 	if details == "" {
-		return animatedConnectingLogo(frame) + "\n\n" + animatedConnectingStatus(frame)
+		return animatedConnectingLogo(frame) + "\n\n" + status
 	}
-	return animatedConnectingLogo(frame) + "\n\n" + details + "\n\n" + animatedConnectingStatus(frame)
+	return animatedConnectingLogo(frame) + "\n\n" + details + "\n\n" + status
+}
+
+func connectingCancelHint() string {
+	return style("Esc cancel", ansiDim, terminalStatusANSIEnabled())
+}
+
+// terminalCRLF converts a logical terminal frame to the physical line endings
+// required while stdin is raw. term.MakeRaw disables OPOST, so bare LF no
+// longer implies carriage return and each redraw would otherwise drift right.
+func terminalCRLF(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	return strings.ReplaceAll(text, "\n", "\r\n")
+}
+
+func connectingScreenTerminalFrame(details string, frame int) string {
+	return terminalCRLF(connectingScreenFrame(details, frame))
 }
 
 func startTerminalConnectingStatus(details string) func() {
@@ -931,7 +1096,7 @@ func startTerminalConnectingStatus(details string) func() {
 		frame := 0
 		for {
 			terminalRenderMu.Lock()
-			fmt.Fprintf(os.Stderr, "\x1b[H\x1b[2J%s", connectingScreenFrame(details, frame))
+			fmt.Fprintf(os.Stderr, "\x1b[H\x1b[2J%s", connectingScreenTerminalFrame(details, frame))
 			terminalRenderMu.Unlock()
 			frame++
 			select {

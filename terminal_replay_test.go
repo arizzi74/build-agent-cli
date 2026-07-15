@@ -94,6 +94,17 @@ func TestTerminalTranscriptRowsFormatsToolResults(t *testing.T) {
 	}
 }
 
+func TestTerminalTranscriptRowsFormatsRuntimeErrorsInRed(t *testing.T) {
+	plain := terminalFormatTranscriptEntry(terminalTranscriptEntry{Role: "error", Title: "Error", Text: "server disconnected"}, false, 80)
+	if plain != "Error\nserver disconnected" {
+		t.Fatalf("plain runtime error = %q", plain)
+	}
+	colored := terminalFormatTranscriptEntry(terminalTranscriptEntry{Role: "error", Title: "Error", Text: "server disconnected"}, true, 80)
+	if !strings.Contains(colored, ansiRed+ansiBold+"Error") || !strings.Contains(colored, ansiRed+"server disconnected") {
+		t.Fatalf("runtime error should be red: %q", colored)
+	}
+}
+
 func TestColoredToolResultDescriptionUsesTableTextColorNotSuccessColor(t *testing.T) {
 	formatted := formatToolResultTerminal("fs_write_file\nSuccessfully wrote file", true, true)
 	if !strings.Contains(formatted, ansiWasabiGreen+"✓ fs_write_file") {
@@ -101,6 +112,13 @@ func TestColoredToolResultDescriptionUsesTableTextColorNotSuccessColor(t *testin
 	}
 	if !strings.Contains(formatted, "\n"+ansiGrayFG+"  Successfully wrote file") {
 		t.Fatalf("description should be on next row in table-text color: %q", formatted)
+	}
+}
+
+func TestToolWarningUsesYellowMarkerAndExactMessage(t *testing.T) {
+	formatted := formatToolWarningTerminal("instance_skills_list\nnot supported by instance zaiagents", true)
+	if !strings.Contains(formatted, ansiYellow+ansiBold+"⚠ instance_skills_list") || !strings.Contains(formatted, "\n"+ansiYellow+"  not supported by instance zaiagents") {
+		t.Fatalf("warning should be yellow with its semantic message: %q", formatted)
 	}
 }
 

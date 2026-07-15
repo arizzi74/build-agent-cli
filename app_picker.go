@@ -60,6 +60,7 @@ func (c *Client) UseAppChoice(ctx context.Context, choice AppChoice) error {
 	_ = c.ensureActiveAppMetadata(ctx)
 	slashCommandPrintf("app set: %s\n", choice.App.ScopeID)
 	printApp(c.currentApp)
+	c.postAppSelectionStatus(ctx)
 	return nil
 }
 

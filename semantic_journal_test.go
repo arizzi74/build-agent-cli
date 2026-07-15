@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,6 +50,30 @@ func TestSemanticJournalAppendReplayAndPermissions(t *testing.T) {
 	}
 	if recovered.LastSequence != 5 || recovered.Workspace.ConversationID != "conv-1" || recovered.Workspace.UsageInputTokens != 3 || recovered.IncompleteTurn {
 		t.Fatalf("unexpected recovery: %#v", recovered)
+	}
+}
+
+func TestSemanticJournalReplaysSubAgentLifecycle(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	profile, workspace := "default", "default"
+	for _, event := range []SemanticEvent{
+		journalEvent("1", EventTurnAccepted, TurnAcceptedPayload{Context: TurnContext{Workspace: workspace, ConversationID: "conv-1"}}),
+		journalEvent("2", EventTurnStarted, nil),
+		journalEvent("3", EventSubAgentStarted, SubAgentLifecyclePayload{AgentID: "worker-1", Name: "Create Workspace"}),
+		journalEvent("4", EventSubAgentEnded, SubAgentLifecyclePayload{AgentID: "worker-1", Name: "Create Workspace"}),
+		journalEvent("5", EventAssistantCompleted, AssistantCompletedPayload{}),
+		journalEvent("6", EventTurnCompleted, TurnCompletedPayload{}),
+	} {
+		if _, err := appendSemanticJournalEvent(profile, workspace, "conv-1", event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recovered, err := recoverWorkspaceFromJournal(profile, workspace, newWorkspaceState(workspace), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.LastSequence != 6 || recovered.IncompleteTurn {
+		t.Fatalf("unexpected lifecycle recovery: %#v", recovered)
 	}
 }
 
@@ -270,6 +295,131 @@ func TestSemanticJournalRecoverySkipsCheckpointedMidTurnAndRequiresNewBoundary(t
 	snapshot.SemanticJournalSequence = 50
 	if _, err := recoverWorkspaceFromJournal(profile, workspace, snapshot, true); err == nil || !strings.Contains(err.Error(), "safe lifecycle boundary") {
 		t.Fatalf("mid-turn post-checkpoint error = %v", err)
+	}
+}
+
+func TestSemanticJournalAutoQuarantinesProvablyStaleConversation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	profile, workspace := "zaiagents", "Default - admin"
+	stale := []SemanticJournalEnvelope{
+		journalEnvelope(workspace, "old-conversation", 1, EventRetryAttempted, RetryPayload{Operation: "connect", Attempt: 1}),
+		journalEnvelope(workspace, "old-conversation", 2, EventRetryAttempted, RetryPayload{Operation: "connect", Attempt: 2}),
+	}
+	writeJournalFixture(t, semanticJournalFile(profile, workspace), stale)
+	snapshot := newWorkspaceState(workspace)
+	snapshot.ConversationID = "current-conversation"
+	snapshot.SemanticJournalSequence = 1
+	_, recoveryErr := recoverWorkspaceFromJournal(profile, workspace, snapshot, true)
+	if recoveryErr == nil {
+		t.Fatal("stale mid-turn journal unexpectedly recovered")
+	}
+	recovered, quarantinePath, ok, err := autoRecoverStaleSemanticJournal(profile, workspace, snapshot, true, recoveryErr)
+	if err != nil || !ok {
+		t.Fatalf("automatic recovery = %#v, path=%q, ok=%v, err=%v", recovered, quarantinePath, ok, err)
+	}
+	if recovered.Workspace.ConversationID != snapshot.ConversationID || recovered.Workspace.SemanticJournalSequence != 0 || recovered.LastSequence != 0 {
+		t.Fatalf("automatic recovery changed snapshot state: %#v", recovered)
+	}
+	if _, err := os.Stat(semanticJournalFile(profile, workspace)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("live journal still present after quarantine: %v", err)
+	}
+	quarantined := filepath.Join(quarantinePath, filepath.Base(semanticJournalFile(profile, workspace)))
+	entries, err := readSemanticJournal(quarantined)
+	if err != nil || len(entries) != len(stale) {
+		t.Fatalf("quarantined journal entries=%d err=%v", len(entries), err)
+	}
+	info, err := os.Stat(quarantinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("quarantine permissions=%v", info.Mode().Perm())
+	}
+}
+
+func TestSemanticJournalAutoRecoveryRejectsAmbiguousSameConversation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	profile, workspace := "default", "default"
+	writeJournalFixture(t, semanticJournalFile(profile, workspace), []SemanticJournalEnvelope{
+		journalEnvelope(workspace, "current", 1, EventRetryAttempted, RetryPayload{Operation: "connect", Attempt: 1}),
+		journalEnvelope(workspace, "current", 2, EventRetryAttempted, RetryPayload{Operation: "connect", Attempt: 2}),
+	})
+	snapshot := newWorkspaceState(workspace)
+	snapshot.ConversationID = "current"
+	snapshot.SemanticJournalSequence = 1
+	_, recoveryErr := recoverWorkspaceFromJournal(profile, workspace, snapshot, true)
+	if recoveryErr == nil {
+		t.Fatal("same-conversation mid-turn journal unexpectedly recovered")
+	}
+	_, _, ok, err := autoRecoverStaleSemanticJournal(profile, workspace, snapshot, true, recoveryErr)
+	if err == nil || ok || !strings.Contains(err.Error(), "safe lifecycle boundary") {
+		t.Fatalf("ambiguous automatic recovery ok=%v err=%v", ok, err)
+	}
+	if _, err := os.Stat(semanticJournalFile(profile, workspace)); err != nil {
+		t.Fatalf("ambiguous journal was moved: %v", err)
+	}
+}
+
+func TestLoadInitialStateAutomaticallyRecoversAndPersistsResetCheckpoint(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	profile, workspace := "zaiagents", "Default - admin"
+	if err := saveActiveWorkspaceName(profile, workspace); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := newWorkspaceState(workspace)
+	snapshot.ConversationID = "current-conversation"
+	snapshot.SemanticJournalSequence = 1
+	if err := saveWorkspace(profile, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	writeJournalFixture(t, semanticJournalFile(profile, workspace), []SemanticJournalEnvelope{
+		journalEnvelope(workspace, "old-conversation", 1, EventRetryAttempted, RetryPayload{Operation: "connect", Attempt: 1}),
+		journalEnvelope(workspace, "old-conversation", 2, EventRetryAttempted, RetryPayload{Operation: "connect", Attempt: 2}),
+	})
+	c := &Client{opts: Options{Profile: profile}}
+	if err := c.loadInitialState(); err != nil {
+		t.Fatal(err)
+	}
+	if c.workspaceName != workspace || c.conversationID != snapshot.ConversationID || c.semanticJournalSequence != 0 {
+		t.Fatalf("loaded client workspace=%q conversation=%q checkpoint=%d", c.workspaceName, c.conversationID, c.semanticJournalSequence)
+	}
+	saved, ok := loadWorkspace(profile, workspace)
+	if !ok || saved.SemanticJournalSequence != 0 || saved.ConversationID != snapshot.ConversationID {
+		t.Fatalf("saved recovered snapshot ok=%v state=%#v", ok, saved)
+	}
+	quarantines, err := filepath.Glob(filepath.Join(semanticJournalQuarantineDir(profile), workspace+"-*"))
+	if err != nil || len(quarantines) != 1 {
+		t.Fatalf("quarantines=%v err=%v", quarantines, err)
+	}
+}
+
+func TestSemanticJournalSkipsWholeTurnWhenAcceptedBoundaryWasNotPersisted(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c := &Client{
+		opts:                Options{Profile: "default", Nirvana: true},
+		semanticState:       NewSemanticTurnState(),
+		semanticLifecycleID: "lifecycle",
+	}
+	// The turn begins before workspace selection is available, so its accepted
+	// boundary cannot be journaled. Later events from that turn must also stay
+	// out of the journal.
+	c.beginSemanticTurnSnapshot(TurnRuntimeSnapshot{Profile: "default", Transport: "nirvana_websocket"})
+	c.workspaceName = "default"
+	c.conversationID = "conv"
+	c.emitSemanticEvent(EventTurnStarted, "turn-1", nil)
+	c.emitRetryAttempted("connect", 1, "temporary")
+	if _, err := os.Stat(semanticJournalFile("default", "default")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mid-turn journal was created without accepted boundary: %v", err)
+	}
+	// The next turn starts with a selected workspace and therefore establishes
+	// a fresh replay-safe journal boundary.
+	c.beginSemanticTurnSnapshot(TurnRuntimeSnapshot{
+		Profile: "default", Transport: "nirvana_websocket", ConversationID: "conv",
+		Workspace: TurnWorkspaceSnapshot{Name: "default"},
+	})
+	entries, err := readSemanticJournal(semanticJournalFile("default", "default"))
+	if err != nil || len(entries) != 1 || entries[0].Event.Type != EventTurnAccepted {
+		t.Fatalf("fresh turn journal=%#v err=%v", entries, err)
 	}
 }
 

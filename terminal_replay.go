@@ -65,6 +65,13 @@ func terminalRecordSystemTextAndAppend(title, text string, status statusBarState
 	return terminalRecordEntryAndAppend(terminalTranscriptEntry{Role: "system", Title: title, Text: text}, status)
 }
 
+// terminalRecordRuntimeErrorAndAppend keeps application diagnostics inside the
+// managed transcript while the interactive footer owns stderr. Renderer escape
+// sequences intentionally continue to write directly to stderr.
+func terminalRecordRuntimeErrorAndAppend(text string, status statusBarState) bool {
+	return terminalRecordEntryAndAppend(terminalTranscriptEntry{Role: "error", Title: "Error", Text: text}, status)
+}
+
 func terminalRecordToolResult(name string, success bool) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -87,6 +94,14 @@ func terminalRecordToolResultAndAppend(name string, success bool, status statusB
 		role = "tool_success"
 	}
 	return terminalRecordEntryAndAppend(terminalTranscriptEntry{Role: role, Text: name}, status)
+}
+
+func terminalRecordToolWarningAndAppend(name string, status statusBarState) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "tool"
+	}
+	return terminalRecordEntryAndAppend(terminalTranscriptEntry{Role: "tool_warning", Text: name}, status)
 }
 
 func terminalRecordConversationHistory(title string, history []interface{}) {
@@ -307,10 +322,18 @@ func terminalFormatTranscriptEntry(entry terminalTranscriptEntry, color bool, wi
 			title = "System"
 		}
 		return style(title, ansiBold, color) + "\n" + strings.TrimRight(formatAssistantResponseTerminal(entry.Text, color, width), "\n")
+	case "error":
+		title := entry.Title
+		if title == "" {
+			title = "Error"
+		}
+		return style(title, ansiRed+ansiBold, color) + "\n" + style(strings.TrimSpace(entry.Text), ansiRed, color)
 	case "tool_success":
 		return formatToolResultTerminal(entry.Text, true, color)
 	case "tool_error":
 		return formatToolResultTerminal(entry.Text, false, color)
+	case "tool_warning":
+		return formatToolWarningTerminal(entry.Text, color)
 	default:
 		return strings.TrimSpace(entry.Text)
 	}
@@ -339,6 +362,27 @@ func formatToolResultTerminal(name string, success bool, color bool) string {
 			continue
 		}
 		out += "\n" + style("  "+line, ansiGrayFG, color)
+	}
+	return out
+}
+
+func formatToolWarningTerminal(name string, color bool) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "tool"
+	}
+	lines := strings.Split(name, "\n")
+	toolName := strings.TrimSpace(lines[0])
+	if toolName == "" {
+		toolName = "tool"
+	}
+	out := style("⚠ "+toolName, ansiYellow+ansiBold, color)
+	for _, line := range lines[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		out += "\n" + style("  "+line, ansiYellow, color)
 	}
 	return out
 }

@@ -276,3 +276,21 @@ func TestSlashCommandOutputCapturePolicy(t *testing.T) {
 		t.Fatal("/conversation list opens terminal UI in TTY and should not be captured")
 	}
 }
+
+func TestAppUseRunsOnePostSelectionStatusCheck(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c, err := NewClient(CLIConfig{InstanceURL: "https://example.service-now.com"}, Options{Profile: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := 0
+	c.postSelectionStatus = func(context.Context) error { checks++; return nil }
+	if _, err := withSlashCommandOutput(&strings.Builder{}, func() (bool, error) {
+		return handleSlashCommand(context.Background(), c, "/app use app-id Demo")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if checks != 1 {
+		t.Fatalf("post-selection status checks = %d, want 1", checks)
+	}
+}

@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	posixpath "path"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 func (c *Client) withGliderFSTimeout(fn func(context.Context) (map[string]interface{}, string)) (map[string]interface{}, string) {
@@ -115,6 +118,60 @@ func (c *Client) answerGliderFSCreateDirectory(ctx context.Context, payload map[
 	return map[string]interface{}{"message": fmt.Sprintf("Successfully created directory %s", payloadPath(payload)), "path": payloadPath(payload), "uri": uri, "ideContext": c.currentIDEContext()}, "complete"
 }
 
+// answerGliderFSDelete removes a file or a directory subtree from the active
+// Glider VFS. It never touches the local persistent checkout.
+func (c *Client) answerGliderFSDelete(ctx context.Context, payload map[string]interface{}) (map[string]interface{}, string) {
+	filePath := payloadPath(payload)
+	if strings.HasSuffix(strings.ToLower(filePath), ".xml") {
+		return map[string]interface{}{"error": "Operations on XML files are not allowed", "code": "XML_BLOCKED"}, "error"
+	}
+	uri, rel, err := c.resolveGliderPath(filePath)
+	if err != nil {
+		return fsToolError(err), "error"
+	}
+	if rel == "" {
+		return fsToolError(errors.New("cannot delete app root")), "error"
+	}
+	entries, err := c.fetchGliderState(ctx, c.activeAppRootURI())
+	if err != nil {
+		return fsToolError(err), "error"
+	}
+	prefix := strings.TrimRight(uri, "/") + "/"
+	remove := make([]gliderChangeEntry, 0)
+	for _, entry := range entries {
+		if strings.EqualFold(entry.URI, uri) || strings.HasPrefix(entry.URI, prefix) {
+			if strings.HasSuffix(strings.ToLower(entry.URI), ".xml") {
+				return map[string]interface{}{"error": "Operations on XML files are not allowed", "code": "XML_BLOCKED"}, "error"
+			}
+			remove = append(remove, entry)
+		}
+	}
+	if len(remove) == 0 {
+		// Deletion is deliberately idempotent: remote absence is the requested
+		// postcondition and no mutation request is necessary.
+		return map[string]interface{}{"message": fmt.Sprintf("Path already absent: %s", filePath), "path": filePath, "uri": uri, "deleted": false, "ideContext": c.currentIDEContext()}, "complete"
+	}
+	sort.Slice(remove, func(i, j int) bool {
+		// Children must precede their parent directories; make equal-depth order
+		// stable and deterministic for reproducible multipart payloads.
+		di, dj := strings.Count(strings.Trim(remove[i].URI, "/"), "/"), strings.Count(strings.Trim(remove[j].URI, "/"), "/")
+		if di != dj {
+			return di > dj
+		}
+		return remove[i].URI < remove[j].URI
+	})
+	if err := c.applyGliderChanges(ctx, nil, nil, remove, nil); err != nil {
+		if c.gliderPathAbsent(ctx, uri) {
+			return map[string]interface{}{
+				"message": fmt.Sprintf("Successfully deleted: %s", rel), "path": filePath, "uri": uri, "deleted": true,
+				"warning": "Glider sync returned an error after deleting the path; verified remote path is absent.", "syncError": err.Error(), "ideContext": c.currentIDEContext(),
+			}, "complete"
+		}
+		return fsToolError(err), "error"
+	}
+	return map[string]interface{}{"message": fmt.Sprintf("Successfully deleted: %s", rel), "path": filePath, "uri": uri, "deleted": true, "removed": len(remove), "ideContext": c.currentIDEContext()}, "complete"
+}
+
 func (c *Client) answerGliderFSTree(ctx context.Context, payload map[string]interface{}) (map[string]interface{}, string) {
 	uri, rel, err := c.resolveGliderPath(payloadPath(payload))
 	if err != nil {
@@ -177,6 +234,223 @@ func (c *Client) answerGliderFSGlob(ctx context.Context, payload map[string]inte
 	}
 	sort.Strings(matches)
 	return map[string]interface{}{"matches": matches, "files": matches, "ideContext": c.currentIDEContext()}, "complete"
+}
+
+const (
+	fsGrepMaxFiles     = 200
+	fsGrepMaxMatches   = 1000
+	fsGrepMaxFileBytes = 1 << 20
+	fsGrepMaxLineBytes = 4096
+	fsGrepFetchBatch   = 20
+)
+
+// answerGliderFSGrep searches the selected app directory without modifying it.
+// Match locations are one-based; column is counted in UTF-8 characters.
+func (c *Client) answerGliderFSGrep(ctx context.Context, payload map[string]interface{}) (map[string]interface{}, string) {
+	pattern := firstString(payload, "pattern", "query", "search_string")
+	if pattern == "" {
+		return fsToolError(errors.New("fs_grep requires pattern")), "error"
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return fsToolError(fmt.Errorf("invalid fs_grep regex %q: %w", pattern, err)), "error"
+	}
+
+	rootURI, _, err := c.resolveGliderPath(payloadPath(payload))
+	if err != nil {
+		return fsToolError(err), "error"
+	}
+	glob := strings.TrimSpace(firstString(payload, "glob"))
+	if glob == "" {
+		glob = "**/*"
+	}
+	globRE, err := compileGliderGlob(glob)
+	if err != nil {
+		return fsToolError(fmt.Errorf("invalid fs_grep glob %q: %w", glob, err)), "error"
+	}
+	if err := ctx.Err(); err != nil {
+		return fsToolError(err), "error"
+	}
+	entries, err := c.fetchGliderState(ctx, rootURI)
+	if err != nil {
+		return fsToolError(err), "error"
+	}
+
+	type candidate struct{ uri, rel, scopedRel string }
+	candidates := make([]candidate, 0)
+	prefix := strings.TrimRight(rootURI, "/") + "/"
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return fsToolError(err), "error"
+		}
+		if entry.Type != "file" || entry.Size > fsGrepMaxFileBytes || !searchableGliderFile(entry.URI) {
+			continue
+		}
+		if !strings.HasPrefix(entry.URI, prefix) {
+			continue
+		}
+		rel := c.relFromGliderURI(entry.URI)
+		scopedRel := strings.TrimPrefix(entry.URI, prefix)
+		if globRE.MatchString(rel) || globRE.MatchString(scopedRel) {
+			candidates = append(candidates, candidate{uri: entry.URI, rel: rel, scopedRel: scopedRel})
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].rel < candidates[j].rel })
+	if len(candidates) > fsGrepMaxFiles {
+		candidates = candidates[:fsGrepMaxFiles]
+	}
+
+	matches := make([]map[string]interface{}, 0)
+	fileSet := make(map[string]struct{})
+	for start := 0; start < len(candidates) && len(matches) < fsGrepMaxMatches; start += fsGrepFetchBatch {
+		if err := ctx.Err(); err != nil {
+			return fsToolError(err), "error"
+		}
+		end := start + fsGrepFetchBatch
+		if end > len(candidates) {
+			end = len(candidates)
+		}
+		uris := make([]string, 0, end-start)
+		for _, candidate := range candidates[start:end] {
+			uris = append(uris, candidate.uri)
+		}
+		contents, err := c.fetchV2SyncFiles(ctx, uris)
+		if err != nil {
+			return fsToolError(err), "error"
+		}
+		for _, candidate := range candidates[start:end] {
+			if err := ctx.Err(); err != nil {
+				return fsToolError(err), "error"
+			}
+			content, ok := contents[candidate.uri]
+			if !ok || len(content) > fsGrepMaxFileBytes || !gliderSearchableText(content) {
+				continue
+			}
+			for _, index := range re.FindAllIndex(content, -1) {
+				if len(matches) == fsGrepMaxMatches {
+					break
+				}
+				line, column, text := gliderGrepLocation(content, index[0])
+				matches = append(matches, map[string]interface{}{"file": candidate.rel, "line": line, "column": column, "text": text})
+				fileSet[candidate.rel] = struct{}{}
+			}
+		}
+	}
+	files := make([]string, 0, len(fileSet))
+	for file := range fileSet {
+		files = append(files, file)
+	}
+	sort.Strings(files)
+	return map[string]interface{}{"matches": matches, "files": files, "ideContext": c.currentIDEContext()}, "complete"
+}
+
+// compileGliderGlob supports path-segment globs and **, where ** matches zero
+// or more directories (so **/*.ts also matches a.ts at the search root).
+func compileGliderGlob(glob string) (*regexp.Regexp, error) {
+	glob = strings.TrimSpace(strings.ReplaceAll(glob, "\\", "/"))
+	if glob == "" {
+		return nil, errors.New("glob cannot be empty")
+	}
+	var b strings.Builder
+	b.WriteString("^")
+	for i := 0; i < len(glob); {
+		switch glob[i] {
+		case '*':
+			if i+1 < len(glob) && glob[i+1] == '*' {
+				i += 2
+				if i < len(glob) && glob[i] == '/' {
+					b.WriteString("(?:.*/)?")
+					i++
+				} else {
+					b.WriteString(".*")
+				}
+				continue
+			}
+			b.WriteString("[^/]*")
+		case '?':
+			b.WriteString("[^/]")
+		case '[':
+			end := i + 1
+			if end < len(glob) && (glob[end] == '!' || glob[end] == '^') {
+				end++
+			}
+			if end < len(glob) && glob[end] == ']' {
+				end++
+			}
+			for end < len(glob) && glob[end] != ']' {
+				end++
+			}
+			if end == len(glob) {
+				return nil, errors.New("unterminated character class")
+			}
+			class := glob[i+1 : end]
+			if strings.HasPrefix(class, "!") {
+				class = "^" + class[1:]
+			}
+			b.WriteByte('[')
+			b.WriteString(class)
+			b.WriteByte(']')
+			i = end
+		default:
+			b.WriteString(regexp.QuoteMeta(string(glob[i])))
+		}
+		i++
+	}
+	b.WriteString("$")
+	return regexp.Compile(b.String())
+}
+
+func gliderSearchableText(content []byte) bool {
+	return !bytes.Contains(content, []byte{0}) && utf8.Valid(content)
+}
+
+func gliderGrepLocation(content []byte, offset int) (line, column int, text string) {
+	if offset < 0 {
+		offset = 0
+	}
+	before := content[:offset]
+	line = bytes.Count(before, []byte{'\n'}) + 1
+	lineStart := bytes.LastIndexByte(before, '\n') + 1
+	lineEnd := bytes.IndexByte(content[offset:], '\n')
+	if lineEnd < 0 {
+		lineEnd = len(content)
+	} else {
+		lineEnd += offset
+	}
+	lineBytes := content[lineStart:lineEnd]
+	column = utf8.RuneCount(lineBytes[:offset-lineStart]) + 1
+	text = string(lineBytes)
+	if len(text) > fsGrepMaxLineBytes {
+		budget := fsGrepMaxLineBytes - len("…")
+		if offset-lineStart >= budget {
+			text = "…" + string(gliderGrepUTF8Tail(lineBytes, budget))
+		} else {
+			text = string(gliderGrepUTF8Prefix(lineBytes, budget)) + "…"
+		}
+	}
+	return line, column, text
+}
+
+func gliderGrepUTF8Prefix(b []byte, max int) []byte {
+	if len(b) <= max {
+		return b
+	}
+	end := max
+	for end > 0 && b[end]&0xc0 == 0x80 {
+		end--
+	}
+	return b[:end]
+}
+
+func gliderGrepUTF8Tail(b []byte, max int) []byte {
+	if len(b) <= max {
+		return b
+	}
+	start := len(b) - max
+	for start < len(b) && b[start]&0xc0 == 0x80 {
+		start++
+	}
+	return b[start:]
 }
 
 func (c *Client) answerGliderLocalSearch(ctx context.Context, payload map[string]interface{}) (map[string]interface{}, string) {
@@ -541,6 +815,20 @@ func (c *Client) gliderDirectoryExists(ctx context.Context, uri string) bool {
 		}
 	}
 	return false
+}
+
+func (c *Client) gliderPathAbsent(ctx context.Context, uri string) bool {
+	entries, err := c.fetchGliderState(ctx, c.activeAppRootURI())
+	if err != nil {
+		return false
+	}
+	prefix := strings.TrimRight(uri, "/") + "/"
+	for _, entry := range entries {
+		if strings.EqualFold(entry.URI, uri) || strings.HasPrefix(entry.URI, prefix) {
+			return false
+		}
+	}
+	return true
 }
 
 func payloadPath(payload map[string]interface{}) string {

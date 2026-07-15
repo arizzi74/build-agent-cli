@@ -30,6 +30,43 @@ func TestParseFlagsDefaultsToNirvana(t *testing.T) {
 	}
 }
 
+func TestParseFlagsProjectRoot(t *testing.T) {
+	opts := parseFlagsForTest(t, "--project-root", "~/Projects/ServiceNow")
+	if opts.ProjectRoot != "~/Projects/ServiceNow" {
+		t.Fatalf("ProjectRoot = %q", opts.ProjectRoot)
+	}
+}
+
+func TestVersionFlagAliases(t *testing.T) {
+	for _, arg := range []string{"-version", "--version"} {
+		if !versionFlagRequested([]string{arg}) {
+			t.Fatalf("versionFlagRequested(%q) = false", arg)
+		}
+		opts := parseFlagsForTest(t, arg)
+		if !opts.Version {
+			t.Fatalf("parseFlags(%q) did not set Version", arg)
+		}
+	}
+	for _, args := range [][]string{{}, {"--profile", "version"}, {"--version=false"}} {
+		if versionFlagRequested(args) {
+			t.Fatalf("versionFlagRequested(%v) = true", args)
+		}
+	}
+}
+
+func TestConnectingCancelRequested(t *testing.T) {
+	for _, input := range [][]byte{{27}, {3}, {'x', 27}, {27, '[', 'A'}} {
+		if !connectingCancelRequested(input) {
+			t.Fatalf("connectingCancelRequested(%v) = false", input)
+		}
+	}
+	for _, input := range [][]byte{nil, {}, {'x'}, {'\r'}, {'[', 'A'}} {
+		if connectingCancelRequested(input) {
+			t.Fatalf("connectingCancelRequested(%v) = true", input)
+		}
+	}
+}
+
 func TestParseFlagsWebGatewayDisablesNirvana(t *testing.T) {
 	opts := parseFlagsForTest(t, "--web-gateway")
 	if opts.Nirvana {
@@ -99,12 +136,12 @@ func TestStartupConnectionDetailsPreservePreviousMessages(t *testing.T) {
 	}
 }
 
-func TestStartupReadyFooterMessageIsCompactAndInstanceFree(t *testing.T) {
+func TestStartupReadyFooterMessageIsCompactAndInstanceURLFree(t *testing.T) {
 	message := startupReadyFooterMessage()
-	if strings.Contains(message, "service-now.com") || strings.Contains(message, "https://") || strings.Contains(message, "instance") {
-		t.Fatalf("startup footer message should omit instance details: %q", message)
+	if strings.Contains(message, "service-now.com") || strings.Contains(message, "https://") {
+		t.Fatalf("startup footer message should omit instance URL details: %q", message)
 	}
-	for _, want := range []string{"Connected", "/help", "/conversation", "/mcp", "/workspace", "/app", "/exit", "/quit"} {
+	for _, want := range []string{"Connected", "/help", "/instance", "/conversation", "/mcp", "/workspace", "/app", "/exit", "/quit"} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("startup footer message missing %q: %q", want, message)
 		}

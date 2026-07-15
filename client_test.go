@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -51,6 +52,37 @@ func TestNirvanaCapabilitiesMatchStreamingWebClient(t *testing.T) {
 	}
 }
 
+func TestDialWebSocketCancelableInterruptsUpgradeHandshake(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := dialWebSocketCancelable(ctx, websocket.Dialer{HandshakeTimeout: 30 * time.Second}, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("websocket handshake did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled websocket dial error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled websocket handshake did not return promptly")
+	}
+}
+
 func TestNirvanaCapabilitiesExcludeUnobservedExtensionOnlyKeys(t *testing.T) {
 	caps := (&Client{opts: Options{Nirvana: true}}).clientCapabilities()
 	for _, key := range []string{"change_log", "working_set", "app_picker", "atf_with_app", "memfs"} {
@@ -66,7 +98,7 @@ func TestGatewayStreamUpdateKeepsWorkingStatusActive(t *testing.T) {
 		c.printGatewayStreamUpdate("hello")
 	})
 	if !c.turnStatusActive {
-		t.Fatalf("stream update should keep Building status active until turn_end")
+		t.Fatalf("stream update should keep Working status active until turn_end")
 	}
 	if out != "hello" {
 		t.Fatalf("stdout = %q, want streamed chunk", out)
@@ -76,18 +108,18 @@ func TestGatewayStreamUpdateKeepsWorkingStatusActive(t *testing.T) {
 func TestElicitationResponseRequestsWorkingStatusDuringActiveTurn(t *testing.T) {
 	c := &Client{processing: true, turnDone: make(chan error, 1), turnStatusActive: true}
 	if !c.clearTurnStatus() {
-		t.Fatalf("clearTurnStatus should report that Building was active")
+		t.Fatalf("clearTurnStatus should report that Working was active")
 	}
 	if c.turnStatusActive {
-		t.Fatalf("clearTurnStatus should mark Building inactive while a blocking prompt owns the terminal")
+		t.Fatalf("clearTurnStatus should mark Working inactive while a blocking prompt owns the terminal")
 	}
 	if !c.ensureTurnStatusVisible() {
-		t.Fatalf("elicitation response should request Building redraw while the turn is still processing")
+		t.Fatalf("elicitation response should request Working redraw while the turn is still processing")
 	}
 
 	c.processing = false
 	if c.ensureTurnStatusVisible() {
-		t.Fatalf("Building redraw must not be requested after the turn is no longer processing")
+		t.Fatalf("Working redraw must not be requested after the turn is no longer processing")
 	}
 }
 
@@ -267,6 +299,39 @@ func TestStatusBarStateCountsInputsAndCumulativeUsage(t *testing.T) {
 	state := c.statusBarState()
 	if state.Model != "claude-opus-4-6" || state.InputMessages != 2 || state.InputTokens != 4010 || state.OutputTokens != 85 || state.Workspace != "Default - admin" || state.App != "Demo App" || state.Instance != "https://demo.example.com" {
 		t.Fatalf("unexpected status state: %#v", state)
+	}
+}
+
+func TestStatusBarStateUsesCachedProjectPath(t *testing.T) {
+	c := &Client{
+		cfg:        CLIConfig{InstanceURL: "https://demo.example.com"},
+		runtime:    RuntimeModelConfig{LargeModel: "model"},
+		currentApp: &AppScope{ScopeID: "app", ScopeName: "Demo", AppSysID: "app"},
+	}
+	c.setStatusProjectPath("/cached/project")
+	if got := c.statusBarState().Project; got != "/cached/project" {
+		t.Fatalf("status project = %q, want cached path", got)
+	}
+	c.setStatusProjectPath("")
+	if got := c.statusBarState().Project; got != "" {
+		t.Fatalf("status project after clear = %q", got)
+	}
+}
+
+func TestAnswerSetAppScopeRunsOneNonFatalPostSelectionStatusCheck(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c, err := NewClient(CLIConfig{InstanceURL: "https://example.service-now.com"}, Options{Profile: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := 0
+	c.postSelectionStatus = func(context.Context) error { checks++; return errors.New("offline") }
+	result, status, err := c.answerSetAppScope(map[string]interface{}{"scopeId": "app-id", "scopeName": "Demo"})
+	if err != nil || status != "complete" || result["success"] != true {
+		t.Fatalf("answerSetAppScope result=%#v status=%q err=%v", result, status, err)
+	}
+	if checks != 1 {
+		t.Fatalf("post-selection status checks = %d, want 1", checks)
 	}
 }
 
@@ -704,4 +769,22 @@ func captureStderr(t *testing.T, fn func()) string {
 		t.Fatal(err)
 	}
 	return string(out)
+}
+
+func TestUnknownNirvanaElicitationReportsUnsupportedAdvertisedAction(t *testing.T) {
+	c := &Client{opts: Options{Nirvana: true}}
+	result, status, err := c.answerUnknownElicitation("future_web_action", map[string]interface{}{})
+	if err != nil || status != "error" {
+		t.Fatalf("status=%q err=%v result=%#v", status, err, result)
+	}
+	if got := stringify(result["code"]); got != "UNEXPECTED_CLIENT_ACTION" {
+		t.Fatalf("code=%q", got)
+	}
+	message := stringify(result["error"])
+	if !strings.Contains(message, "unsupported client-side action") || !strings.Contains(message, "advertised web-client action") {
+		t.Fatalf("message=%q", message)
+	}
+	if strings.Contains(message, "only advertises server-side tools") {
+		t.Fatalf("misleading Nirvana message=%q", message)
+	}
 }

@@ -20,8 +20,12 @@ const (
 )
 
 type CLIConfig struct {
-	InstanceURL      string `json:"instanceUrl"`
-	WSURL            string `json:"wsUrl"`
+	InstanceURL string `json:"instanceUrl"`
+	WSURL       string `json:"wsUrl"`
+	// ProjectRoot is the profile-local root for automatic canonical checkouts.
+	// An empty value is intentionally supported for configs written before this
+	// setting existed; it means the historical default, ~/BA.
+	ProjectRoot      string `json:"projectRoot,omitempty"`
 	OAuthClientID    string `json:"-"`
 	OAuthRedirectURI string `json:"-"`
 	LLMProxyURL      string `json:"-"`
@@ -105,6 +109,16 @@ func resolveConfig(opts *Options) (CLIConfig, error) {
 		if opts.WSURL != "" {
 			cfg.WSURL = opts.WSURL
 		}
+		// Re-running setup for a profile must not silently reset an existing
+		// non-default project root when --project-root is omitted.
+		if strings.TrimSpace(opts.ProjectRoot) == "" {
+			if saved, ok := loadProfileConfig(opts.Profile); ok {
+				cfg.ProjectRoot = saved.ProjectRoot
+			}
+		}
+		if err := applyConfiguredProjectRoot(&cfg, opts.ProjectRoot); err != nil {
+			return cfg, err
+		}
 		if err := saveProfileConfig(opts.Profile, cfg); err != nil {
 			return cfg, err
 		}
@@ -122,6 +136,9 @@ func resolveConfig(opts *Options) (CLIConfig, error) {
 		if opts.WSURL != "" {
 			cfg.WSURL = opts.WSURL
 		}
+		if err := applyConfiguredProjectRoot(&cfg, opts.ProjectRoot); err != nil {
+			return cfg, err
+		}
 		return cfg, nil
 	}
 
@@ -134,7 +151,21 @@ func resolveConfig(opts *Options) (CLIConfig, error) {
 		if opts.WSURL != "" {
 			cfg.WSURL = opts.WSURL
 		}
+		cfg.ProjectRoot = saved.ProjectRoot
+		if err := applyConfiguredProjectRoot(&cfg, opts.ProjectRoot); err != nil {
+			return cfg, err
+		}
+		if opts.ProjectRoot != "" {
+			if err := saveProfileConfig(opts.Profile, cfg); err != nil {
+				return cfg, err
+			}
+			fmt.Fprintf(os.Stderr, "saved project root for profile %q to %s\n", opts.Profile, cfg.ProjectRoot)
+		}
 		return cfg, nil
+	}
+
+	if opts.ProfileExplicit {
+		return cfg, fmt.Errorf("profile %q is not configured; run bacli --setup --profile %s or choose one with --instance-list", opts.Profile, opts.Profile)
 	}
 
 	if instanceURL := firstEnv("INSTANCE_URL", "BA_INSTANCE_URL"); instanceURL != "" {
@@ -145,6 +176,9 @@ func resolveConfig(opts *Options) (CLIConfig, error) {
 		}
 		if opts.WSURL != "" {
 			cfg.WSURL = opts.WSURL
+		}
+		if err := applyConfiguredProjectRoot(&cfg, opts.ProjectRoot); err != nil {
+			return cfg, err
 		}
 		return cfg, nil
 	}
@@ -161,11 +195,30 @@ func resolveConfig(opts *Options) (CLIConfig, error) {
 	if opts.WSURL != "" {
 		cfg.WSURL = opts.WSURL
 	}
+	if err := applyConfiguredProjectRoot(&cfg, opts.ProjectRoot); err != nil {
+		return cfg, err
+	}
 	if err := saveProfileConfig(opts.Profile, cfg); err != nil {
 		return cfg, err
 	}
 	fmt.Fprintf(os.Stderr, "saved profile %q to %s\n", opts.Profile, profileConfigFile(opts.Profile))
 	return cfg, nil
+}
+
+// applyConfiguredProjectRoot leaves an omitted setting at the backward-
+// compatible default. A supplied value is normalized before it reaches any
+// project path resolver; callers therefore never join an unchecked string.
+func applyConfiguredProjectRoot(cfg *CLIConfig, requested string) error {
+	root := strings.TrimSpace(requested)
+	if root == "" {
+		root = cfg.ProjectRoot
+	}
+	normalized, err := canonicalProjectRoot(root)
+	if err != nil {
+		return err
+	}
+	cfg.ProjectRoot = normalized
+	return nil
 }
 
 func profileNameFromInstanceURL(raw string) string {
@@ -312,7 +365,10 @@ func saveProfileConfig(profile string, cfg CLIConfig) error {
 	if err := os.MkdirAll(profileDir(profile), 0o700); err != nil {
 		return err
 	}
-	toSave := CLIConfig{InstanceURL: cfg.InstanceURL, WSURL: cfg.WSURL}
+	if err := applyConfiguredProjectRoot(&cfg, cfg.ProjectRoot); err != nil {
+		return err
+	}
+	toSave := CLIConfig{InstanceURL: cfg.InstanceURL, WSURL: cfg.WSURL, ProjectRoot: cfg.ProjectRoot}
 	raw, err := json.MarshalIndent(toSave, "", "  ")
 	if err != nil {
 		return err

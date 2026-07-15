@@ -13,8 +13,9 @@ import (
 )
 
 type fluentTopic struct {
-	Name    string `json:"name"`
-	Summary string `json:"summary"`
+	Name    string   `json:"name"`
+	Summary string   `json:"summary"`
+	Tags    []string `json:"tags,omitempty"`
 }
 
 type fluentCatalogResult struct {

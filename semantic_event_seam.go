@@ -33,6 +33,7 @@ func (c *Client) beginSemanticTurnSnapshot(snapshot TurnRuntimeSnapshot) {
 	c.semanticMu.Lock()
 	c.semanticState = NewSemanticTurnState()
 	c.semanticSequence = 0
+	c.journalBoundaryMissed = false
 	if c.semanticLifecycleID == "" {
 		c.semanticLifecycleID = uuidV4Compact()
 	}
@@ -71,7 +72,18 @@ func (c *Client) emitSemanticEvent(eventType SemanticEventType, turnID string, p
 		c.debugf("semantic event ignored: %v\n", err)
 		return
 	}
-	if c.workspaceName != "" {
+	journalThisEvent := c.workspaceName != ""
+	if eventType != EventTurnAccepted && (c.semanticState.Status == SemanticTurnAccepted || c.semanticState.Status == SemanticTurnStarted) && c.journalBoundaryMissed {
+		// If the accepted boundary could not be persisted (for example because
+		// workspace selection completed after the turn began), skip the whole
+		// turn. Appending later retry/tool/delta events would create a journal
+		// that cannot be safely replayed after restart.
+		journalThisEvent = false
+	}
+	if eventType == EventTurnAccepted && !journalThisEvent {
+		c.journalBoundaryMissed = true
+	}
+	if journalThisEvent {
 		conversationID := c.conversationID
 		if accepted, ok := payload.(TurnAcceptedPayload); ok && accepted.Context.ConversationID != "" {
 			conversationID = accepted.Context.ConversationID
@@ -82,8 +94,14 @@ func (c *Client) emitSemanticEvent(eventType SemanticEventType, turnID string, p
 			// a live ServiceNow turn. The event was validated/redacted before an
 			// append is attempted, so a failure cannot leak a raw transport frame.
 			c.debugf("semantic journal append ignored: %v\n", journalErr)
+			if eventType == EventTurnAccepted {
+				c.journalBoundaryMissed = true
+			}
 		} else {
 			c.semanticJournalSequence = envelope.Sequence
+			if eventType == EventTurnAccepted {
+				c.journalBoundaryMissed = false
+			}
 		}
 	}
 	c.semanticState = next

@@ -151,7 +151,7 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 		}
 		fmt.Fprintf(os.Stderr, "\r\x1b[2K%s", commandInputLine(prompt, string(line)))
 		fmt.Fprint(os.Stderr, "\x1b[J")
-		lines := slashMenuLines(menuOpen, menu, selected)
+		lines := boundedSlashMenuLines(slashMenuLines(menuOpen, menu, selected), terminalSlashMenuMaxRows())
 		for _, menuLine := range lines {
 			fmt.Fprintf(os.Stderr, "\r\n%s", menuLine)
 		}
@@ -444,9 +444,7 @@ func (l *fixedPromptLayout) redraw(prompt, line string, cursor int, menuLines []
 	}
 	menuBottom := maxInt(l.promptTop-1, 0)
 	maxMenuRows := menuBottom
-	if len(menuLines) > maxMenuRows {
-		menuLines = menuLines[:maxMenuRows]
-	}
+	menuLines = boundedSlashMenuLines(menuLines, maxMenuRows)
 	if !replay {
 		l.clearMenu(maxInt(l.drawnMenuRows, len(menuLines)))
 	}
@@ -577,7 +575,7 @@ func (l *fixedPromptLayout) submit(prompt, _ string) {
 	l.drawnMenuRows = 0
 	// The submitted text is copied into the managed transcript by the REPL
 	// immediately after Enter. Keep the footer prompt ready for the next input
-	// while `Building...` and the assistant response render above it.
+	// while `Working...` and the assistant response render above it.
 	l.drawPrompt(prompt, "", 0)
 	placeTerminalFooterPromptCursor(prompt, 0)
 }
@@ -758,6 +756,63 @@ func slashMenuLines(open bool, suggestions []SlashCommandSuggestion, selected in
 		lines = append(lines, fmt.Sprintf("%s %-24s %s", marker, strings.TrimRight(s.Text, " "), s.Description))
 	}
 	return lines
+}
+
+// boundedSlashMenuLines returns a contiguous command window that fits maxRows.
+// When room permits, the help header stays visible; otherwise the selected row
+// takes priority. A zero bound deliberately renders no menu, which keeps
+// callers safe on terminals with no usable space above the prompt. A negative
+// bound means the caller has no terminal-size information and keeps all rows.
+func boundedSlashMenuLines(lines []string, maxRows int) []string {
+	if len(lines) == 0 || maxRows == 0 {
+		return nil
+	}
+	if maxRows < 0 || len(lines) <= maxRows {
+		return lines
+	}
+
+	selected := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, "›") {
+			selected = i
+			break
+		}
+	}
+	if selected <= 0 {
+		return lines[:maxRows]
+	}
+	if maxRows == 1 {
+		return lines[selected : selected+1]
+	}
+
+	// Reserve one row for help and fill the remaining rows with a contiguous
+	// command range that contains the selection. This naturally recalculates
+	// after filtering, wrap-around navigation, or a terminal resize.
+	commandRows := maxRows - 1
+	start := selected - commandRows + 1
+	if start < 1 {
+		start = 1
+	}
+	end := start + commandRows
+	if end > len(lines) {
+		end = len(lines)
+		start = maxInt(1, end-commandRows)
+	}
+	visible := make([]string, 0, maxRows)
+	visible = append(visible, lines[0])
+	visible = append(visible, lines[start:end]...)
+	return visible
+}
+
+// terminalSlashMenuMaxRows bounds the non-fixed fallback renderer when the
+// terminal reports a size. The fixed footer uses its precise prompt boundary.
+// Unknown terminal sizes retain the historical unbounded behavior.
+func terminalSlashMenuMaxRows() int {
+	_, height, err := term.GetSize(terminalStderrFD())
+	if err != nil || height <= 0 {
+		return -1
+	}
+	return maxInt(height-2, 1)
 }
 
 func slashMenuChoice(suggestions []SlashCommandSuggestion, selected int) SlashCommandSuggestion {
@@ -998,6 +1053,79 @@ type processingInputCapture struct {
 	done     chan struct{}
 	stopOnce sync.Once
 	cancel   func() bool
+}
+
+type connectingInputCapture struct {
+	stop        chan struct{}
+	done        chan struct{}
+	stopOnce    sync.Once
+	cleanupOnce sync.Once
+	cancel      func()
+	fd          int
+	oldState    *term.State
+}
+
+func startConnectingInputCapture(cancel func()) func() {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) || cancel == nil {
+		return func() {}
+	}
+	// Prepare raw/nonblocking input synchronously so the first rendered frame
+	// never advertises Esc cancellation before stdin is actually ready.
+	stdinState.Lock()
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		stdinState.Unlock()
+		return func() {}
+	}
+	if err := setTerminalNonblock(fd, true); err != nil {
+		_ = term.Restore(fd, oldState)
+		stdinState.Unlock()
+		return func() {}
+	}
+	capture := &connectingInputCapture{stop: make(chan struct{}), done: make(chan struct{}), cancel: cancel, fd: fd, oldState: oldState}
+	go capture.run()
+	return capture.Stop
+}
+
+func (c *connectingInputCapture) Stop() {
+	c.stopOnce.Do(func() { close(c.stop) })
+	<-c.done
+	c.cleanupOnce.Do(func() {
+		_ = setTerminalNonblock(c.fd, false)
+		_ = term.Restore(c.fd, c.oldState)
+		stdinState.Unlock()
+	})
+}
+
+func (c *connectingInputCapture) run() {
+	defer close(c.done)
+	buf := make([]byte, 16)
+	for {
+		select {
+		case <-c.stop:
+			return
+		default:
+		}
+		n, err := readTerminalFD(c.fd, buf)
+		if n > 0 && connectingCancelRequested(buf[:n]) {
+			c.cancel()
+			return
+		}
+		if err != nil && !terminalReadWouldBlock(err) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func connectingCancelRequested(input []byte) bool {
+	for _, b := range input {
+		if b == 27 || b == 3 {
+			return true
+		}
+	}
+	return false
 }
 
 func startProcessingInputCapture(prompt string, status *statusBarState, cancel func() bool) *processingInputCapture {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -45,16 +46,32 @@ type Client struct {
 	ambCancel           context.CancelFunc
 	nirvanaPingCancel   context.CancelFunc
 
-	conversationID          string
-	conversationTitle       string
-	conversationState       string
-	serverConversation      bool
-	history                 []interface{}
-	usageInputTokens        int64
-	usageOutputTokens       int64
-	usageThinkingTokens     int64
-	appScope                interface{}
-	currentApp              *AppScope
+	conversationID      string
+	conversationTitle   string
+	conversationState   string
+	serverConversation  bool
+	history             []interface{}
+	usageInputTokens    int64
+	usageOutputTokens   int64
+	usageThinkingTokens int64
+	appScope            interface{}
+	currentApp          *AppScope
+	// localProjectOverride is intentionally process-local. Restarting resolves
+	// the registered primary checkout, while /project use can temporarily select
+	// an explicit secondary checkout.
+	localProjectOverride string
+	// statusProjectPath is refreshed after app/project selection. It keeps the
+	// animated terminal footer independent from filesystem and registry reads.
+	statusProjectMu   sync.RWMutex
+	statusProjectPath string
+	// postSelectionStatus is a narrow test seam for the non-fatal local-project
+	// probe that follows contextful app selection. SetApp intentionally does not
+	// use it because bare state updates must not perform network I/O.
+	postSelectionStatus func(context.Context) error
+	// projectRecoveryApproval is a narrow test seam for the destructive-but-
+	// recoverable canonical-project replacement prompt. It intentionally does
+	// not consult AutoApprove.
+	projectRecoveryApproval func([][2]string, string) (bool, error)
 	workingSet              interface{}
 	workspaceName           string
 	workspaceURI            string
@@ -111,10 +128,18 @@ type Client struct {
 	semanticEventIDSequence uint64
 	semanticLifecycleID     string
 	semanticJournalSequence uint64
-	remoteRetryPolicy       RetryPolicy
-	attemptTelemetryMu      sync.Mutex
-	attemptTelemetry        []AttemptTelemetry
-	turnAttemptOffset       int
+	journalBoundaryMissed   bool
+	connectionAuthPrepared  bool
+	// The following narrow seams keep OAuth recovery ordering testable without
+	// requiring a live ServiceNow instance or an interactive terminal.
+	oauthRefresh        func(context.Context, OAuthConfig, string) (TokenResponse, error)
+	oauthSessionPKCE    func(context.Context, bool) (TokenResponse, error)
+	oauthConfigure      func(context.Context) error
+	oauthRecoveryChoice func(string, string, string, error) (string, error)
+	remoteRetryPolicy   RetryPolicy
+	attemptTelemetryMu  sync.Mutex
+	attemptTelemetry    []AttemptTelemetry
+	turnAttemptOffset   int
 
 	connected chan error
 	turnDone  chan error
@@ -123,6 +148,10 @@ type Client struct {
 	processing bool
 	debug      bool // pre-existing startup trace option
 	debugLocal bool // explicit /debug local state; never persisted or used for protocol logging
+
+	// instanceSwitch is owned by main because a switch replaces this Client
+	// rather than mutating its closed transport/session lifecycle in place.
+	instanceSwitch func(context.Context, string) error
 }
 
 type WebAgentConfig struct {
@@ -179,11 +208,19 @@ func (c *Client) loadInitialState() error {
 		}
 	}
 	recovery, err := recoverWorkspaceFromJournal(c.opts.Profile, name, ws, ok)
+	autoRecovered := false
 	if err != nil {
-		return err
+		var quarantinePath string
+		recovery, quarantinePath, autoRecovered, err = autoRecoverStaleSemanticJournal(c.opts.Profile, name, ws, ok, err)
+		if err != nil {
+			return err
+		}
+		if autoRecovered {
+			fmt.Fprintf(os.Stderr, "warning: quarantined stale semantic journal for workspace %q at %s and resumed from the workspace snapshot\n", name, quarantinePath)
+		}
 	}
 	ws = recovery.Workspace
-	if !ok || recovery.LastSequence > snapshotSequence || recovery.IncompleteTurn {
+	if !ok || autoRecovered || recovery.LastSequence > snapshotSequence || recovery.IncompleteTurn {
 		if err := saveWorkspace(c.opts.Profile, ws); err != nil {
 			return err
 		}
@@ -341,6 +378,7 @@ func (c *Client) SetApp(app AppScope) error {
 	}
 	c.currentApp = &app
 	c.appScope = app.ScopeID
+	c.setStatusProjectPath("")
 	if err := saveActiveApp(c.opts.Profile, app); err != nil {
 		return err
 	}
@@ -354,6 +392,8 @@ func (c *Client) SetApp(app AppScope) error {
 func (c *Client) ClearApp() error {
 	c.currentApp = nil
 	c.appScope = nil
+	c.localProjectOverride = ""
+	c.setStatusProjectPath("")
 	if err := deleteActiveApp(c.opts.Profile); err != nil {
 		return err
 	}
@@ -382,6 +422,9 @@ func (c *Client) absorbAppScope(v interface{}) {
 }
 
 func (c *Client) Connect(ctx context.Context) error {
+	if err := c.PrepareConnectionAuthentication(ctx); err != nil {
+		return err
+	}
 	// The browser loads these values before opening Nirvana. Keep this
 	// best-effort so older instances and non-browser auth remain usable.
 	c.webStartupConfig = c.loadWebStartupConfig(ctx)
@@ -393,7 +436,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 
 	dialer := websocket.Dialer{HandshakeTimeout: 30 * time.Second}
-	conn, _, err := dialer.DialContext(ctx, c.cfg.WSURL, c.nirvanaDialHeaders())
+	conn, _, err := dialWebSocketCancelable(ctx, dialer, c.cfg.WSURL, c.nirvanaDialHeaders())
 	if err != nil {
 		return fmt.Errorf("websocket dial failed: %w", err)
 	}
@@ -438,6 +481,45 @@ func (c *Client) Connect(ctx context.Context) error {
 		_ = c.Close()
 		return errors.New("connection handshake timed out after 30s")
 	}
+}
+
+// PrepareConnectionAuthentication completes any interactive credential work
+// before the terminal enters its animated connecting screen. The screen can
+// then own stdin solely for Esc cancellation without erasing or intercepting
+// username/password/cookie prompts.
+func (c *Client) PrepareConnectionAuthentication(ctx context.Context) error {
+	if c.connectionAuthPrepared {
+		return nil
+	}
+	// Nirvana owns a stricter recovery order for expired OAuth credentials:
+	// refresh token, then saved browser session, then (and only then) the
+	// interactive recovery choice. Do not configure form/cookie auth first,
+	// because that can prompt for credentials before those automatic fallbacks.
+	if c.opts.Nirvana {
+		// A still-usable cached OAuth token keeps the existing session-first
+		// startup validation behavior. The stricter fallback order applies only
+		// once that cache entry is expired or otherwise unusable.
+		if tok, ok := loadCachedToken(c.opts.Profile); ok &&
+			(tok.InstanceURL == "" || sameInstance(tok.InstanceURL, c.cfg.InstanceURL)) &&
+			!tokenExpired(tok) {
+			if err := c.configureGatewayAuth(ctx); err != nil {
+				return err
+			}
+			c.connectionAuthPrepared = true
+		}
+		tok, err := c.getNirvanaAccessToken(ctx, false)
+		if err != nil {
+			return err
+		}
+		c.oauthAccessToken = tok.AccessToken
+		c.connectionAuthPrepared = true
+		return nil
+	}
+	if err := c.configureGatewayAuth(ctx); err != nil {
+		return err
+	}
+	c.connectionAuthPrepared = true
+	return nil
 }
 
 func (c *Client) startNirvanaPingLoop() {
@@ -717,8 +799,11 @@ func (c *Client) connectGateway(ctx context.Context) error {
 	if c.opts.CodeAssistWS {
 		return c.connectCodeAssistGateway(ctx)
 	}
-	if err := c.configureGatewayAuth(ctx); err != nil {
-		return err
+	if !c.connectionAuthPrepared {
+		if err := c.configureGatewayAuth(ctx); err != nil {
+			return err
+		}
+		c.connectionAuthPrepared = true
 	}
 	if c.opts.Conversation != "" {
 		if err := c.SelectConversationByArg(ctx, c.opts.Conversation, true); err != nil {
@@ -755,8 +840,11 @@ func (c *Client) connectGateway(ctx context.Context) error {
 }
 
 func (c *Client) connectCodeAssistGateway(ctx context.Context) error {
-	if err := c.configureGatewayAuth(ctx); err != nil {
-		return err
+	if !c.connectionAuthPrepared {
+		if err := c.configureGatewayAuth(ctx); err != nil {
+			return err
+		}
+		c.connectionAuthPrepared = true
 	}
 	if c.userToken == "" && c.gatewayAuth != authModeBasic {
 		c.userToken = c.fetchUserToken(ctx)
@@ -787,7 +875,7 @@ func (c *Client) connectCodeAssistGateway(ctx context.Context) error {
 	if c.httpClient != nil {
 		dialer.Jar = c.httpClient.Jar
 	}
-	conn, resp, err := dialer.DialContext(ctx, wsURL, header)
+	conn, resp, err := dialWebSocketCancelable(ctx, dialer, wsURL, header)
 	if err != nil {
 		return fmt.Errorf("web UI websocket dial failed: %w%s", err, websocketResponseSuffix(resp))
 	}
@@ -798,6 +886,42 @@ func (c *Client) connectCodeAssistGateway(ctx context.Context) error {
 		fmt.Fprintf(os.Stderr, "agent config: model=%s skill=%s\n", c.webAgentConfig.Model, c.webAgentConfig.SkillID)
 	}
 	return nil
+}
+
+// Gorilla's DialContext can remain blocked reading an HTTP upgrade response
+// after the TCP connection has succeeded. Close the raw connection when the
+// caller cancels so Esc aborts the websocket handshake immediately rather than
+// waiting for HandshakeTimeout.
+func dialWebSocketCancelable(ctx context.Context, dialer websocket.Dialer, wsURL string, header http.Header) (*websocket.Conn, *http.Response, error) {
+	stop := make(chan struct{})
+	baseDial := dialer.NetDialContext
+	if baseDial == nil {
+		netDialer := &net.Dialer{}
+		baseDial = netDialer.DialContext
+	}
+	dialer.NetDialContext = func(dialCtx context.Context, network, address string) (net.Conn, error) {
+		conn, err := baseDial(dialCtx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = conn.Close()
+			case <-stop:
+			}
+		}()
+		return conn, nil
+	}
+	conn, response, err := dialer.DialContext(ctx, wsURL, header)
+	close(stop)
+	if ctx.Err() != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, response, ctx.Err()
+	}
+	return conn, response, err
 }
 
 func (c *Client) suppressInteractiveStartupScrollback() bool {
@@ -1948,7 +2072,7 @@ func (c *Client) ambLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			fmt.Fprintf(os.Stderr, "\n[amb] %v\n", err)
+			c.printRuntimeError(fmt.Sprintf("[amb] %v", err))
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -1974,7 +2098,11 @@ func (c *Client) handleAMBMessage(msg map[string]interface{}) {
 	}
 	if contentType, _ := data["contentType"].(string); contentType == "stream" {
 		if content, _ := data["content"].(string); content != "" {
-			if text := collectGatewayStreamContent(content); text != "" {
+			text, runtimeErrors := collectGatewayStreamContentParts(content)
+			for _, message := range runtimeErrors {
+				c.printRuntimeError(message)
+			}
+			if text != "" {
 				c.webStreamText += text
 				c.printGatewayStreamUpdate(text)
 			}
@@ -2157,8 +2285,14 @@ func (c *Client) nextAmbID() string {
 }
 
 func collectGatewayStreamContent(content string) string {
+	text, _ := collectGatewayStreamContentParts(content)
+	return text
+}
+
+func collectGatewayStreamContentParts(content string) (string, []string) {
 	hasAssistantText := false
 	var assistantParts []string
+	var runtimeErrors []string
 	for _, text := range extractTagContent(content, "text") {
 		if strings.TrimSpace(text) != "" {
 			assistantParts = append(assistantParts, text)
@@ -2167,20 +2301,20 @@ func collectGatewayStreamContent(content string) string {
 	}
 	for _, text := range extractTagContent(content, "error_message") {
 		if strings.TrimSpace(text) != "" {
-			fmt.Fprintf(os.Stderr, "\n%s\n", text)
+			runtimeErrors = append(runtimeErrors, strings.TrimSpace(text))
 		}
 	}
 	if hasAssistantText {
-		return strings.Join(assistantParts, "")
+		return strings.Join(assistantParts, ""), runtimeErrors
 	}
 	if strings.Contains(content, "<thinking>") || strings.Contains(content, "<signature>") {
-		return ""
+		return "", runtimeErrors
 	}
 	cleaned := stripSimpleTags(content)
 	if strings.TrimSpace(cleaned) != "" {
-		return cleaned
+		return cleaned, runtimeErrors
 	}
-	return ""
+	return "", runtimeErrors
 }
 
 func (c *Client) printGatewayStreamUpdate(chunk string) {
@@ -2358,9 +2492,9 @@ func (c *Client) animateTurnStatus(stop <-chan struct{}, done chan<- struct{}) {
 		c.statusMu.Lock()
 		if terminalStatusANSIEnabled() {
 			if interactiveTerminalUIEnabled() {
-				drawTerminalFooterWorkingLine(animatedBuildingStatus(frame), c.statusBarState())
+				drawTerminalFooterWorkingLine(animatedWorkingStatus(frame), c.statusBarState())
 			} else {
-				fmt.Fprintf(os.Stderr, "\r\x1b[2K%s", animatedBuildingStatus(frame))
+				fmt.Fprintf(os.Stderr, "\r\x1b[2K%s", animatedWorkingStatus(frame))
 			}
 		}
 		c.statusMu.Unlock()
@@ -2374,7 +2508,7 @@ func (c *Client) animateTurnStatus(stop <-chan struct{}, done chan<- struct{}) {
 }
 
 func (c *Client) finishGatewayStreamOutput() {
-	// Keep the animated Building indicator alive while text streams; clear it only
+	// Keep the animated Working indicator alive while text streams; clear it only
 	// when the server closes the turn and final output is committed.
 	c.clearTurnStatus()
 	assistantText := strings.TrimSpace(c.webStreamText)
@@ -2660,6 +2794,7 @@ func (c *Client) writeJSON(v interface{}) error {
 
 func (c *Client) readGatewayWebSocketLoop() {
 	defer func() {
+		clearTerminalFooterSubagents()
 		select {
 		case <-c.closed:
 		default:
@@ -2682,7 +2817,7 @@ func (c *Client) readGatewayWebSocketLoop() {
 			c.debugf("\n<<< %s\n", redactDebugJSONBytes(data))
 		}
 		if err := c.handleGatewayWebSocketEvent(data); err != nil {
-			fmt.Fprintf(os.Stderr, "event handling error: %v\n", err)
+			c.printRuntimeError(fmt.Sprintf("event handling error: %v", err))
 		}
 	}
 }
@@ -2701,7 +2836,7 @@ func (c *Client) handleGatewayWebSocketEvent(data []byte) error {
 
 	if status == "error" {
 		err := codeAssistError(event, "websocket message error")
-		fmt.Fprintf(os.Stderr, "\n%s\n", err)
+		c.printRuntimeError(err.Error())
 		c.processing = false
 		if c.turnDone != nil {
 			select {
@@ -2754,7 +2889,7 @@ func (c *Client) handleGatewayCompleteMessage(event map[string]interface{}, type
 		}
 		c.clearTurnStatus()
 		if err := c.saveCurrentState(); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not save workspace %q: %v\n", c.workspaceName, err)
+			c.printRuntimeError(fmt.Sprintf("warning: could not save workspace %q: %v", c.workspaceName, err))
 		}
 		c.processing = false
 		if c.turnDone != nil {
@@ -2774,7 +2909,7 @@ func (c *Client) handleGatewayCompleteMessage(event map[string]interface{}, type
 			c.clearTurnStatus()
 			printInterviewInputs(inputs)
 			if err := c.saveCurrentState(); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not save workspace %q: %v\n", c.workspaceName, err)
+				c.printRuntimeError(fmt.Sprintf("warning: could not save workspace %q: %v", c.workspaceName, err))
 			}
 			c.processing = false
 			if c.turnDone != nil {
@@ -2796,7 +2931,7 @@ func (c *Client) handleGatewayCompleteMessage(event map[string]interface{}, type
 	case "error":
 		err := codeAssistError(event, "websocket message error")
 		c.clearTurnStatus()
-		fmt.Fprintf(os.Stderr, "\n%s\n", err)
+		c.printRuntimeError(err.Error())
 		c.processing = false
 		if c.turnDone != nil {
 			select {
@@ -2910,6 +3045,29 @@ func (c *Client) printToolResultStatus(name string, success bool, summary string
 		return
 	}
 	fmt.Fprintf(os.Stderr, "\n%s\n", formatToolResultTerminal(display, success, terminalStatusANSIEnabled()))
+}
+
+func (c *Client) printToolWarning(name, warning string) {
+	c.flushActiveStreamForTerminalInterruption()
+	display := toolResultDisplay(name, warning)
+	if terminalRecordToolWarningAndAppend(display, c.statusBarState()) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\n%s\n", formatToolWarningTerminal(display, terminalStatusANSIEnabled()))
+}
+
+// printRuntimeError routes application diagnostics through the managed
+// transcript while the interactive terminal footer owns stderr. It deliberately
+// does not intercept renderer control writes, which must stay direct ANSI.
+func (c *Client) printRuntimeError(message string) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	if interactiveTerminalUIEnabled() && terminalRecordRuntimeErrorAndAppend(message, c.statusBarState()) {
+		return
+	}
+	fmt.Fprintln(os.Stderr, message)
 }
 
 func toolResultDisplay(name, summary string) string {
@@ -3082,6 +3240,7 @@ func codeAssistError(event map[string]interface{}, fallback string) error {
 
 func (c *Client) readLoop() {
 	defer func() {
+		clearTerminalFooterSubagents()
 		select {
 		case <-c.closed:
 		default:
@@ -3107,7 +3266,7 @@ func (c *Client) readLoop() {
 			c.debugf("\n<<< %s\n", redactDebugJSONBytes(data))
 		}
 		if err := c.handleEvent(data); err != nil {
-			fmt.Fprintf(os.Stderr, "event handling error: %v\n", err)
+			c.printRuntimeError(fmt.Sprintf("event handling error: %v", err))
 		}
 	}
 }
@@ -3197,14 +3356,18 @@ func (c *Client) handleEvent(data []byte) error {
 		return c.handleElicitation(event)
 	case "turn_summary":
 		if summary, ok := event["summary"].(string); ok && summary != "" {
-			fmt.Fprintf(os.Stderr, "\n[summary] %s\n", summary)
+			if !terminalRecordSystemTextAndAppend("Summary", summary, c.statusBarState()) {
+				fmt.Fprintf(os.Stderr, "\n[summary] %s\n", summary)
+			}
 		}
 	case "sub_agent_start":
-		name, _ := event["name"].(string)
-		fmt.Fprintf(os.Stderr, "\n[sub-agent started] %s\n", name)
+		id, name := eventSubAgentIdentity(event)
+		setTerminalFooterSubagent(id, name)
+		c.emitSemanticEvent(EventSubAgentStarted, "", SubAgentLifecyclePayload{AgentID: id, Name: name})
 	case "sub_agent_end":
-		name, _ := event["name"].(string)
-		fmt.Fprintf(os.Stderr, "\n[sub-agent ended] %s\n", name)
+		id, name := eventSubAgentIdentity(event)
+		clearTerminalFooterSubagent(id, name)
+		c.emitSemanticEvent(EventSubAgentEnded, "", SubAgentLifecyclePayload{AgentID: id, Name: name})
 	case "turn_end":
 		// Emit final observed state before terminal lifecycle events. This keeps
 		// the semantic sequence usable for replay without changing established UI.
@@ -3221,6 +3384,7 @@ func (c *Client) handleEvent(data []byte) error {
 		c.emitSemanticEvent(EventAssistantCompleted, "", AssistantCompletedPayload{Reason: "stream_end"})
 		c.emitSemanticEvent(EventTurnCompleted, "", TurnCompletedPayload{Reason: "server_turn_end"})
 		c.finishGatewayStreamOutput()
+		clearTerminalFooterSubagents()
 		c.clearTurnStatus()
 		assistantText := strings.TrimSpace(c.webStreamText)
 		if assistantText != "" {
@@ -3231,7 +3395,7 @@ func (c *Client) handleEvent(data []byte) error {
 			}
 			if !c.richWebPersistence || c.BestEffortPersistRichAssistantFinalMessage(ctx, c.conversationID, "", assistantText, duration, c.turnStartedAt) == "" {
 				if err := c.persistWebAssistantMessage(ctx, assistantText); err != nil {
-					fmt.Fprintf(os.Stderr, "warning: could not persist assistant message: %v\n", err)
+					c.printRuntimeError(fmt.Sprintf("warning: could not persist assistant message: %v", err))
 				}
 			}
 			cancel()
@@ -3250,7 +3414,7 @@ func (c *Client) handleEvent(data []byte) error {
 			c.workingSet = v
 		}
 		if err := c.saveCurrentState(); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not save workspace %q: %v\n", c.workspaceName, err)
+			c.printRuntimeError(fmt.Sprintf("warning: could not save workspace %q: %v", c.workspaceName, err))
 		}
 		c.processing = false
 		c.CompleteBuildAgentTelemetry(context.Background(), c.turnTelemetry)
@@ -3272,7 +3436,8 @@ func (c *Client) handleEvent(data []byte) error {
 		err := eventError(event, "turn error")
 		c.emitSemanticEvent(EventTurnFailed, "", TurnFailedPayload{Code: "server_turn_error"})
 		c.clearTurnStatus()
-		fmt.Fprintf(os.Stderr, "\n%s\n", err)
+		clearTerminalFooterSubagents()
+		c.printRuntimeError(err.Error())
 		c.processing = false
 		c.ErrorBuildAgentTelemetry(context.Background(), c.turnTelemetry)
 		if c.turnTelemetry != nil {
@@ -3292,7 +3457,8 @@ func (c *Client) handleEvent(data []byte) error {
 	case "error":
 		err := eventError(event, "server error")
 		c.clearTurnStatus()
-		fmt.Fprintf(os.Stderr, "\n%s\n", err)
+		clearTerminalFooterSubagents()
+		c.printRuntimeError(err.Error())
 		select {
 		case c.connected <- err:
 		default:
@@ -3308,10 +3474,30 @@ func (c *Client) handleEvent(data []byte) error {
 			return nil
 		}
 		if typeName != "" {
-			fmt.Fprintf(os.Stderr, "\n[unhandled event] %s\n", typeName)
+			c.printRuntimeError(fmt.Sprintf("[unhandled event] %s", typeName))
 		}
 	}
 	return nil
+}
+
+func eventSubAgentIdentity(event map[string]interface{}) (id, name string) {
+	for _, candidate := range eventCandidateMaps(event) {
+		if id == "" {
+			id = firstString(candidate, "sub_agent_id", "subAgentId", "agent_id", "agentId", "id", "call_id", "callId")
+		}
+		if name == "" {
+			name = firstString(candidate, "name", "agent_name", "agentName", "label", "title")
+		}
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "sub-agent"
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = name
+	}
+	return id, name
 }
 
 func (c *Client) handleNirvanaStreamStart(streamID, contentType string, event map[string]interface{}) {
@@ -3575,12 +3761,30 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
 			return c.answerGliderFSCreateDirectory(ctx, payload)
 		})
+	case "fs_delete":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
+			return c.answerGliderFSDelete(ctx, payload)
+		})
+	case "fs_copy":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
+			return c.answerGliderFSCopy(ctx, payload, false)
+		})
+	case "fs_move":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
+			return c.answerGliderFSCopy(ctx, payload, true)
+		})
+	case "fs_find_and_replace":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
+			return c.answerGliderFSFindAndReplace(ctx, payload)
+		})
 	case "fs_tree":
 		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) { return c.answerGliderFSTree(ctx, payload) })
 	case "fs_stat":
 		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) { return c.answerGliderFSStat(ctx, payload) })
 	case "fs_glob":
 		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) { return c.answerGliderFSGlob(ctx, payload) })
+	case "fs_grep":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) { return c.answerGliderFSGrep(ctx, payload) })
 	case "local_search":
 		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
 			return c.answerGliderLocalSearch(ctx, payload)
@@ -3589,16 +3793,50 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
 			return c.answerGliderRunDiagnostics(ctx, payload)
 		})
+	case "open_app":
+		ctx, cancel := context.WithTimeout(turnCtx, 30*time.Second)
+		defer cancel()
+		result, status, err = c.answerOpenApp(ctx, payload)
+	case "ui_diagnostics":
+		result, status = c.withGliderFSTimeout(func(ctx context.Context) (map[string]interface{}, string) {
+			return c.answerUIDiagnostics(payload)
+		})
+	case "connect_to_mcp_server", "disconnect_from_mcp_server", "list_mcp_servers", "list_mcp_tools":
+		ctx, cancel := context.WithTimeout(turnCtx, 30*time.Second)
+		defer cancel()
+		result, status = c.answerMCPManagement(ctx, action, payload)
 	case "build", "install", "install_dependencies", "build_install":
 		ctx, cancel := context.WithTimeout(turnCtx, 20*time.Minute)
 		defer cancel()
 		result, status = c.answerGliderBuild(ctx, action, payload)
 	case "instance_skills_list":
-		result, status = map[string]interface{}{"content": "[]"}, "complete"
+		ctx, cancel := context.WithTimeout(turnCtx, 30*time.Second)
+		defer cancel()
+		result, status = c.answerInstanceSkillsList(ctx)
+	case "instance_skill_body":
+		ctx, cancel := context.WithTimeout(turnCtx, 30*time.Second)
+		defer cancel()
+		result, status = c.answerInstanceSkillBody(ctx, payload)
+	case "instance_skill_resource":
+		ctx, cancel := context.WithTimeout(turnCtx, 30*time.Second)
+		defer cancel()
+		result, status = c.answerInstanceSkillResource(ctx, payload)
 	case "fluent_topics_list":
 		ctx, cancel := context.WithTimeout(turnCtx, 5*time.Minute)
 		defer cancel()
 		result, status = c.answerFluentTopicsList(ctx, payload)
+	case "search_fluent_docs":
+		ctx, cancel := context.WithTimeout(turnCtx, 5*time.Minute)
+		defer cancel()
+		result, status = c.answerSearchFluentDocs(ctx, payload)
+	case "explain_fluent_doc":
+		ctx, cancel := context.WithTimeout(turnCtx, 5*time.Minute)
+		defer cancel()
+		result, status = c.answerExplainFluentDoc(ctx, payload)
+	case "package_docs":
+		ctx, cancel := context.WithTimeout(turnCtx, 30*time.Second)
+		defer cancel()
+		result, status = c.answerPackageDocs(ctx, payload)
 	default:
 		result, status, err = c.answerUnknownElicitation(action, payload)
 	}
@@ -3610,11 +3848,19 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 		return nil
 	}
 	if len(c.toolCallNames) == 0 {
-		c.printToolResultStatus(action, status == "complete", summarizeToolValue(result, 0))
+		if action == "instance_skills_list" {
+			if warning := strings.TrimSpace(stringify(result["warning"])); warning != "" {
+				c.printToolWarning(action, warning)
+			} else {
+				c.printToolResultStatus(action, status == "complete", summarizeToolValue(result, 0))
+			}
+		} else {
+			c.printToolResultStatus(action, status == "complete", summarizeToolValue(result, 0))
+		}
 	}
 	// Some client-side prompts (notably approvals) temporarily clear the animated
-	// Building footer so the blocking picker can own the terminal. Once the local
-	// answer is ready, restore the Building indicator before handing control back
+	// Working footer so the blocking picker can own the terminal. Once the local
+	// answer is ready, restore the Working indicator before handing control back
 	// to the server; it should remain visible until turn_end/turn_error.
 	c.ensureTurnStatusVisible()
 	return c.sendElicitationResponse(elicitationID, status, result)
@@ -3735,6 +3981,7 @@ func (c *Client) answerSetAppScope(payload map[string]interface{}) (map[string]i
 	if err := c.SetApp(*app); err != nil {
 		return nil, "error", err
 	}
+	c.postAppSelectionStatus(context.Background())
 	fmt.Fprintf(os.Stderr, "scope set: %s\n", app.ScopeID)
 	return map[string]interface{}{"success": true}, "complete", nil
 }
@@ -3750,8 +3997,12 @@ func (c *Client) answerUnknownElicitation(action string, payload map[string]inte
 			"code":  "NOT_IMPLEMENTED",
 		}, "error", nil
 	}
+	message := fmt.Sprintf("unexpected client-side action %q; this CLI only advertises server-side tools by default", action)
+	if c.opts.Nirvana {
+		message = fmt.Sprintf("unsupported client-side action %q; this bacli build does not implement the advertised web-client action", action)
+	}
 	return map[string]interface{}{
-		"error": fmt.Sprintf("unexpected client-side action %q; this CLI only advertises server-side tools by default", action),
+		"error": message,
 		"code":  "UNEXPECTED_CLIENT_ACTION",
 	}, "error", nil
 }
@@ -3825,7 +4076,7 @@ func (c *Client) printLiveUserTurn(content string) {
 	printLiveUserPrompt(content)
 	// `printLiveUserPrompt` writes the submitted turn into the scrollback region.
 	// Put the terminal cursor back in the input footer immediately afterwards so
-	// any typeahead while `Building...` is animating echoes in the prompt bar, not
+	// any typeahead while `Working...` is animating echoes in the prompt bar, not
 	// in the transcript/working area.
 	placeTerminalFooterPromptCursor("ba> ", 0)
 }
@@ -3854,6 +4105,7 @@ func (c *Client) statusBarState() statusBarState {
 		OutputTokens:  c.usageOutputTokens,
 		Workspace:     c.workspaceName,
 		App:           c.statusBarAppName(),
+		Project:       c.cachedStatusProjectPath(),
 		Instance:      c.cfg.InstanceURL,
 	}
 }

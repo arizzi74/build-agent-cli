@@ -357,6 +357,7 @@ func handleAppCommand(parent context.Context, c *Client, args []string) error {
 		}
 		_ = c.ensureActiveAppMetadata(ctx)
 		slashCommandPrintf("app set: %s\n", app.ScopeID)
+		c.postAppSelectionStatus(ctx)
 		return nil
 	case "clear", "unset":
 		if err := c.ClearApp(); err != nil {

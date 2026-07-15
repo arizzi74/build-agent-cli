@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -86,6 +88,16 @@ func TestCollectGatewayStreamContentDoesNotPrintMarkup(t *testing.T) {
 	}
 }
 
+func TestCollectGatewayStreamContentSeparatesRuntimeErrors(t *testing.T) {
+	text, runtimeErrors := collectGatewayStreamContentParts(`<text>partial answer</text><error_message>backend failed</error_message>`)
+	if text != "partial answer" {
+		t.Fatalf("stream text = %q", text)
+	}
+	if len(runtimeErrors) != 1 || runtimeErrors[0] != "backend failed" {
+		t.Fatalf("runtime errors = %#v", runtimeErrors)
+	}
+}
+
 func TestAssistantResponseBulletOnlyWhenColorEnabled(t *testing.T) {
 	plain := formatAssistantResponseTerminal("Hello", false, 80)
 	if strings.Contains(plain, "•") || !strings.Contains(plain, "Hello") {
@@ -112,10 +124,11 @@ func TestStatusBarFormattingIncludesRequestedFieldsAndFitsWidth(t *testing.T) {
 		OutputTokens:  81,
 		Workspace:     "Default - admin",
 		App:           "Demo App",
+		Project:       "/very/long/local/project/path/that/should/be/compact/in/the/status/bar/Demo App",
 		Instance:      "https://demoalectriallwfze140800.service-now.com/",
 	}
 	plain := formatStatusBar(state, false, 80)
-	for _, check := range []string{"model=claude-opus-4-6", "input_messages=7", "workspace=Default - admin", "app=Demo App", "instance=demoalectriallwfze140800.service-now.com"} {
+	for _, check := range []string{"model=claude-opus-4-6", "input_messages=7", "workspace=Default - admin", "app=Demo App", "project=…", "instance=demoalectriallwfze140800.service-now.com"} {
 		if !strings.Contains(plain, check) {
 			t.Fatalf("plain status missing %q: %q", check, plain)
 		}
@@ -125,9 +138,24 @@ func TestStatusBarFormattingIncludesRequestedFieldsAndFitsWidth(t *testing.T) {
 			t.Fatalf("plain status should not include token field %q: %q", forbidden, plain)
 		}
 	}
-	colored := formatStatusBar(state, true, 140)
-	if strings.Contains(colored, "48;5;") || !strings.Contains(colored, "38;5;118") || !strings.Contains(colored, "34") || !strings.Contains(colored, "35") || runeLen(colored) != 140 {
+	colored := formatStatusBar(state, true, 220)
+	if strings.Contains(colored, "48;5;") || !strings.Contains(colored, "38;5;118") || !strings.Contains(colored, "34") || !strings.Contains(colored, "35") || runeLen(colored) != 220 {
 		t.Fatalf("colored status should be colorful, background-free, and fit width, len=%d text=%q", runeLen(colored), colored)
+	}
+}
+
+func TestCompactStatusProjectPathUsesHomeAndTruncates(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := compactStatusProjectPath(filepath.Join(home, "code", "demo")); got != filepath.Join("~", "code", "demo") {
+		t.Fatalf("home project path = %q", got)
+	}
+	long := filepath.Join(home, strings.Repeat("nested/", 12), "project")
+	got := compactStatusProjectPath(long)
+	if !strings.HasPrefix(got, "…") || len([]rune(got)) > 40 {
+		t.Fatalf("long project path = %q", got)
 	}
 }
 
@@ -209,16 +237,48 @@ func TestAnimatedConnectingLogoMatchesReferenceShapeAndGlows(t *testing.T) {
 	profileAt := strings.Index(frame, "profile: zaiagents")
 	transportAt := strings.Index(frame, "transport: Nirvana websocket")
 	connectingAt := strings.Index(frame, "Connecting...")
-	if !strings.HasPrefix(frame, rows[0]) || profileAt < len(rows[0]) || transportAt <= profileAt || connectingAt <= transportAt {
+	cancelAt := strings.Index(frame, "Esc cancel")
+	if !strings.HasPrefix(frame, rows[0]) || profileAt < len(rows[0]) || transportAt <= profileAt || connectingAt <= transportAt || cancelAt <= connectingAt {
 		t.Fatalf("connecting screen order should be logo, details, status: %q", frame)
+	}
+	if lines := strings.Count(frame, "\n") + 1; lines > 24 {
+		t.Fatalf("connecting screen uses %d rows, want at most 24: %q", lines, frame)
 	}
 }
 
-func TestAnimatedBuildingAndConnectingStatusBounceAndUseWasabiPalette(t *testing.T) {
-	first := animatedBuildingStatus(0)
-	later := animatedBuildingStatus(5)
-	if first == later || !strings.Contains(first, "38;5;190") || !strings.Contains(stripANSI(later), "Building...") {
-		t.Fatalf("animated building status did not vary/glow as expected: first=%q later=%q", first, later)
+func TestConnectingScreenTerminalFrameUsesCRLFWithoutChangingContentOrOrder(t *testing.T) {
+	details := "profile: zaiagents\ntransport: Nirvana websocket\n"
+	logical := connectingScreenFrame(details, 2)
+	physical := connectingScreenTerminalFrame(details, 2)
+
+	if strings.Contains(strings.ReplaceAll(physical, "\r\n", ""), "\n") {
+		t.Fatalf("connecting terminal frame contains a bare LF: %q", physical)
+	}
+	if restored := strings.ReplaceAll(physical, "\r\n", "\n"); restored != logical {
+		t.Fatalf("CRLF conversion changed connecting frame content:\n got: %q\nwant: %q", restored, logical)
+	}
+
+	plain := stripANSI(strings.ReplaceAll(physical, "\r\n", "\n"))
+	profileAt := strings.Index(plain, "profile: zaiagents")
+	transportAt := strings.Index(plain, "transport: Nirvana websocket")
+	connectingAt := strings.Index(plain, "Connecting...")
+	cancelAt := strings.Index(plain, "Esc cancel")
+	if profileAt < 0 || transportAt <= profileAt || connectingAt <= transportAt || cancelAt <= connectingAt {
+		t.Fatalf("connecting terminal frame order should be logo, details, status: %q", plain)
+	}
+}
+
+func TestAnimatedWorkingAndConnectingStatusBounceAndUseWasabiPalette(t *testing.T) {
+	first := animatedWorkingStatus(0)
+	later := animatedWorkingStatus(5)
+	if first == later || !strings.Contains(first, "38;5;190") || !strings.Contains(stripANSI(later), "Working...") {
+		t.Fatalf("animated working status did not vary/glow as expected: first=%q later=%q", first, later)
+	}
+	if got := stripANSI(workingStatusText(true)); got != "Working..." {
+		t.Fatalf("working status label = %q", got)
+	}
+	if got := stripANSI(animatedBuildingStatus(2)); got != "Building..." {
+		t.Fatalf("explicit build status label = %q", got)
 	}
 	connecting := animatedConnectingStatus(3)
 	if !strings.Contains(stripANSI(connecting), "Connecting...") || !strings.Contains(connecting, "38;5;") {

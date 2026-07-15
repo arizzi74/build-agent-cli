@@ -318,7 +318,10 @@ func (c *Client) validateWebSession(ctx context.Context) error {
 
 func (c *Client) sessionValidationGET(ctx context.Context, path string) ([]byte, int, error) {
 	result, err := c.retryGETResult(ctx, strings.TrimRight(c.cfg.InstanceURL, "/")+path, "session_validation", "http", 2*1024*1024, func(req *http.Request) {
-		c.setGatewayHeaders(req)
+		// Session validation must exercise the browser session itself. Generic
+		// Nirvana REST headers prefer cached OAuth, which can hide an expired
+		// cookie or make a valid session endpoint reject the request.
+		c.setGliderWebHeaders(req)
 		req.Header.Set("Accept", "application/json,text/html;q=0.8,*/*;q=0.5")
 	})
 	body, status := result.Body, result.Status

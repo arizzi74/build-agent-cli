@@ -42,6 +42,8 @@ func TestUseAppChoicePersistsSelectedWorkspaceApp(t *testing.T) {
 		t.Fatal(err)
 	}
 	choice := AppChoice{App: AppScope{ScopeID: "appsysid123", ScopeName: "Demo App", AppSysID: "appsysid123"}}
+	statusChecks := 0
+	c.postSelectionStatus = func(context.Context) error { statusChecks++; return nil }
 	var output strings.Builder
 	_, err = withSlashCommandOutput(&output, func() (bool, error) {
 		return true, c.UseAppChoice(context.Background(), choice)
@@ -51,6 +53,9 @@ func TestUseAppChoicePersistsSelectedWorkspaceApp(t *testing.T) {
 	}
 	if c.CurrentApp() == nil || c.CurrentApp().AppSysID != "appsysid123" || c.appScope != "appsysid123" {
 		t.Fatalf("current app mismatch: %#v appScope=%#v", c.CurrentApp(), c.appScope)
+	}
+	if statusChecks != 1 {
+		t.Fatalf("post-selection status checks = %d, want 1", statusChecks)
 	}
 	if got := output.String(); !strings.Contains(got, "app set: appsysid123") || !strings.Contains(got, "app name: Demo App") {
 		t.Fatalf("app selection output mismatch: %q", got)

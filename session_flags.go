@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 func handleSessionFlags(opts Options) (bool, error) {
@@ -13,10 +15,10 @@ func handleSessionFlags(opts Options) (bool, error) {
 		return false, fmt.Errorf("invalid profile %q: use letters, numbers, dash or underscore", opts.Profile)
 	}
 	if opts.Logout {
-		if err := deleteWebSession(opts.Profile); err != nil {
+		if err := deleteProfileAuthentication(opts.Profile); err != nil {
 			return true, err
 		}
-		fmt.Fprintf(os.Stderr, "deleted web session for profile %q\n", opts.Profile)
+		fmt.Fprintf(os.Stderr, "deleted web session and OAuth token for profile %q; instance configuration was preserved\n", opts.Profile)
 		return true, nil
 	}
 	if opts.SessionStatus {
@@ -42,4 +44,13 @@ func handleSessionFlags(opts Options) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+func deleteProfileAuthentication(profile string) error {
+	for _, path := range []string{sessionFile(profile), fileTokenPath(profile)} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("delete saved authentication %s: %w", filepath.Base(path), err)
+		}
+	}
+	return nil
 }

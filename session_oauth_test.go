@@ -18,6 +18,44 @@ func sessionOAuthClient(t *testing.T, server *httptest.Server) *Client {
 	return c
 }
 
+func TestPrepareConnectionAuthenticationValidatesWebSessionBeforeCachedOAuth(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var validations int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/sn_build_agent/build_agent_api/providerConfig" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		validations++
+		if !strings.Contains(r.Header.Get("Cookie"), "JSESSIONID=valid") || r.Header.Get("X-UserToken") != "gck" {
+			t.Fatalf("saved web credentials missing: cookie=%q token=%q", r.Header.Get("Cookie"), r.Header.Get("X-UserToken"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":{"model":"gpt_large"}}`))
+	}))
+	defer server.Close()
+	if err := saveWebSession("zaiagents", WebSession{
+		InstanceURL: server.URL, AuthMode: authModeForm, Username: "admin",
+		CookieHeader: "JSESSIONID=valid", UserToken: "gck", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCachedToken("zaiagents", TokenResponse{
+		AccessToken: "cached-oauth", InstanceURL: server.URL, IssuedAt: time.Now().UnixMilli(), ExpiresIn: 3600,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{cfg: CLIConfig{InstanceURL: server.URL}, opts: Options{Profile: "zaiagents", Nirvana: true, AuthMode: authModeForm}}
+	if err := c.PrepareConnectionAuthentication(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if validations != 1 || !c.connectionAuthPrepared || c.oauthAccessToken != "cached-oauth" || c.sessionCookieHeader != "JSESSIONID=valid" {
+		t.Fatalf("prepared auth validations=%d prepared=%v oauth=%q cookie=%q", validations, c.connectionAuthPrepared, c.oauthAccessToken, c.sessionCookieHeader)
+	}
+	if err := c.PrepareConnectionAuthentication(context.Background()); err != nil || validations != 1 {
+		t.Fatalf("second prepare should be a no-op: validations=%d err=%v", validations, err)
+	}
+}
+
 func TestSessionOAuthDirectJSONExchangesAndCaches(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	var tokenForm url.Values

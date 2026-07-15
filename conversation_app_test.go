@@ -15,6 +15,8 @@ func TestApplyWebConversationAppUsesMatchingWorkspaceApp(t *testing.T) {
 		{Name: "Demo App", URI: "now-file:/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		{Name: "Other App", URI: "now-file:/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
 	}
+	statusChecks := 0
+	c.postSelectionStatus = func(context.Context) error { statusChecks++; return nil }
 	conv := WebConversation{
 		ID:              "cccccccccccccccccccccccccccccccc",
 		Title:           "Conversation for demo",
@@ -33,6 +35,9 @@ func TestApplyWebConversationAppUsesMatchingWorkspaceApp(t *testing.T) {
 	if saved, ok := loadActiveApp(c.opts.Profile); !ok || saved.AppSysID != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || saved.ScopeName != "Demo App" {
 		t.Fatalf("active app was not persisted from conversation: %#v ok=%v", saved, ok)
 	}
+	if statusChecks != 1 {
+		t.Fatalf("post-selection status checks = %d, want 1", statusChecks)
+	}
 }
 
 func TestApplyWebConversationAppFallsBackToConversationApplicationName(t *testing.T) {
@@ -47,11 +52,16 @@ func TestApplyWebConversationAppFallsBackToConversationApplicationName(t *testin
 		ApplicationID:   "dddddddddddddddddddddddddddddddd",
 		ApplicationName: "Conversation App",
 	}
+	statusChecks := 0
+	c.postSelectionStatus = func(context.Context) error { statusChecks++; return nil }
 	if err := c.applyWebConversationApp(context.Background(), conv); err != nil {
 		t.Fatalf("applyWebConversationApp returned error: %v", err)
 	}
 	if c.CurrentApp() == nil || c.CurrentApp().AppSysID != "dddddddddddddddddddddddddddddddd" || c.CurrentApp().ScopeName != "Conversation App" {
 		t.Fatalf("conversation app fallback mismatch: %#v", c.CurrentApp())
+	}
+	if statusChecks != 1 {
+		t.Fatalf("post-selection status checks = %d, want 1", statusChecks)
 	}
 }
 

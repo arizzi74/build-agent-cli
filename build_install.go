@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 )
 
 const (
@@ -58,11 +60,12 @@ type packageJSONInfo struct {
 }
 
 type syncedBuildProject struct {
-	Dir      string
-	RootURI  string
-	Entries  map[string]gliderChangeEntry
-	Files    map[string]string
-	Original map[string][]byte
+	Dir         string
+	RootURI     string
+	Entries     map[string]gliderChangeEntry
+	Files       map[string]string
+	Original    map[string][]byte
+	PendingPush []string
 }
 
 type installProgressResult struct {
@@ -119,12 +122,7 @@ func (c *Client) answerInstallDependenciesParity(ctx context.Context, payload ma
 	if err != nil {
 		return buildInstallError(err.Error(), buildInstallErrorCode(err), nil), "error"
 	}
-	keepProject := false
-	defer func() {
-		if !keepProject {
-			cleanup()
-		}
-	}()
+	defer cleanup()
 
 	missing := missingNodeDependencies(project.Dir, buildDependencies(ctxInfo.Package))
 	if len(missing) == 0 {
@@ -145,7 +143,6 @@ func (c *Client) answerInstallDependenciesParity(ctx context.Context, payload ma
 		BuildSucceeded: false,
 		BuiltAt:        time.Now(),
 	})
-	keepProject = true
 	msg := fmt.Sprintf("Dependencies installed for ServiceNow application %s.", ctxInfo.displayName())
 	return buildInstallSuccess(msg, map[string]interface{}{"path": payloadPathOrDot(payload), "installedDependencies": missing, "ideContext": c.currentIDEContext()}), "complete"
 }
@@ -158,12 +155,7 @@ func (c *Client) answerBuildParity(ctx context.Context, payload map[string]inter
 	if err != nil {
 		return buildInstallError(err.Error(), buildInstallErrorCode(err), nil), "error"
 	}
-	keepProject := false
-	defer func() {
-		if !keepProject {
-			cleanup()
-		}
-	}()
+	defer cleanup()
 
 	missing := missingNodeDependencies(project.Dir, buildDependencies(ctxInfo.Package))
 	if len(missing) > 0 {
@@ -217,8 +209,6 @@ func (c *Client) answerBuildParity(ctx context.Context, payload map[string]inter
 		BuildSucceeded: true,
 		BuiltAt:        time.Now(),
 	})
-	keepProject = true
-
 	if warnings == nil {
 		warnings = []interface{}{}
 	}
@@ -309,15 +299,237 @@ func (c *Client) prepareBuildProject(ctx context.Context, payload map[string]int
 		return buildInstallContext{}, syncedBuildProject{}, func() {}, err
 	}
 	c.buildInstallProgress("build: synchronizing persistent local project for %s", ctxInfo.displayName())
-	project, cleanup, err := c.syncGliderBuildProjectToPersistent(ctx, ctxInfo.AppID, ctxInfo.RootURI)
+	project, cleanup, err := c.syncGliderBuildProjectToPersistentNamed(ctx, ctxInfo.AppID, ctxInfo.AppName, ctxInfo.RootURI)
 	if err != nil {
-		return buildInstallContext{}, syncedBuildProject{}, func() {}, fmt.Errorf("Error while syncing Glider project for build: %w", err)
+		var collision *canonicalProjectCollisionError
+		if !errors.As(err, &collision) || !collision.Recoverable {
+			return buildInstallContext{}, syncedBuildProject{}, func() {}, fmt.Errorf("Error while syncing Glider project for build: %w", err)
+		}
+		backup, err := c.recoverCanonicalBuildProject(ctx, collision, ctxInfo)
+		if err != nil {
+			return buildInstallContext{}, syncedBuildProject{}, func() {}, err
+		}
+		project, cleanup, err = c.syncGliderBuildProjectToPersistentNamed(ctx, ctxInfo.AppID, ctxInfo.AppName, ctxInfo.RootURI)
+		if err != nil {
+			partial := collision.Target + ".bacli-recovery-failed-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+			if moveErr := os.Rename(collision.Target, partial); moveErr == nil {
+				restored, restoreErr := restoreCanonicalProject(backup, collision.Target)
+				return buildInstallContext{}, syncedBuildProject{}, func() {}, codedError{Code: "PROJECT_RECOVERY_RECREATE_FAILED", Message: projectRecoveryRollbackMessage(err, backup, partial, restored, restoreErr)}
+			}
+			return buildInstallContext{}, syncedBuildProject{}, func() {}, codedError{Code: "PROJECT_RECOVERY_RECREATE_FAILED", Message: fmt.Sprintf("Recovered checkout sync failed (%v); original backup retained at %s and partial checkout remains at %s.", err, backup, collision.Target)}
+		}
+	}
+	if len(project.PendingPush) > 0 {
+		cleanup()
+		return buildInstallContext{}, syncedBuildProject{}, func() {}, codedError{
+			Code:    "SYNC_PUSH_REQUIRED",
+			Message: fmt.Sprintf("Local project changes are pending for %s (%s). Run /sync push before building; the build will not upload pre-existing local edits.", ctxInfo.displayName(), strings.Join(project.PendingPush, ", ")),
+		}
 	}
 	if _, ok := project.Files["now.config.json"]; !ok {
 		cleanup()
 		return buildInstallContext{}, syncedBuildProject{}, func() {}, errors.New("now.config.json was not found in the active Glider project")
 	}
+	if err := refreshBuildInstallContextFromProject(&ctxInfo, project); err != nil {
+		cleanup()
+		return buildInstallContext{}, syncedBuildProject{}, func() {}, err
+	}
 	return ctxInfo, project, cleanup, nil
+}
+
+const projectRecoveryPathLimit = 50
+
+// recoverCanonicalBuildProject is deliberately reachable only from mutating
+// build preparation. It first reads Web state, then asks for a non-bypassable
+// confirmation before moving (never deleting) a conflicting checkout.
+func (c *Client) recoverCanonicalBuildProject(ctx context.Context, collision *canonicalProjectCollisionError, info buildInstallContext) (string, error) {
+	entries, remote, err := c.fetchPersistentRemoteFiles(ctx, info.RootURI)
+	if err != nil {
+		return "", codedError{Code: "PROJECT_RECOVERY_REMOTE_UNAVAILABLE", Message: fmt.Sprintf("Cannot offer local-project recovery for %s because the current Web project could not be read: %v", collision.Target, err)}
+	}
+	diagnostics, err := projectRecoveryDiagnostics(collision.Target, entries, remote)
+	if err != nil {
+		return "", codedError{Code: "PROJECT_RECOVERY_DIAGNOSTICS_FAILED", Message: fmt.Sprintf("Cannot inspect local-project collision at %s: %v", collision.Target, err)}
+	}
+	message := fmt.Sprintf("The canonical local project %s is ambiguous (%s). Recreate it strictly from the current Web project? The existing directory will be moved to a sibling backup and retained.\n%s", collision.Target, collision.Reason, diagnostics.summary())
+	rows := diagnostics.rows()
+	var approved bool
+	if c.projectRecoveryApproval != nil {
+		approved, err = c.projectRecoveryApproval(rows, message)
+	} else {
+		if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) {
+			return "", codedError{Code: "PROJECT_RECOVERY_NONINTERACTIVE", Message: fmt.Sprintf("Local-project recovery requires an interactive explicit confirmation; nothing was changed. %s", diagnostics.summary())}
+		}
+		// This is intentionally not answerApproval and therefore AutoApprove
+		// cannot bypass a local replacement confirmation.
+		approved, err = promptApprovalTable(rows, message, false)
+	}
+	if err != nil {
+		return "", codedError{Code: "PROJECT_RECOVERY_PROMPT_FAILED", Message: fmt.Sprintf("Local-project recovery was not performed: %v. %s", err, diagnostics.summary())}
+	}
+	if !approved {
+		return "", codedError{Code: "PROJECT_RECOVERY_DECLINED", Message: fmt.Sprintf("Local-project recovery was declined; nothing was changed. %s", diagnostics.summary())}
+	}
+	backup, err := moveCanonicalProjectToBackup(collision.Target)
+	if err != nil {
+		return "", codedError{Code: "PROJECT_RECOVERY_BACKUP_FAILED", Message: fmt.Sprintf("Could not preserve conflicting local project before recovery: %v", err)}
+	}
+	if err := os.MkdirAll(collision.Target, 0o755); err != nil {
+		restored, restoreErr := restoreCanonicalProject(backup, collision.Target)
+		return "", codedError{Code: "PROJECT_RECOVERY_RECREATE_FAILED", Message: projectRecoveryRollbackMessage(err, backup, "", restored, restoreErr)}
+	}
+	// The caller retries normal sync from an empty, unclaimed directory. That
+	// path is pull-only on first materialization; no collision contents are ever
+	// included in a push.
+	return backup, nil
+}
+
+type projectRecoveryReport struct {
+	localCount, remoteCount          int
+	localNewest, remoteNewest        string
+	differing, localOnly, remoteOnly []string
+}
+
+func projectRecoveryDiagnostics(dir string, entries map[string]gliderChangeEntry, remote map[string][]byte) (projectRecoveryReport, error) {
+	report := projectRecoveryReport{remoteCount: len(remote)}
+	local, err := localPersistentFiles(dir)
+	if err != nil {
+		return report, err
+	}
+	report.localCount = len(local)
+	var newest time.Time
+	for rel := range local {
+		path, err := persistentSafeLocalWritePath(dir, rel)
+		if err != nil {
+			return report, err
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return report, err
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		if info.ModTime().After(newest) || (info.ModTime().Equal(newest) && rel < report.localNewest) {
+			newest, report.localNewest = info.ModTime(), rel
+		}
+	}
+	if !newest.IsZero() {
+		report.localNewest = newest.UTC().Format(time.RFC3339) + " " + report.localNewest
+	}
+	var remoteLatest int64
+	var remoteLatestPath string
+	for path, content := range remote {
+		entry := entries[path]
+		if entry.MTime > remoteLatest || (entry.MTime == remoteLatest && (remoteLatestPath == "" || path < remoteLatestPath)) {
+			remoteLatest, remoteLatestPath = entry.MTime, path
+		}
+		if localContent, ok := local[path]; !ok {
+			report.remoteOnly = append(report.remoteOnly, path)
+		} else if !bytes.Equal(localContent, content) {
+			report.differing = append(report.differing, path)
+		}
+	}
+	for path := range local {
+		if _, ok := remote[path]; !ok {
+			report.localOnly = append(report.localOnly, path)
+		}
+	}
+	if remoteLatestPath != "" {
+		if remoteLatest > 0 {
+			report.remoteNewest = time.UnixMilli(remoteLatest).UTC().Format(time.RFC3339) + " " + remoteLatestPath
+		} else {
+			report.remoteNewest = "unavailable (Web timestamps not provided)"
+		}
+	}
+	for _, paths := range [][]string{report.differing, report.localOnly, report.remoteOnly} {
+		sort.Strings(paths)
+	}
+	return report, nil
+}
+
+func boundedRecoveryPaths(paths []string) string {
+	if len(paths) == 0 {
+		return "none"
+	}
+	if len(paths) > projectRecoveryPathLimit {
+		return strings.Join(paths[:projectRecoveryPathLimit], ", ") + fmt.Sprintf(" (+%d more)", len(paths)-projectRecoveryPathLimit)
+	}
+	return strings.Join(paths, ", ")
+}
+func (r projectRecoveryReport) summary() string {
+	return fmt.Sprintf("Local files: %d (newest: %s); Web files: %d (newest: %s); differing: %s; local-only: %s; Web-only: %s.", r.localCount, firstNonBlank(r.localNewest, "none"), r.remoteCount, firstNonBlank(r.remoteNewest, "none"), boundedRecoveryPaths(r.differing), boundedRecoveryPaths(r.localOnly), boundedRecoveryPaths(r.remoteOnly))
+}
+func (r projectRecoveryReport) rows() [][2]string {
+	return [][2]string{{"Local files", fmt.Sprint(r.localCount)}, {"Web files", fmt.Sprint(r.remoteCount)}, {"Newest local", firstNonBlank(r.localNewest, "none")}, {"Newest Web", firstNonBlank(r.remoteNewest, "none")}, {"Differing", boundedRecoveryPaths(r.differing)}, {"Local-only", boundedRecoveryPaths(r.localOnly)}, {"Web-only", boundedRecoveryPaths(r.remoteOnly)}}
+}
+
+func moveCanonicalProjectToBackup(target string) (string, error) {
+	for n := 0; ; n++ {
+		suffix := time.Now().UTC().Format("20060102T150405.000000000Z")
+		if n > 0 {
+			suffix += fmt.Sprintf("-%d", n)
+		}
+		backup := target + ".bacli-backup-" + suffix
+		if _, err := os.Lstat(backup); errors.Is(err, os.ErrNotExist) {
+			if err := os.Rename(target, backup); err != nil {
+				return "", err
+			}
+			return backup, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+}
+func restoreCanonicalProject(backup, target string) (bool, error) {
+	if err := os.Rename(backup, target); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+func projectRecoveryRollbackMessage(cause error, backup, partial string, restored bool, restoreErr error) string {
+	if restored {
+		return fmt.Sprintf("Recovery recreation failed (%v); the original local project was restored from %s.", cause, backup)
+	}
+	return fmt.Sprintf("Recovery recreation failed (%v); backup retained at %s, partial checkout at %s, restore error: %v.", cause, backup, partial, restoreErr)
+}
+
+// refreshBuildInstallContextFromProject makes dependency and packaging decisions
+// from the locked checkout after sync has pulled remote-only changes.
+func refreshBuildInstallContextFromProject(ctxInfo *buildInstallContext, project syncedBuildProject) error {
+	nowPath, ok := project.Files["now.config.json"]
+	if !ok {
+		return errors.New("now.config.json was not found in the active Glider project")
+	}
+	nowRaw, err := os.ReadFile(nowPath)
+	if err != nil {
+		return fmt.Errorf("failed to read synced now.config.json: %w", err)
+	}
+	var nowCfg map[string]interface{}
+	if err := json.Unmarshal(nowRaw, &nowCfg); err != nil {
+		return fmt.Errorf("failed to parse synced now.config.json: %w", err)
+	}
+	ctxInfo.NowConfig = nowCfg
+	if scope := strings.TrimSpace(stringify(nowCfg["scope"])); scope != "" {
+		ctxInfo.Scope = scope
+	}
+	if scopeID := strings.TrimSpace(stringify(nowCfg["scopeId"])); scopeID != "" {
+		ctxInfo.ScopeID = scopeID
+	}
+	if appName := strings.TrimSpace(stringify(nowCfg["name"])); appName != "" {
+		ctxInfo.AppName = appName
+	}
+	if packagePath, ok := project.Files["package.json"]; ok {
+		packageRaw, err := os.ReadFile(packagePath)
+		if err != nil {
+			return fmt.Errorf("failed to read synced package.json: %w", err)
+		}
+		ctxInfo.Package = parsePackageJSONInfo(packageRaw)
+		if version := strings.TrimSpace(ctxInfo.Package.Version); version != "" {
+			ctxInfo.Version = version
+		}
+	}
+	return nil
 }
 
 func (c *Client) resolveBuildInstallContext(ctx context.Context, payload map[string]interface{}) (buildInstallContext, error) {
@@ -413,32 +625,38 @@ func (c *Client) syncGliderBuildProjectToTemp(ctx context.Context, rootURI strin
 }
 
 func (c *Client) syncGliderBuildProjectToPersistent(ctx context.Context, appID, rootURI string) (syncedBuildProject, func(), error) {
+	return c.syncGliderBuildProjectToPersistentNamed(ctx, appID, c.persistentAppDisplayName(appID), rootURI)
+}
+
+func (c *Client) syncGliderBuildProjectToPersistentNamed(ctx context.Context, appID, appName, rootURI string) (syncedBuildProject, func(), error) {
 	// Kept under the historical wrapper name for compatibility, but projects now
 	// live persistently under the process launch directory. Internal build tools
 	// may run while a turn is processing, so they bypass only the interactive
 	// slash-command availability guard while retaining conflict detection.
-	result, err := c.syncPersistentAppForBuild(ctx, appID, rootURI, persistentSyncAuto)
+	result, cleanup, err := c.syncPersistentAppForBuildNamedLocked(ctx, appID, appName, rootURI, persistentSyncAuto)
 	if err != nil {
 		return syncedBuildProject{}, func() {}, err
 	}
 	entries, remoteFiles, err := c.fetchPersistentRemoteFiles(ctx, rootURI)
 	if err != nil {
+		cleanup()
 		return syncedBuildProject{}, func() {}, err
 	}
-	project := syncedBuildProject{Dir: result.LocalDir, RootURI: rootURI, Entries: map[string]gliderChangeEntry{}, Files: map[string]string{}, Original: map[string][]byte{}}
+	project := syncedBuildProject{Dir: result.LocalDir, RootURI: rootURI, Entries: map[string]gliderChangeEntry{}, Files: map[string]string{}, Original: map[string][]byte{}, PendingPush: append([]string(nil), result.PendingPush...)}
 	for rel, entry := range entries {
 		if !includeBuildProjectFile(rel) {
 			continue
 		}
 		localPath, err := safeBuildLocalPath(project.Dir, rel)
 		if err != nil {
+			cleanup()
 			return syncedBuildProject{}, func() {}, err
 		}
 		project.Entries[entry.URI] = entry
 		project.Files[rel] = localPath
 		project.Original[rel] = append([]byte(nil), remoteFiles[rel]...)
 	}
-	return project, func() {}, nil
+	return project, cleanup, nil
 }
 
 func includeBuildProjectFile(rel string) bool {
@@ -554,7 +772,10 @@ func (c *Client) installProjectDependencies(ctx context.Context, projectDir stri
 		return codedError{Code: "NPM_NOT_FOUND", Message: msg}
 	}
 	c.buildInstallProgress("build: installing %d missing dependency package(s): %s", len(missing), strings.Join(missing, ", "))
-	output, err := runLocalCommand(ctx, projectDir, npmPath, []string{"install", "--no-audit", "--no-fund"})
+	// package-lock.json is derived local dependency state for bacli builds, not
+	// application source. Prevent npm from creating/updating it and forcing the
+	// next conservative sync preflight into a local-change conflict.
+	output, err := runLocalCommand(ctx, projectDir, npmPath, []string{"install", "--no-audit", "--no-fund", "--package-lock=false"})
 	if err != nil {
 		return codedError{Code: "DEPENDENCY_INSTALL_FAILED", Message: fmt.Sprintf("Dependency installation failed: %s", commandErrorSummary(err, output))}
 	}
@@ -705,12 +926,12 @@ func (c *Client) persistGeneratedBuildFiles(ctx context.Context, project syncedB
 		if !allMatch {
 			return nil, err
 		}
-		if manifestErr := refreshPersistentSyncManifest(project.Dir, ctxInfo.AppID, project.RootURI); manifestErr != nil {
+		if manifestErr := c.refreshPersistentSyncManifest(project.Dir, ctxInfo.AppID, project.RootURI); manifestErr != nil {
 			return nil, manifestErr
 		}
 		return []interface{}{"Glider sync returned an error after persisting generated files; verified remote content matches."}, nil
 	}
-	if err := refreshPersistentSyncManifest(project.Dir, ctxInfo.AppID, project.RootURI); err != nil {
+	if err := c.refreshPersistentSyncManifest(project.Dir, ctxInfo.AppID, project.RootURI); err != nil {
 		return nil, err
 	}
 	return nil, nil

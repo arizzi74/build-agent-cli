@@ -1089,7 +1089,11 @@ func (c *Client) applyWebConversationApp(ctx context.Context, conv WebConversati
 	c.currentApp = &app
 	c.appScope = app.ScopeID
 	_ = c.ensureActiveAppMetadata(ctx)
-	return saveActiveApp(c.opts.Profile, *c.currentApp)
+	if err := saveActiveApp(c.opts.Profile, *c.currentApp); err != nil {
+		return err
+	}
+	c.postAppSelectionStatus(ctx)
+	return nil
 }
 
 func (c *Client) restoreSavedWebConversation(ctx context.Context) {
@@ -1144,6 +1148,25 @@ func (c *Client) restoreStartupConversationTranscript(status statusBarState) boo
 		}
 	}
 	return changed
+}
+
+// replaceTerminalConversationTranscript establishes a hard UI boundary when
+// changing profiles. In particular, a target profile with no saved
+// conversation must clear the previous instance's transcript rather than
+// leaving it visible merely because restoreStartupConversationTranscript has
+// nothing to replay.
+func (c *Client) replaceTerminalConversationTranscript(status statusBarState) bool {
+	terminalSetConversationHistory("", nil)
+	if c.restoreStartupConversationTranscript(status) {
+		return true
+	}
+	if interactiveTerminalUIEnabled() {
+		if _, replayed := terminalReplayManagedViewportWithScrollback(status); replayed {
+			redrawPendingFooterPromptFromState()
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) StartNewWebConversation(ctx context.Context) error {
