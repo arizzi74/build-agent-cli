@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -158,6 +159,14 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 	var ctrlDMu sync.Mutex
 	var ctrlDTimer *time.Timer
 	promptDone := make(chan struct{})
+	promptLabel := func() string {
+		if client != nil {
+			if count := client.pendingAttachmentCount(); count > 0 {
+				return fmt.Sprintf("ba[attach:%d]> ", count)
+			}
+		}
+		return prompt
+	}
 	defer func() {
 		close(promptDone)
 		ctrlDMu.Lock()
@@ -199,8 +208,9 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 	}
 
 	redrawSnapshot := func(snapshot promptSnapshot) {
+		livePrompt := promptLabel()
 		menuLines := slashMenuLines(snapshot.menuOpen, snapshot.menu, snapshot.selected)
-		layout.redraw(prompt, snapshot.line, snapshot.cursor, menuLines)
+		layout.redraw(livePrompt, snapshot.line, snapshot.cursor, menuLines)
 		if layout.enabled {
 			return
 		}
@@ -218,7 +228,7 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 		if terminalStatusANSIEnabled() {
 			leadingCells = 1
 		}
-		available := maxInt(1, width-terminalDisplayWidth(prompt)-leadingCells-1)
+		available := maxInt(1, width-terminalDisplayWidth(livePrompt)-leadingCells-1)
 		visiblePrefix := displayPrefix
 		leftMarker := ""
 		if terminalDisplayWidth(visiblePrefix) > available {
@@ -229,7 +239,7 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 		displayLine := leftMarker + visiblePrefix + terminalFitCells(displaySuffix, maxInt(available-cursorCells, 0))
 		terminalRenderMu.Lock()
 		beginTerminalFrame()
-		fmt.Fprintf(os.Stderr, "\r%s%s", ansiEraseLine, commandInputLine(prompt, displayLine))
+		fmt.Fprintf(os.Stderr, "\r%s%s", ansiEraseLine, commandInputLine(livePrompt, displayLine))
 		fmt.Fprintf(os.Stderr, "%s\x1b[J", ansiReset)
 		lines := boundedSlashMenuLines(menuLines, terminalSlashMenuMaxRows())
 		for _, menuLine := range lines {
@@ -240,7 +250,7 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 		} else {
 			fmt.Fprint(os.Stderr, "\r")
 		}
-		col := terminalDisplayWidth(prompt) + leadingCells + cursorCells
+		col := terminalDisplayWidth(livePrompt) + leadingCells + cursorCells
 		if col > 0 {
 			fmt.Fprintf(os.Stderr, "\x1b[%dC", col)
 		}
@@ -264,7 +274,7 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 			if abort {
 				layout.abort(marker)
 			} else {
-				layout.submit(prompt, result)
+				layout.submit(promptLabel(), result)
 			}
 			return
 		}
@@ -321,7 +331,7 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 		if sizeErr != nil || width <= 0 {
 			width = terminalStatusWidth()
 		}
-		return maxInt(1, width-terminalDisplayWidth(prompt)-2)
+		return maxInt(1, width-terminalDisplayWidth(promptLabel())-2)
 	}
 
 	for {
@@ -468,6 +478,26 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 					end -= before - len(editor.Text())
 				}
 			}
+
+		case terminalInputCtrlV:
+			if client == nil {
+				warning = "Clipboard image capture is unavailable"
+				break
+			}
+			clipboardCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			name, mediaType, data, clipboardErr := readClipboardAttachment(clipboardCtx)
+			cancel()
+			if clipboardErr != nil {
+				warning = "Attachment not added: " + clipboardErr.Error()
+				break
+			}
+			summary, attachmentErr := client.addPendingAttachmentBytes(name, mediaType, data)
+			if attachmentErr != nil {
+				warning = "Attachment not added: " + attachmentErr.Error()
+				break
+			}
+			warning = fmt.Sprintf("Attached %s (%s)", summary.Name, formatAttachmentBytes(summary.Size))
+			redrawNeeded = true
 
 		case terminalInputCtrlK:
 			probe := editor

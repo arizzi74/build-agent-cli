@@ -49,6 +49,9 @@ type Options struct {
 	AdvertiseLocalTools bool
 	ApplicationIDList   string
 	TurnTimeout         time.Duration
+	TelegramOnly        bool
+	TelegramStatus      bool
+	TelegramApprove     string
 	Version             bool
 }
 
@@ -83,12 +86,21 @@ func main() {
 		}
 		return
 	}
+	if handled, err := handleTelegramOfflineFlags(opts); handled {
+		if err != nil {
+			fatal(err)
+		}
+		return
+	}
 	if handled, err := handleSessionFlags(opts); handled {
 		if err != nil {
 			fatal(err)
 		}
 		return
 	}
+	// Keep the optional bot token out of OAuth/browser, Node/npm, and other child
+	// process environments. The in-memory copy is passed only to the bot client.
+	telegramEnvironmentToken := takeTelegramEnvironmentToken()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -114,7 +126,7 @@ func main() {
 	}
 
 	appScreenEntered := false
-	if len(opts.Prompts) == 0 && enterTerminalAppScreen() {
+	if len(opts.Prompts) == 0 && !opts.TelegramOnly && enterTerminalAppScreen() {
 		appScreenEntered = true
 		defer func() {
 			if appScreenEntered {
@@ -156,6 +168,7 @@ func main() {
 	stopConnectingStatus()
 	cancel()
 	defer func() { _ = client.Close() }()
+	clientRef := newActiveClientRef(client)
 
 	var switchInstance func(context.Context, string) error
 	switchInstance = func(switchCtx context.Context, selector string) error {
@@ -216,6 +229,7 @@ func main() {
 
 		candidate.instanceSwitch = switchInstance
 		client = candidate
+		clientRef.Set(candidate)
 		candidate.drawPersistentStatus()
 		if wasAppScreen {
 			status := candidate.statusBarState()
@@ -226,6 +240,31 @@ func main() {
 		return nil
 	}
 	client.instanceSwitch = switchInstance
+
+	telegram, telegramErr := maybeStartTelegramService(ctx, opts.Profile, clientRef, opts.TurnTimeout, telegramEnvironmentToken)
+	if telegramErr != nil {
+		if opts.TelegramOnly {
+			fatal(telegramErr)
+		}
+		client.printRuntimeError("warning: Telegram channel unavailable: " + telegramErr.Error())
+	}
+	if telegram != nil {
+		defer telegram.Close()
+	}
+	if opts.TelegramOnly {
+		if len(opts.Prompts) > 0 {
+			fatal(errors.New("--telegram-only cannot be combined with --prompt"))
+		}
+		if telegram == nil {
+			fatal(errors.New("--telegram-only requires an enabled Telegram policy and a secure token file or BACLI_TELEGRAM_BOT_TOKEN"))
+		}
+		select {
+		case <-ctx.Done():
+		case err := <-telegram.Fatal():
+			fatal(err)
+		}
+		return
+	}
 
 	if len(opts.Prompts) > 0 {
 		for _, prompt := range opts.Prompts {
@@ -251,7 +290,7 @@ func main() {
 			return
 		}
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if line == "" && client.pendingAttachmentCount() == 0 {
 			continue
 		}
 		switch strings.ToLower(line) {
@@ -382,6 +421,9 @@ func parseFlags() Options {
 	flag.BoolVar(&opts.Version, "version", false, "print the bacli version and exit")
 	flag.BoolVar(&opts.AdvertiseLocalTools, "advertise-local-tools", false, "advertise tools.execute; local tools are mostly not implemented in this first Go version")
 	flag.StringVar(&opts.ApplicationIDList, "application-id-list", "", "comma-separated sys_app ids for Build Agent conversation listing; mirrors the web UI application_id_list query")
+	flag.BoolVar(&opts.TelegramOnly, "telegram-only", false, "run headless with the private Telegram command channel")
+	flag.BoolVar(&opts.TelegramStatus, "telegram-status", false, "show local Telegram pairing/configuration status and exit without connecting")
+	flag.StringVar(&opts.TelegramApprove, "telegram-approve", "", "approve a one-hour Telegram pairing code offline and exit")
 	turnTimeout := flag.Duration("turn-timeout", 10*time.Minute, "timeout per agent turn")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options]\n\n", os.Args[0])
@@ -416,14 +458,8 @@ func versionFlagRequested(args []string) bool {
 }
 
 func runPrompt(ctx context.Context, client *Client, prompt string, timeout time.Duration) error {
-	turnCtx := client.beginActiveTurn(ctx)
-	defer client.endActiveTurn()
-	if err := client.SendMessage(turnCtx, prompt); err != nil {
-		return err
-	}
-	waitCtx, cancel := context.WithTimeout(turnCtx, timeout)
-	defer cancel()
-	return client.WaitTurn(waitCtx)
+	_, err := runPromptForResponse(ctx, client, prompt, timeout)
+	return err
 }
 
 func fatal(err error) {

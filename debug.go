@@ -10,6 +10,7 @@ import (
 )
 
 const redactedDebugValue = "[REDACTED]"
+const redactedDebugAttachmentValue = "[REDACTED ATTACHMENT]"
 
 type lockedWriter struct {
 	mu sync.Mutex
@@ -129,11 +130,20 @@ func redactDebugJSON(v interface{}) []byte {
 func redactDebugJSONBytes(raw []byte) []byte {
 	var v interface{}
 	if err := json.Unmarshal(raw, &v); err != nil {
+		if containsInlineAttachmentData(string(raw)) {
+			return []byte(redactedDebugAttachmentValue)
+		}
 		return raw
+	}
+	if text, ok := v.(string); ok && containsInlineAttachmentData(text) {
+		v = redactedDebugAttachmentValue
 	}
 	redactDebugValue(v, "")
 	redacted, err := json.Marshal(v)
 	if err != nil {
+		if containsInlineAttachmentData(string(raw)) {
+			return []byte(redactedDebugAttachmentValue)
+		}
 		return raw
 	}
 	return redacted
@@ -147,13 +157,44 @@ func redactDebugValue(v interface{}, key string) {
 				typed[k] = redactedDebugValue
 				continue
 			}
+			if isAttachmentDebugKey(k) {
+				typed[k] = redactedDebugAttachmentValue
+				continue
+			}
+			if text, ok := child.(string); ok && containsInlineAttachmentData(text) {
+				typed[k] = redactedDebugAttachmentValue
+				continue
+			}
 			redactDebugValue(child, k)
 		}
 	case []interface{}:
-		for _, child := range typed {
+		for i, child := range typed {
+			if text, ok := child.(string); ok && containsInlineAttachmentData(text) {
+				typed[i] = redactedDebugAttachmentValue
+				continue
+			}
 			redactDebugValue(child, key)
 		}
 	}
+}
+
+func isAttachmentDebugKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "attachment", "attachments", "images", "image_data", "file_data", "clipboard_data":
+		return true
+	default:
+		return false
+	}
+}
+
+func isInlineAttachmentData(value string) bool {
+	value = strings.TrimSpace(value)
+	return strings.HasPrefix(strings.ToLower(value), "data:") && strings.Contains(value, ";base64,")
+}
+
+func containsInlineAttachmentData(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	return isInlineAttachmentData(lower) || (strings.Contains(lower, "data:") && strings.Contains(lower, ";base64,"))
 }
 
 func isSensitiveDebugKey(key string) bool {

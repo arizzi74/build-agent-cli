@@ -637,7 +637,7 @@ func (c *Client) syncGliderBuildProjectToPersistentNamed(ctx context.Context, ap
 	// live persistently under the process launch directory. Internal build tools
 	// may run while a turn is processing, so they bypass only the interactive
 	// slash-command availability guard while retaining conflict detection.
-	result, cleanup, err := c.syncPersistentAppForBuildNamedLocked(ctx, appID, appName, rootURI, persistentSyncAuto)
+	result, cleanup, err := c.syncPersistentAppForBuildNamedLocked(ctx, appID, appName, rootURI, persistentSyncReconcile)
 	if err != nil {
 		return syncedBuildProject{}, func() {}, err
 	}
@@ -874,6 +874,9 @@ func (c *Client) persistGeneratedBuildFiles(ctx context.Context, project syncedB
 			return err
 		}
 		rel := filepath.ToSlash(relLocal)
+		if !isPersistentSyncFile(rel) {
+			return nil
+		}
 		if bytes.Equal(project.Original[rel], content) {
 			return nil
 		}
@@ -928,12 +931,12 @@ func (c *Client) persistGeneratedBuildFiles(ctx context.Context, project syncedB
 		if !allMatch {
 			return nil, err
 		}
-		if manifestErr := c.refreshPersistentSyncManifest(project.Dir, ctxInfo.AppID, project.RootURI); manifestErr != nil {
+		if manifestErr := c.refreshPersistentSyncManifestVerified(ctx, project.Dir, ctxInfo.AppID, project.RootURI, rels); manifestErr != nil {
 			return nil, manifestErr
 		}
 		return []interface{}{"Glider sync returned an error after persisting generated files; verified remote content matches."}, nil
 	}
-	if err := c.refreshPersistentSyncManifest(project.Dir, ctxInfo.AppID, project.RootURI); err != nil {
+	if err := c.refreshPersistentSyncManifestVerified(ctx, project.Dir, ctxInfo.AppID, project.RootURI, rels); err != nil {
 		return nil, err
 	}
 	return nil, nil

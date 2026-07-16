@@ -246,11 +246,27 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		},
 	},
 	{
-		Canonical: "/project", Aliases: []string{"/projects"}, Description: "manage local app project checkouts", Category: "Context", Order: 66,
+		Canonical: "/attach", Aliases: []string{"/attachments"}, Description: "manage files and clipboard images for the next prompt", Category: "Context", Order: 66,
+		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeNirvana,
+		CapturePolicy: SlashCommandCaptureOutput, Suggestions: []string{"/attach list", "/attach add ", "/attach paste", "/attach remove ", "/attach clear"},
+		Handler: func(ctx context.Context, c *Client, args []string) (bool, error) {
+			return true, handleAttachmentCommand(ctx, c, args)
+		},
+	},
+	{
+		Canonical: "/project", Aliases: []string{"/projects"}, Description: "manage local app project checkouts", Category: "Context", Order: 67,
 		Arguments: SlashCommandRequiredSubcommand, Behavior: SlashCommandTemplate, Runtime: SlashCommandRuntimeAny,
 		CapturePolicy: SlashCommandCaptureOutput, Suggestions: []string{"/project help", "/project current", "/project list", "/project use ", "/project clone-here", "/project primary ", "/project forget "},
 		Handler: func(ctx context.Context, c *Client, args []string) (bool, error) {
 			return true, handleProjectCommand(ctx, c, args)
+		},
+	},
+	{
+		Canonical: "/telegram", Description: "inspect and manage the private Telegram channel", Category: "General", Order: 68,
+		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: false, Suggestions: []string{"/telegram status", "/telegram help"},
+		Handler: func(ctx context.Context, c *Client, args []string) (bool, error) {
+			return true, handleTelegramCommand(ctx, c, args)
 		},
 	},
 	{

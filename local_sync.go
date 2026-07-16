@@ -12,7 +12,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/term"
 )
 
 const (
@@ -39,6 +42,10 @@ const (
 	persistentSyncPull   persistentSyncMode = "pull"
 	persistentSyncPush   persistentSyncMode = "push"
 	persistentSyncStatus persistentSyncMode = "status"
+	// persistentSyncReconcile is internal to build preparation. It keeps the
+	// remote-only fast path, but requires an explicit plan approval before any
+	// local source is uploaded or a divergent path is overwritten.
+	persistentSyncReconcile persistentSyncMode = "reconcile"
 )
 
 type persistentSyncResult struct {
@@ -50,6 +57,103 @@ type persistentSyncResult struct {
 	Conflicts       []string
 	Unchanged       int
 	PendingPush     []string
+	PendingPull     []string
+}
+
+type persistentSyncSnapshot struct {
+	Manifest      persistentSyncManifest
+	HaveManifest  bool
+	RemoteEntries map[string]gliderChangeEntry
+	RemoteFiles   map[string][]byte
+	LocalFiles    map[string][]byte
+	LocalChecks   map[string]string
+	RemoteChecks  map[string]string
+	Baseline      map[string]string
+	LocalMTimes   map[string]int64
+	Fingerprint   string
+}
+
+type persistentSyncAction struct {
+	Path        string
+	Direction   string
+	Delete      bool
+	Conflict    bool
+	LocalMTime  int64
+	RemoteMTime int64
+	Reason      string
+}
+
+type persistentSyncPlan struct {
+	Fingerprint string
+	Actions     []persistentSyncAction
+	Unresolved  []string
+}
+
+var errPersistentSyncNonInteractive = errors.New("persistent sync reconciliation requires an interactive terminal")
+
+type persistentSyncCachedOutcome struct {
+	TurnID      string
+	Fingerprint string
+	Err         codedError
+}
+
+var persistentSyncOutcomeCache = struct {
+	sync.Mutex
+	byClient map[*Client]persistentSyncCachedOutcome
+}{byClient: map[*Client]persistentSyncCachedOutcome{}}
+
+// persistentSyncApprovalPrompt is a narrow test seam. The production prompt
+// is always explicit and defaults to Reject; --auto-approve cannot bypass it.
+var persistentSyncApprovalPrompt = func(rows [][2]string, message string) (bool, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) {
+		return false, errPersistentSyncNonInteractive
+	}
+	return promptApprovalTable(rows, message, false)
+}
+
+func (c *Client) persistentSyncTurnID() string {
+	if !c.processing {
+		return ""
+	}
+	c.activeTurnMu.Lock()
+	turnID := strings.TrimSpace(c.activeServerTurnID)
+	c.activeTurnMu.Unlock()
+	return turnID
+}
+
+func (c *Client) cachedPersistentSyncOutcome(fingerprint string) (error, bool) {
+	turnID := c.persistentSyncTurnID()
+	if turnID == "" {
+		return nil, false
+	}
+	persistentSyncOutcomeCache.Lock()
+	defer persistentSyncOutcomeCache.Unlock()
+	cached, ok := persistentSyncOutcomeCache.byClient[c]
+	if !ok {
+		return nil, false
+	}
+	if cached.TurnID != turnID || cached.Fingerprint != fingerprint {
+		delete(persistentSyncOutcomeCache.byClient, c)
+		return nil, false
+	}
+	return cached.Err, true
+}
+
+func (c *Client) rememberPersistentSyncOutcome(fingerprint string, err error) {
+	turnID := c.persistentSyncTurnID()
+	var coded codedError
+	if turnID == "" || !errors.As(err, &coded) || (coded.Code != "SYNC_RECONCILIATION_REQUIRED" && coded.Code != "SYNC_RECONCILIATION_DECLINED") {
+		return
+	}
+	persistentSyncOutcomeCache.Lock()
+	persistentSyncOutcomeCache.byClient[c] = persistentSyncCachedOutcome{TurnID: turnID, Fingerprint: fingerprint, Err: coded}
+	persistentSyncOutcomeCache.Unlock()
+}
+
+func (c *Client) clearPersistentSyncOutcome() {
+	persistentSyncOutcomeCache.Lock()
+	delete(persistentSyncOutcomeCache.byClient, c)
+	persistentSyncOutcomeCache.Unlock()
 }
 
 // canonicalProjectCollisionError makes the distinction between a recoverable
@@ -324,7 +428,7 @@ func isPersistentSyncFile(rel string) bool {
 	// npm creates this derived dependency lock while preparing a local build.
 	// It is deliberately local-only: build/install must not turn dependency
 	// installation into an implicit source upload or a permanent sync conflict.
-	if strings.EqualFold(rel, "package-lock.json") {
+	if strings.EqualFold(rel, "package-lock.json") || strings.EqualFold(rel, ".now/bom.json") {
 		return false
 	}
 	parts := strings.Split(rel, "/")
@@ -398,12 +502,291 @@ func fileChecksums(files map[string][]byte) map[string]string {
 	return fileChecksumsWithAlgorithm(files, "sha256")
 }
 
+func localPersistentFileMTimes(root string, files map[string][]byte) (map[string]int64, error) {
+	out := make(map[string]int64, len(files))
+	for rel := range files {
+		path, err := persistentSafeLocalPath(root, rel)
+		if err != nil {
+			return nil, err
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("sync source is not a regular file: %s", rel)
+		}
+		out[rel] = info.ModTime().UnixNano()
+	}
+	return out, nil
+}
+
+func persistentSyncSnapshotFingerprint(snapshot persistentSyncSnapshot) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "manifest=%t\nalgorithm=%s\n", snapshot.HaveManifest, snapshot.Manifest.ChecksumAlgorithm)
+	for _, rel := range syncPaths(snapshot.LocalChecks, snapshot.RemoteChecks, snapshot.Baseline) {
+		remoteMTime := int64(0)
+		if entry, ok := snapshot.RemoteEntries[rel]; ok {
+			remoteMTime = entry.MTime
+		}
+		fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%d\x00%d\n", rel, snapshot.Baseline[rel], snapshot.LocalChecks[rel], snapshot.RemoteChecks[rel], snapshot.LocalMTimes[rel], remoteMTime)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (c *Client) capturePersistentSyncSnapshot(ctx context.Context, projectDir, rootURI string, manifest persistentSyncManifest, haveManifest bool) (persistentSyncSnapshot, error) {
+	entries, remoteFiles, err := c.fetchPersistentRemoteFiles(ctx, rootURI)
+	if err != nil {
+		return persistentSyncSnapshot{}, err
+	}
+	localFiles, err := localPersistentFiles(projectDir)
+	if err != nil {
+		return persistentSyncSnapshot{}, err
+	}
+	localMTimes, err := localPersistentFileMTimes(projectDir, localFiles)
+	if err != nil {
+		return persistentSyncSnapshot{}, err
+	}
+	algorithm := "sha256"
+	baseline := map[string]string{}
+	if haveManifest {
+		algorithm = manifest.ChecksumAlgorithm
+		baseline = manifest.Files
+	}
+	snapshot := persistentSyncSnapshot{
+		Manifest:      manifest,
+		HaveManifest:  haveManifest,
+		RemoteEntries: entries,
+		RemoteFiles:   remoteFiles,
+		LocalFiles:    localFiles,
+		LocalChecks:   fileChecksumsWithAlgorithm(localFiles, algorithm),
+		RemoteChecks:  fileChecksumsWithAlgorithm(remoteFiles, algorithm),
+		Baseline:      baseline,
+		LocalMTimes:   localMTimes,
+	}
+	snapshot.Fingerprint = persistentSyncSnapshotFingerprint(snapshot)
+	return snapshot, nil
+}
+
+func persistentSyncPlanFromSnapshot(snapshot persistentSyncSnapshot) persistentSyncPlan {
+	plan := persistentSyncPlan{Fingerprint: snapshot.Fingerprint}
+	for _, rel := range syncPaths(snapshot.LocalChecks, snapshot.RemoteChecks, snapshot.Baseline) {
+		local, remote, base := snapshot.LocalChecks[rel], snapshot.RemoteChecks[rel], snapshot.Baseline[rel]
+		if local == remote {
+			continue
+		}
+		localChanged, remoteChanged := local != base, remote != base
+		if !snapshot.HaveManifest && local != "" && remote != "" {
+			localChanged, remoteChanged = true, true
+		}
+		localMTime := snapshot.LocalMTimes[rel]
+		remoteMTime := int64(0)
+		if entry, ok := snapshot.RemoteEntries[rel]; ok {
+			remoteMTime = entry.MTime
+		}
+		switch {
+		case localChanged && remoteChanged:
+			// Modification-vs-deletion has no trustworthy deletion timestamp in
+			// the current manifest/Glider state. Equal or missing timestamps are
+			// likewise ambiguous and must not be guessed.
+			if local == "" || remote == "" || localMTime <= 0 || remoteMTime <= 0 || localMTime/1e6 == remoteMTime {
+				plan.Unresolved = append(plan.Unresolved, rel)
+				continue
+			}
+			action := persistentSyncAction{Path: rel, Conflict: true, LocalMTime: localMTime, RemoteMTime: remoteMTime}
+			if localMTime/1e6 > remoteMTime {
+				action.Direction = "push"
+				action.Reason = "both changed; Local timestamp is newer (advisory)"
+			} else {
+				action.Direction = "pull"
+				action.Reason = "both changed; Web timestamp is newer (advisory)"
+			}
+			plan.Actions = append(plan.Actions, action)
+		case localChanged:
+			plan.Actions = append(plan.Actions, persistentSyncAction{Path: rel, Direction: "push", Delete: local == "", LocalMTime: localMTime, RemoteMTime: remoteMTime, Reason: "changed only in Local"})
+		case remoteChanged:
+			plan.Actions = append(plan.Actions, persistentSyncAction{Path: rel, Direction: "pull", Delete: remote == "", LocalMTime: localMTime, RemoteMTime: remoteMTime, Reason: "changed only in Web"})
+		}
+	}
+	sort.Slice(plan.Actions, func(i, j int) bool {
+		if plan.Actions[i].Path == plan.Actions[j].Path {
+			return plan.Actions[i].Direction < plan.Actions[j].Direction
+		}
+		return plan.Actions[i].Path < plan.Actions[j].Path
+	})
+	sort.Strings(plan.Unresolved)
+	return plan
+}
+
+func (p persistentSyncPlan) directionCounts() (pull, push int) {
+	for _, action := range p.Actions {
+		if action.Direction == "pull" {
+			pull++
+		} else if action.Direction == "push" {
+			push++
+		}
+	}
+	return pull, push
+}
+
+func (p persistentSyncPlan) hasConflictResolution() bool {
+	for _, action := range p.Actions {
+		if action.Conflict {
+			return true
+		}
+	}
+	return false
+}
+
+func persistentSyncNeedsReconciliation(mode persistentSyncMode, plan persistentSyncPlan) bool {
+	pull, push := plan.directionCounts()
+	if plan.hasConflictResolution() || (pull > 0 && push > 0) {
+		return true
+	}
+	return mode == persistentSyncReconcile && push > 0
+}
+
+func persistentSyncTimestamp(value int64, local bool) string {
+	if value <= 0 {
+		return "unavailable"
+	}
+	if local {
+		return time.Unix(0, value).UTC().Format(time.RFC3339Nano)
+	}
+	return time.UnixMilli(value).UTC().Format(time.RFC3339Nano)
+}
+
+func persistentSyncPlanRows(plan persistentSyncPlan) [][2]string {
+	rows := make([][2]string, 0, len(plan.Actions)+2)
+	pull, push := plan.directionCounts()
+	rows = append(rows, [2]string{"Changes", fmt.Sprintf("pull %d; push %d", pull, push)})
+	for _, action := range plan.Actions {
+		verb := strings.ToUpper(action.Direction)
+		if action.Delete {
+			verb += " DELETE"
+		}
+		value := fmt.Sprintf("%s — %s; Local %s; Web %s", action.Path, action.Reason, persistentSyncTimestamp(action.LocalMTime, true), persistentSyncTimestamp(action.RemoteMTime, false))
+		rows = append(rows, [2]string{verb, value})
+	}
+	return rows
+}
+
 func (c *Client) refreshPersistentSyncManifest(projectDir, appID, rootURI string) error {
 	files, err := localPersistentFiles(projectDir)
 	if err != nil {
 		return err
 	}
 	return c.savePersistentSyncManifestWithFiles(projectDir, appID, rootURI, fileChecksums(files))
+}
+
+// updatePersistentSyncManifestFromVerifiedState re-reads both sides before it
+// advances any baseline. A complete sync must converge everywhere. A partial
+// operation advances only paths whose current Local and Web content matches,
+// preserving the old baseline for every still-divergent path.
+func (c *Client) updatePersistentSyncManifestFromVerifiedState(ctx context.Context, projectDir, appID, rootURI string, manifest persistentSyncManifest, haveManifest, requireClean bool, requiredPaths []string) error {
+	var snapshot persistentSyncSnapshot
+	var differing []string
+	for attempt := 0; attempt < 3; attempt++ {
+		fresh, err := c.capturePersistentSyncSnapshot(ctx, projectDir, rootURI, manifest, haveManifest)
+		if err != nil {
+			return err
+		}
+		snapshot = fresh
+		differing = differingPersistentSyncPaths(fresh, requireClean, requiredPaths)
+		if len(differing) == 0 {
+			break
+		}
+		if attempt < 2 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt+1) * 50 * time.Millisecond):
+			}
+		}
+	}
+	if len(differing) > 0 {
+		return codedError{Code: "SYNC_VERIFY_FAILED", Message: fmt.Sprintf("Sync could not verify matching Local/Web content for: %s; the baseline was not advanced.", strings.Join(differing, ", "))}
+	}
+
+	if requireClean {
+		return c.savePersistentSyncManifestWithFiles(projectDir, appID, rootURI, fileChecksums(snapshot.RemoteFiles))
+	}
+
+	if !haveManifest {
+		// Establish only the common portion of a first partial checkout. Paths
+		// that exist on just one side remain visibly pending on the next sync.
+		common := map[string]string{}
+		for _, rel := range syncPaths(snapshot.LocalChecks, snapshot.RemoteChecks) {
+			if snapshot.LocalChecks[rel] == snapshot.RemoteChecks[rel] && snapshot.LocalChecks[rel] != "" {
+				common[rel] = snapshot.LocalChecks[rel]
+			}
+		}
+		return c.savePersistentSyncManifestWithFiles(projectDir, appID, rootURI, common)
+	}
+
+	next := make(map[string]string, len(snapshot.Baseline)+len(snapshot.LocalChecks))
+	for rel, sum := range snapshot.Baseline {
+		next[rel] = sum
+	}
+	for _, rel := range syncPaths(snapshot.LocalChecks, snapshot.RemoteChecks, snapshot.Baseline) {
+		if snapshot.LocalChecks[rel] != snapshot.RemoteChecks[rel] {
+			continue
+		}
+		if sum := snapshot.LocalChecks[rel]; sum != "" {
+			next[rel] = sum
+		} else {
+			delete(next, rel)
+		}
+	}
+	manifest.Files = next
+	if err := writePersistentSyncManifest(projectDir, manifest); err != nil {
+		return err
+	}
+	_, err := c.registerPersistentProject(projectDir, appID, rootURI, manifest.CheckoutID, false)
+	return err
+}
+
+func differingPersistentSyncPaths(snapshot persistentSyncSnapshot, requireClean bool, requiredPaths []string) []string {
+	paths := append([]string(nil), requiredPaths...)
+	if requireClean {
+		paths = syncPaths(snapshot.LocalChecks, snapshot.RemoteChecks)
+	}
+	sort.Strings(paths)
+	paths = compactSortedStrings(paths)
+	differing := make([]string, 0, len(paths))
+	for _, rel := range paths {
+		if snapshot.LocalChecks[rel] != snapshot.RemoteChecks[rel] {
+			differing = append(differing, rel)
+		}
+	}
+	return differing
+}
+
+func compactSortedStrings(values []string) []string {
+	if len(values) < 2 {
+		return values
+	}
+	out := values[:1]
+	for _, value := range values[1:] {
+		if value != out[len(out)-1] {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func (c *Client) refreshPersistentSyncManifestVerified(ctx context.Context, projectDir, appID, rootURI string, requiredPaths []string) error {
+	manifest, ok, err := loadPersistentSyncManifest(projectDir)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("cannot refresh a missing local sync manifest")
+	}
+	if !manifestMatchesProject(manifest, c.cfg.InstanceURL, appID, rootURI) {
+		return errors.New("local sync manifest belongs to another app")
+	}
+	return c.updatePersistentSyncManifestFromVerifiedState(ctx, projectDir, appID, rootURI, manifest, true, false, requiredPaths)
 }
 
 func (c *Client) savePersistentSyncManifestWithFiles(projectDir, appID, rootURI string, files map[string]string) error {
@@ -646,6 +1029,168 @@ func syncPaths(maps ...map[string]string) []string {
 	return out
 }
 
+func persistentSyncChecksEqual(local, remote map[string]string) (bool, []string) {
+	var differing []string
+	for _, rel := range syncPaths(local, remote) {
+		if local[rel] != remote[rel] {
+			differing = append(differing, rel)
+		}
+	}
+	return len(differing) == 0, differing
+}
+
+func (c *Client) confirmPersistentSyncPlan(plan persistentSyncPlan) error {
+	pull, push := plan.directionCounts()
+	message := fmt.Sprintf("Reconcile this local project with ServiceNow? This will pull %d Web change(s) and upload %d Local change(s). Timestamps are advisory; approval authorizes every listed overwrite or deletion.", pull, push)
+	// A build elicitation owns the animated footer. Give the blocking picker a
+	// stable terminal and let handleElicitation restore Building afterward.
+	c.flushActiveStreamForTerminalInterruption()
+	c.clearTurnStatus()
+	approved, err := persistentSyncApprovalPrompt(persistentSyncPlanRows(plan), message)
+	if errors.Is(err, errPersistentSyncNonInteractive) {
+		return codedError{Code: "SYNC_RECONCILIATION_REQUIRED", Message: fmt.Sprintf("Sync reconciliation requires explicit interactive approval (pull %d, push %d); nothing was changed.", pull, push)}
+	}
+	if err != nil {
+		return codedError{Code: "SYNC_RECONCILIATION_PROMPT_FAILED", Message: fmt.Sprintf("Sync reconciliation was not performed: %v", err)}
+	}
+	if !approved {
+		return codedError{Code: "SYNC_RECONCILIATION_DECLINED", Message: "Sync reconciliation was declined; nothing was changed."}
+	}
+	return nil
+}
+
+func (c *Client) applyPersistentSyncPlan(ctx context.Context, projectDir, appID, rootURI string, snapshot persistentSyncSnapshot, plan persistentSyncPlan) (persistentSyncResult, error) {
+	result := persistentSyncResult{LocalDir: projectDir}
+	push := map[string][]byte{}
+	pull := map[string][]byte{}
+	var remoteRemove, localRemove []string
+	for _, action := range plan.Actions {
+		switch action.Direction {
+		case "push":
+			if action.Delete {
+				remoteRemove = append(remoteRemove, action.Path)
+			} else {
+				content, ok := snapshot.LocalFiles[action.Path]
+				if !ok {
+					return result, codedError{Code: "SYNC_PLAN_STALE", Message: fmt.Sprintf("Local sync source disappeared before reconciliation: %s", action.Path)}
+				}
+				push[action.Path] = content
+			}
+		case "pull":
+			if action.Delete {
+				localRemove = append(localRemove, action.Path)
+			} else {
+				content, ok := snapshot.RemoteFiles[action.Path]
+				if !ok {
+					return result, codedError{Code: "SYNC_PLAN_STALE", Message: fmt.Sprintf("Web sync source disappeared before reconciliation: %s", action.Path)}
+				}
+				pull[action.Path] = content
+			}
+		}
+	}
+
+	// Validate every local destination before the first remote mutation. This
+	// prevents a known unsafe path from producing a half-applied bidirectional
+	// plan. Remote changes are idempotent and the manifest is committed last.
+	for _, rel := range append(sortedContentKeys(pull), localRemove...) {
+		if _, err := persistentSafeLocalWritePath(projectDir, rel); err != nil {
+			return result, err
+		}
+	}
+	if err := c.applyPersistentRemoteChanges(ctx, rootURI, push, remoteRemove); err != nil {
+		return result, err
+	}
+	for _, rel := range localRemove {
+		path, err := persistentSafeLocalWritePath(projectDir, rel)
+		if err != nil {
+			return result, err
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return result, err
+		}
+		removeEmptyPersistentParents(projectDir, filepath.Dir(path))
+		result.Deleted = append(result.Deleted, rel)
+	}
+	for _, rel := range sortedContentKeys(pull) {
+		path, err := persistentSafeLocalWritePath(projectDir, rel)
+		if err != nil {
+			return result, err
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return result, err
+		}
+		if err := os.WriteFile(path, pull[rel], 0o644); err != nil {
+			return result, err
+		}
+		result.Pulled = append(result.Pulled, rel)
+	}
+	for rel := range push {
+		result.Pushed = append(result.Pushed, rel)
+	}
+	result.Deleted = append(result.Deleted, remoteRemove...)
+	sort.Strings(result.Pulled)
+	sort.Strings(result.Pushed)
+	sort.Strings(result.Deleted)
+
+	var verified persistentSyncSnapshot
+	var differing []string
+	for attempt := 0; attempt < 3; attempt++ {
+		fresh, err := c.capturePersistentSyncSnapshot(ctx, projectDir, rootURI, snapshot.Manifest, snapshot.HaveManifest)
+		if err != nil {
+			return result, err
+		}
+		verified = fresh
+		if equal, paths := persistentSyncChecksEqual(fresh.LocalChecks, fresh.RemoteChecks); equal {
+			differing = nil
+			break
+		} else {
+			differing = paths
+		}
+		if attempt < 2 {
+			select {
+			case <-ctx.Done():
+				return result, ctx.Err()
+			case <-time.After(time.Duration(attempt+1) * 50 * time.Millisecond):
+			}
+		}
+	}
+	if len(differing) > 0 {
+		return result, codedError{Code: "SYNC_RECONCILIATION_VERIFY_FAILED", Message: fmt.Sprintf("Sync reconciliation could not verify matching Local/Web content for: %s; the baseline was not advanced.", strings.Join(differing, ", "))}
+	}
+	if err := c.savePersistentSyncManifestWithFiles(projectDir, appID, rootURI, fileChecksums(verified.RemoteFiles)); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func (c *Client) reconcilePersistentSyncPlan(ctx context.Context, projectDir, appID, rootURI string, snapshot persistentSyncSnapshot, plan persistentSyncPlan) (persistentSyncResult, error) {
+	result := persistentSyncResult{LocalDir: projectDir}
+	if len(plan.Unresolved) > 0 {
+		result.Conflicts = append(result.Conflicts, plan.Unresolved...)
+		return result, codedError{Code: "SYNC_CONFLICT_UNRESOLVED", Message: fmt.Sprintf("Sync conflict in %s has no trustworthy newer side (timestamp missing/equal or modification versus deletion); nothing was changed.", strings.Join(plan.Unresolved, ", "))}
+	}
+	if cached, ok := c.cachedPersistentSyncOutcome(plan.Fingerprint); ok {
+		return result, cached
+	}
+	if err := c.confirmPersistentSyncPlan(plan); err != nil {
+		c.rememberPersistentSyncOutcome(plan.Fingerprint, err)
+		return result, err
+	}
+	c.clearPersistentSyncOutcome()
+	fresh, err := c.capturePersistentSyncSnapshot(ctx, projectDir, rootURI, snapshot.Manifest, snapshot.HaveManifest)
+	if err != nil {
+		return result, err
+	}
+	if fresh.Fingerprint != plan.Fingerprint {
+		return result, codedError{Code: "SYNC_PLAN_STALE", Message: "Local or Web files changed while the reconciliation plan was awaiting approval; nothing was changed. Review /sync status and try again."}
+	}
+	freshPlan := persistentSyncPlanFromSnapshot(fresh)
+	if len(freshPlan.Unresolved) > 0 {
+		return result, codedError{Code: "SYNC_PLAN_STALE", Message: "The approved reconciliation plan is no longer resolvable; nothing was changed."}
+	}
+	return c.applyPersistentSyncPlan(ctx, projectDir, appID, rootURI, fresh, freshPlan)
+}
+
 func (c *Client) syncPersistentApp(ctx context.Context, mode persistentSyncMode) (persistentSyncResult, error) {
 	if c.processing {
 		return persistentSyncResult{}, errors.New("cannot run /sync while a turn is processing")
@@ -676,7 +1221,7 @@ func (c *Client) syncPersistentAppForBuildNamedLocked(ctx context.Context, appID
 	if mode == "" {
 		mode = persistentSyncAuto
 	}
-	if mode != persistentSyncAuto && mode != persistentSyncPull && mode != persistentSyncPush && mode != persistentSyncStatus {
+	if mode != persistentSyncAuto && mode != persistentSyncPull && mode != persistentSyncPush && mode != persistentSyncStatus && mode != persistentSyncReconcile {
 		return persistentSyncResult{}, nil, fmt.Errorf("unknown sync mode %q", mode)
 	}
 	appID = strings.TrimSpace(appID)
@@ -779,6 +1324,7 @@ func (c *Client) inspectPersistentAppStatus(ctx context.Context, appID, appName,
 		LocalDir:        projectDir,
 		NotMaterialized: true,
 		Pulled:          sortedContentKeys(remoteFiles),
+		PendingPull:     sortedContentKeys(remoteFiles),
 	}, nil
 }
 
@@ -840,24 +1386,15 @@ func (c *Client) syncPersistentAppAtLocked(ctx context.Context, projectDir, appI
 			return persistentSyncResult{}, errors.New("local app folder has no sync manifest; refusing to claim an existing named folder")
 		}
 	}
-	_, remoteFiles, err := c.fetchPersistentRemoteFiles(ctx, rootURI)
+	snapshot, err := c.capturePersistentSyncSnapshot(ctx, projectDir, rootURI, manifest, haveManifest)
 	if err != nil {
 		return persistentSyncResult{}, err
 	}
-	localFiles, err := localPersistentFiles(projectDir)
-	if err != nil {
-		return persistentSyncResult{}, err
-	}
-	algorithm := "sha256"
-	if haveManifest {
-		algorithm = manifest.ChecksumAlgorithm
-	}
-	localChecks := fileChecksumsWithAlgorithm(localFiles, algorithm)
-	remoteChecks := fileChecksumsWithAlgorithm(remoteFiles, algorithm)
-	baseline := map[string]string{}
-	if haveManifest {
-		baseline = manifest.Files
-	}
+	remoteFiles := snapshot.RemoteFiles
+	localFiles := snapshot.LocalFiles
+	localChecks := snapshot.LocalChecks
+	remoteChecks := snapshot.RemoteChecks
+	baseline := snapshot.Baseline
 	result := persistentSyncResult{LocalDir: projectDir}
 	if mode == persistentSyncStatus {
 		for _, rel := range syncPaths(localChecks, remoteChecks, baseline) {
@@ -871,9 +1408,18 @@ func (c *Client) syncPersistentAppAtLocked(ctx context.Context, projectDir, appI
 				result.PendingPush = append(result.PendingPush, rel)
 			} else {
 				result.Pulled = append(result.Pulled, rel)
+				result.PendingPull = append(result.PendingPull, rel)
 			}
 		}
 		return result, nil
+	}
+	plan := persistentSyncPlanFromSnapshot(snapshot)
+	if len(plan.Unresolved) > 0 || persistentSyncNeedsReconciliation(mode, plan) {
+		return c.reconcilePersistentSyncPlan(ctx, projectDir, appID, rootURI, snapshot, plan)
+	}
+	if mode == persistentSyncReconcile {
+		// A remote-only build preflight remains safe and noninteractive.
+		mode = persistentSyncAuto
 	}
 
 	pull := map[string][]byte{}
@@ -900,7 +1446,7 @@ func (c *Client) syncPersistentAppAtLocked(ctx context.Context, projectDir, appI
 		switch {
 		case remoteChanged:
 			if mode == persistentSyncPush {
-				result.Conflicts = append(result.Conflicts, rel)
+				result.PendingPull = append(result.PendingPull, rel)
 				continue
 			}
 			if remote == "" {
@@ -910,7 +1456,7 @@ func (c *Client) syncPersistentAppAtLocked(ctx context.Context, projectDir, appI
 			}
 		case localChanged:
 			if mode == persistentSyncPull {
-				result.Conflicts = append(result.Conflicts, rel)
+				result.PendingPush = append(result.PendingPush, rel)
 				continue
 			}
 			if mode != persistentSyncPush {
@@ -968,42 +1514,10 @@ func (c *Client) syncPersistentAppAtLocked(ctx context.Context, projectDir, appI
 	sort.Strings(result.Pushed)
 	sort.Strings(result.Deleted)
 	sort.Strings(result.PendingPush)
-	finalFiles, readErr := localPersistentFiles(projectDir)
-	if readErr != nil {
-		return result, readErr
-	}
-	if len(result.PendingPush) == 0 {
-		// A clean successful operation is the only v1->v2 migration point.
-		if err := c.savePersistentSyncManifestWithFiles(projectDir, appID, rootURI, fileChecksums(finalFiles)); err != nil {
-			return result, err
-		}
-	} else if haveManifest {
-		// Pulls can update unrelated paths while local edits stay pending. Write
-		// only those reconciled baselines with the existing algorithm; changing
-		// a v1 checksum here would make the pending paths ambiguous.
-		pending := make(map[string]bool, len(result.PendingPush))
-		for _, rel := range result.PendingPush {
-			pending[rel] = true
-		}
-		next := make(map[string]string, len(baseline)+len(finalFiles))
-		for rel, sum := range baseline {
-			next[rel] = sum
-		}
-		for _, rel := range syncPaths(localChecks, remoteChecks, baseline) {
-			if pending[rel] {
-				continue
-			}
-			if content, ok := finalFiles[rel]; ok {
-				next[rel] = checksumHex(manifest.ChecksumAlgorithm, content)
-			} else {
-				delete(next, rel)
-			}
-		}
-		manifest.Files = next
-		if err := writePersistentSyncManifest(projectDir, manifest); err != nil {
-			return result, err
-		}
-		_, _ = c.registerPersistentProject(projectDir, appID, rootURI, manifest.CheckoutID, false)
+	sort.Strings(result.PendingPull)
+	requireClean := len(result.PendingPush) == 0 && len(result.PendingPull) == 0
+	if err := c.updatePersistentSyncManifestFromVerifiedState(ctx, projectDir, appID, rootURI, manifest, haveManifest, requireClean, nil); err != nil {
+		return result, err
 	}
 	return result, nil
 }
@@ -1280,13 +1794,43 @@ func formatPersistentSyncResult(result persistentSyncResult, mode persistentSync
 	}
 	parts := []string{fmt.Sprintf("local project: %s", localProject)}
 	if mode == persistentSyncStatus {
-		parts = append(parts, fmt.Sprintf("pending pull: %d", len(result.Pulled)), fmt.Sprintf("pending push: %d", len(result.PendingPush)), fmt.Sprintf("unchanged: %d", result.Unchanged))
-		if len(result.Conflicts) > 0 {
-			parts = append(parts, fmt.Sprintf("conflicts: %s", strings.Join(result.Conflicts, ", ")))
+		pendingPull := append([]string(nil), result.PendingPull...)
+		if len(pendingPull) == 0 {
+			// Pulled historically carried pending status paths. Keep accepting it
+			// for callers/tests while new results use the unambiguous field.
+			pendingPull = append(pendingPull, result.Pulled...)
+		}
+		pendingPush := append([]string(nil), result.PendingPush...)
+		conflicts := append([]string(nil), result.Conflicts...)
+		sort.Strings(pendingPull)
+		sort.Strings(pendingPush)
+		sort.Strings(conflicts)
+		parts = append(parts, fmt.Sprintf("pending pull: %d", len(pendingPull)), fmt.Sprintf("pending push: %d", len(pendingPush)), fmt.Sprintf("unchanged: %d", result.Unchanged))
+		for _, rel := range pendingPull {
+			parts = append(parts, "PULL: "+rel)
+		}
+		for _, rel := range pendingPush {
+			parts = append(parts, "PUSH: "+rel)
+		}
+		if len(conflicts) > 0 {
+			parts = append(parts, fmt.Sprintf("conflicts: %s", strings.Join(conflicts, ", ")))
+			for _, rel := range conflicts {
+				parts = append(parts, "CONFLICT: "+rel)
+			}
 		}
 		return strings.Join(parts, "\n")
 	}
 	parts = append(parts, fmt.Sprintf("pulled: %d", len(result.Pulled)), fmt.Sprintf("pushed: %d", len(result.Pushed)), fmt.Sprintf("deleted: %d", len(result.Deleted)), fmt.Sprintf("unchanged: %d", result.Unchanged))
+	if len(result.PendingPull) > 0 {
+		pending := append([]string(nil), result.PendingPull...)
+		sort.Strings(pending)
+		parts = append(parts, fmt.Sprintf("pending pull: %s", strings.Join(pending, ", ")))
+	}
+	if len(result.PendingPush) > 0 {
+		pending := append([]string(nil), result.PendingPush...)
+		sort.Strings(pending)
+		parts = append(parts, fmt.Sprintf("pending push: %s", strings.Join(pending, ", ")))
+	}
 	if len(result.Conflicts) > 0 {
 		parts = append(parts, fmt.Sprintf("conflicts: %s", strings.Join(result.Conflicts, ", ")))
 	}

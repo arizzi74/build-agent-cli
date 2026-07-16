@@ -1519,9 +1519,17 @@ func parseWebMessages(body []byte) []interface{} {
 			}
 		}
 		contentValue := firstMessageContentValue(m)
+		attachments := richAttachmentsFromMessageContentValue(contentValue)
+		if len(attachments) == 0 {
+			attachments = richAttachmentsFromValue(m["attachments"])
+		}
 		if contentValue == nil {
 			if bodyMap := asMap(m["body"]); bodyMap != nil {
 				contentValue = firstMessageContentValue(bodyMap)
+				attachments = richAttachmentsFromMessageContentValue(contentValue)
+				if len(attachments) == 0 {
+					attachments = richAttachmentsFromValue(bodyMap["attachments"])
+				}
 			}
 		}
 		contentRole, contentText, contentHasRole := messageContentRoleTextValue(contentValue)
@@ -1531,9 +1539,13 @@ func parseWebMessages(body []byte) []interface{} {
 				continue
 			}
 			role = contentRole
-		}
-		if contentText != "" {
 			content = contentText
+		} else if contentText != "" {
+			content = contentText
+		} else if len(attachments) > 0 {
+			// An attachment-only rich envelope has no display text. Do not
+			// render its serialized metadata as the user's message body.
+			content = ""
 		}
 		role = normalizeMessageRole(role)
 		if rawRole == "" && !contentHasRole {
@@ -1542,10 +1554,10 @@ func parseWebMessages(body []byte) []interface{} {
 		if role == "" && rawRole != "" {
 			continue
 		}
-		if content == "" {
+		if content == "" && len(attachments) == 0 {
 			continue
 		}
-		messages = append(messages, webMessage{Index: i, Sequence: intFromAny(m["sequence"]), Timestamp: firstString(m, "timestamp", "sys_created_on"), Role: role, Content: content})
+		messages = append(messages, webMessage{Index: i, Sequence: intFromAny(m["sequence"]), Timestamp: firstString(m, "timestamp", "sys_created_on"), Role: role, Content: content, Attachments: attachments})
 	}
 	sort.SliceStable(messages, func(i, j int) bool {
 		if messages[i].Sequence != 0 || messages[j].Sequence != 0 {
@@ -1566,18 +1578,23 @@ func parseWebMessages(body []byte) []interface{} {
 		if role == "" {
 			continue
 		}
-		out = append(out, map[string]interface{}{"role": role, "content": msg.Content})
+		message := map[string]interface{}{"role": role, "content": msg.Content}
+		if len(msg.Attachments) > 0 {
+			message["attachments"] = cloneRichAttachments(msg.Attachments)
+		}
+		out = append(out, message)
 		lastRole = role
 	}
 	return out
 }
 
 type webMessage struct {
-	Index     int
-	Sequence  int
-	Timestamp string
-	Role      string
-	Content   string
+	Index       int
+	Sequence    int
+	Timestamp   string
+	Role        string
+	Content     string
+	Attachments []RichAttachment
 }
 
 func inferBareWebMessageRole(previousRole string) string {

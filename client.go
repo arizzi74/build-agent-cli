@@ -71,65 +71,74 @@ type Client struct {
 	// projectRecoveryApproval is a narrow test seam for the destructive-but-
 	// recoverable canonical-project replacement prompt. It intentionally does
 	// not consult AutoApprove.
-	projectRecoveryApproval func([][2]string, string) (bool, error)
-	workingSet              interface{}
-	workspaceName           string
-	workspaceURI            string
-	workspaceChecksum       string
-	workspaceDescription    string
-	workspaceFolders        []WebWorkspaceFolder
-	streamTypes             map[string]string
-	webAgentConfig          WebAgentConfig
-	webStartupConfig        WebStartupConfig
-	webStreamID             string
-	webStreamType           string
-	webStreamText           string
-	webStreamTS             string
-	webStreamRows           int
-	webStreamTranscriptText string
-	webStreamPlain          bool
-	webStreamBulletStarted  bool
-	nirvanaMCPServers       []MCPServer
-	nirvanaMCPServersReady  bool
-	toolCallNames           map[string]string
-	toolCallInputs          map[string]interface{}
-	toolCallStarted         map[string]time.Time
-	lastUserMessageSysID    string
-	lastUserMessageContent  RichUserContent
-	richWebPersistence      bool
-	turnStartedAt           time.Time
-	turnTelemetry           *BuildAgentTelemetryState
-	turnToolTelemetry       []BuildAgentToolTelemetry
-	turnStopPersisted       bool
-	turnRuntimeSnapshot     *TurnRuntimeSnapshot
-	lastGliderBuild         *gliderBuildState
-	buildOperationMu        sync.Mutex
-	metadataSyncMu          sync.Mutex
-	turnCompletedByAMB      bool
-	responseTransport       string
-	warnedLegacySend        bool
-	pendingUserContent      string
-	nirvanaThinkingText     string
-	nirvanaThinkingStarted  time.Time
-	nirvanaThinkingDone     bool
-	turnStatusActive        bool
-	turnStatusStop          chan struct{}
-	turnStatusDone          chan struct{}
-	statusMu                sync.Mutex
-	activeTurnMu            sync.Mutex
-	activeTurnCtx           context.Context
-	activeTurnCancel        context.CancelFunc
-	activeTurnStopping      bool
-	activeServerTurnID      string
-	cancelledServerTurnIDs  map[string]struct{}
-	semanticMu              sync.Mutex
-	semanticState           SemanticTurnState
-	semanticSequence        uint64
-	semanticEventIDSequence uint64
-	semanticLifecycleID     string
-	semanticJournalSequence uint64
-	journalBoundaryMissed   bool
-	connectionAuthPrepared  bool
+	projectRecoveryApproval         func([][2]string, string) (bool, error)
+	workingSet                      interface{}
+	workspaceName                   string
+	workspaceURI                    string
+	workspaceChecksum               string
+	workspaceDescription            string
+	workspaceFolders                []WebWorkspaceFolder
+	streamTypes                     map[string]string
+	webAgentConfig                  WebAgentConfig
+	webStartupConfig                WebStartupConfig
+	webStreamID                     string
+	webStreamType                   string
+	webStreamText                   string
+	webStreamTS                     string
+	webStreamRows                   int
+	webStreamTranscriptText         string
+	webStreamPlain                  bool
+	webStreamBulletStarted          bool
+	nirvanaMCPServers               []MCPServer
+	nirvanaMCPServersReady          bool
+	toolCallNames                   map[string]string
+	toolCallInputs                  map[string]interface{}
+	toolCallStarted                 map[string]time.Time
+	lastUserMessageSysID            string
+	lastUserMessageContent          RichUserContent
+	attachmentsMu                   sync.Mutex
+	pendingAttachments              []pendingAttachment
+	pendingAttachmentMessageKey     string
+	pendingAttachmentMessageSysID   string
+	pendingAttachmentMessageContent string
+	pendingAttachmentMessageRichID  string
+	pendingUserAttachments          []RichAttachment
+	richWebPersistence              bool
+	turnStartedAt                   time.Time
+	turnTelemetry                   *BuildAgentTelemetryState
+	turnToolTelemetry               []BuildAgentToolTelemetry
+	turnStopPersisted               bool
+	turnRuntimeSnapshot             *TurnRuntimeSnapshot
+	lastGliderBuild                 *gliderBuildState
+	buildOperationMu                sync.Mutex
+	metadataSyncMu                  sync.Mutex
+	turnCompletedByAMB              bool
+	responseTransport               string
+	warnedLegacySend                bool
+	pendingUserContent              string
+	nirvanaThinkingText             string
+	nirvanaThinkingStarted          time.Time
+	nirvanaThinkingDone             bool
+	turnStatusActive                bool
+	turnStatusStop                  chan struct{}
+	turnStatusDone                  chan struct{}
+	statusMu                        sync.Mutex
+	activeTurnMu                    sync.Mutex
+	activeTurnCtx                   context.Context
+	activeTurnCancel                context.CancelFunc
+	activeTurnStopping              bool
+	activeServerTurnID              string
+	cancelledServerTurnIDs          map[string]struct{}
+	turnResultMu                    sync.Mutex
+	turnFinalText                   string
+	semanticMu                      sync.Mutex
+	semanticState                   SemanticTurnState
+	semanticSequence                uint64
+	semanticEventIDSequence         uint64
+	semanticLifecycleID             string
+	semanticJournalSequence         uint64
+	journalBoundaryMissed           bool
+	connectionAuthPrepared          bool
 	// The following narrow seams keep OAuth recovery ordering testable without
 	// requiring a live ServiceNow instance or an interactive terminal.
 	oauthRefresh        func(context.Context, OAuthConfig, string) (TokenResponse, error)
@@ -239,7 +248,7 @@ func (c *Client) applyWorkspace(ws WorkspaceState) {
 	c.conversationTitle = ws.ConversationTitle
 	c.conversationState = ws.ConversationState
 	c.serverConversation = ws.ServerConversation
-	c.history = ws.ConversationHistory
+	c.history = sanitizeAttachmentHistory(ws.ConversationHistory)
 	c.usageInputTokens = ws.UsageInputTokens
 	c.usageOutputTokens = ws.UsageOutputTokens
 	c.usageThinkingTokens = ws.UsageThinkingTokens
@@ -279,7 +288,7 @@ func (c *Client) WorkspaceState() WorkspaceState {
 		ConversationTitle:       c.conversationTitle,
 		ConversationState:       c.conversationState,
 		ServerConversation:      c.serverConversation,
-		ConversationHistory:     c.history,
+		ConversationHistory:     sanitizeAttachmentHistory(c.history),
 		UsageInputTokens:        c.usageInputTokens,
 		UsageOutputTokens:       c.usageOutputTokens,
 		UsageThinkingTokens:     c.usageThinkingTokens,
@@ -562,6 +571,7 @@ func (c *Client) prepareNirvanaConversationSelection(ctx context.Context) error 
 }
 
 func (c *Client) Close() error {
+	c.clearPersistentSyncOutcome()
 	if c.nirvanaPingCancel != nil {
 		c.nirvanaPingCancel()
 		c.nirvanaPingCancel = nil
@@ -585,6 +595,9 @@ func (c *Client) Close() error {
 
 func (c *Client) SendMessage(ctx context.Context, content string) error {
 	if !c.opts.Nirvana {
+		if c.pendingAttachmentCount() > 0 {
+			return errors.New("attachments require the default Nirvana transport")
+		}
 		return c.sendGatewayMessage(ctx, content)
 	}
 
@@ -599,9 +612,33 @@ func (c *Client) SendMessage(ctx context.Context, content string) error {
 		_ = c.ensureActiveAppMetadata(ctx)
 	}
 	mcpServers := c.nirvanaMCPServerPayload(ctx)
-	if err := c.ensureWebConversationWithTitle(ctx, content); err != nil {
+	queuedAttachments := c.pendingAttachmentSnapshot()
+	if err := c.ensureWebConversationWithTitle(ctx, attachmentConversationTitle(content, c.pendingAttachmentSummaries())); err != nil {
 		return err
 	}
+	persistedAttachmentMessageID := ""
+	persistedAttachmentRichID := ""
+	queuedAttachmentKey := ""
+	if len(queuedAttachments) > 0 {
+		queuedAttachmentKey = pendingAttachmentTurnKey(c.conversationID, content, queuedAttachments)
+		var err error
+		persistedAttachmentMessageID, persistedAttachmentRichID, err = c.persistedPendingAttachmentMessage(queuedAttachmentKey)
+		if err != nil {
+			return err
+		}
+	}
+	pendingAttachments, err := c.preparePendingAttachments(ctx)
+	if err != nil {
+		return err
+	}
+	attachmentKey := ""
+	if len(pendingAttachments) > 0 {
+		attachmentKey = pendingAttachmentTurnKey(c.conversationID, content, pendingAttachments)
+		if persistedAttachmentMessageID != "" && attachmentKey != queuedAttachmentKey {
+			return errors.New("attachment state changed after its message was persisted; use /attach clear to abandon it locally")
+		}
+	}
+	images, attachments, richAttachments := attachmentPayloads(pendingAttachments)
 	invokeOptions, params, err := c.buildInvokePayload(ctx, false)
 	if err != nil {
 		return err
@@ -615,8 +652,8 @@ func (c *Client) SendMessage(ctx context.Context, content string) error {
 		"content":             content,
 		"conversationHistory": snapshot.ConversationHistory,
 		"ideContext":          snapshot.IDEContext,
-		"images":              []interface{}{},
-		"attachments":         []interface{}{},
+		"images":              images,
+		"attachments":         attachments,
 		"isGreeting":          false,
 		"isMCPRetry":          false,
 		"mcpServers":          cloneMCPServers(snapshot.MCPServers),
@@ -627,13 +664,34 @@ func (c *Client) SendMessage(ctx context.Context, content string) error {
 	if snapshot.App != nil {
 		payload["appScope"] = appScopeObject(*snapshot.App)
 	}
-	userRow := NewRichUserContent("", content)
+	userRow := NewRichUserContent(persistedAttachmentRichID, content)
+	userRow.Attachments = richAttachments
 	c.lastUserMessageContent = userRow
 	c.turnStartedAt = time.Now()
 	c.turnTelemetry = c.StartBuildAgentTelemetry(ctx, content)
 	c.turnToolTelemetry = nil
 	c.turnStopPersisted = false
-	c.lastUserMessageSysID = c.BestEffortPersistRichWebMessageContent(ctx, c.conversationID, userRow)
+	c.lastUserMessageSysID = ""
+	c.richWebPersistence = false
+	if len(pendingAttachments) > 0 {
+		c.lastUserMessageSysID = persistedAttachmentMessageID
+		if c.lastUserMessageSysID == "" {
+			c.lastUserMessageSysID, err = c.PersistRichWebMessageContent(ctx, c.conversationID, userRow)
+			if err != nil {
+				c.ErrorBuildAgentTelemetry(ctx, c.turnTelemetry)
+				c.turnTelemetry = nil
+				return fmt.Errorf("could not persist the attachment message: %w", err)
+			}
+			if c.lastUserMessageSysID == "" {
+				c.ErrorBuildAgentTelemetry(ctx, c.turnTelemetry)
+				c.turnTelemetry = nil
+				return errors.New("attachment message persistence did not return a message id")
+			}
+			c.rememberPersistedPendingAttachmentMessage(attachmentKey, content, c.lastUserMessageSysID, userRow.ID)
+		}
+	} else {
+		c.lastUserMessageSysID = c.BestEffortPersistRichWebMessageContent(ctx, c.conversationID, userRow)
+	}
 	c.richWebPersistence = c.lastUserMessageSysID != ""
 	if c.lastUserMessageSysID == "" {
 		if err := c.persistWebUserMessage(ctx, content); err != nil {
@@ -646,6 +704,7 @@ func (c *Client) SendMessage(ctx context.Context, content string) error {
 	}
 	c.resetWebStream()
 	c.pendingUserContent = content
+	c.pendingUserAttachments = cloneRichAttachments(richAttachments)
 	c.turnDone = make(chan error, 1)
 	c.processing = true
 	c.turnRuntimeSnapshot = &snapshot
@@ -655,9 +714,11 @@ func (c *Client) SendMessage(ctx context.Context, content string) error {
 		c.turnTelemetry = nil
 		c.processing = false
 		c.pendingUserContent = ""
+		c.pendingUserAttachments = nil
 		c.turnRuntimeSnapshot = nil
 		return err
 	}
+	c.consumePendingAttachments(pendingAttachments)
 	return nil
 }
 
@@ -684,6 +745,7 @@ func (c *Client) WaitTurn(ctx context.Context) error {
 }
 
 func (c *Client) beginActiveTurn(parent context.Context) context.Context {
+	c.clearPersistentSyncOutcome()
 	ctx, cancel := context.WithCancel(parent)
 	c.activeTurnMu.Lock()
 	c.activeTurnCtx = ctx
@@ -774,6 +836,7 @@ func (c *Client) cancelActiveTurn() bool {
 	c.turnTelemetry = nil
 	c.turnToolTelemetry = nil
 	c.pendingUserContent = ""
+	c.pendingUserAttachments = nil
 	if c.turnDone != nil {
 		select {
 		case c.turnDone <- context.Canceled:
@@ -1792,6 +1855,7 @@ func (c *Client) printLegacyBuildAgentResponse(ctx context.Context, body []byte,
 		c.history = append(c.history, map[string]interface{}{"role": "user", "content": userContent})
 	}
 	if assistantText := strings.TrimSpace(strings.Join(assistantParts, "\n")); assistantText != "" {
+		c.setTurnFinalText(assistantText)
 		c.clearTurnStatus()
 		printAssistantText(assistantText)
 		if err := c.persistWebAssistantMessage(ctx, assistantText); err != nil {
@@ -2727,13 +2791,15 @@ func (c *Client) resetWebStream() {
 func (c *Client) appendGatewayRESTTurnHistory() {
 	userText := strings.TrimSpace(c.pendingUserContent)
 	assistantText := strings.TrimSpace(c.webStreamText)
-	if userText != "" {
-		c.history = append(c.history, map[string]interface{}{"role": "user", "content": userText})
+	c.setTurnFinalText(assistantText)
+	if userText != "" || len(c.pendingUserAttachments) > 0 {
+		c.history = append(c.history, historyUserMessage(userText, c.pendingUserAttachments))
 	}
 	if assistantText != "" {
 		c.history = append(c.history, map[string]interface{}{"role": "assistant", "content": assistantText})
 	}
 	c.pendingUserContent = ""
+	c.pendingUserAttachments = nil
 	c.resetWebStream()
 }
 
@@ -2741,6 +2807,7 @@ func (c *Client) appendWebStreamMessage() {
 	if c.webStreamText == "" {
 		return
 	}
+	c.setTurnFinalText(c.webStreamText)
 	messageType := c.webStreamType
 	if messageType == "" {
 		messageType = "text"
@@ -2768,6 +2835,9 @@ func (c *Client) appendWebStreamMessage() {
 }
 
 func (c *Client) appendCodeAssistAssistantMessage(message map[string]interface{}) {
+	if body := asMap(message["body"]); body != nil {
+		c.setTurnFinalText(firstString(body, "text", "message"))
+	}
 	if _, ok := message["author"]; !ok {
 		message["author"] = "assistant"
 	}
@@ -3395,6 +3465,7 @@ func (c *Client) handleEvent(data []byte) error {
 		clearTerminalFooterSubagents()
 		c.clearTurnStatus()
 		assistantText := strings.TrimSpace(c.webStreamText)
+		c.setTurnFinalText(assistantText)
 		if assistantText != "" {
 			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			duration := time.Duration(0)
@@ -3409,8 +3480,9 @@ func (c *Client) handleEvent(data []byte) error {
 			cancel()
 		}
 		if snapshot, ok := event["snapshot"].([]interface{}); ok {
-			c.history = snapshot
+			c.history = preservePendingAttachmentsInHistory(snapshot, c.pendingUserContent, c.pendingUserAttachments)
 			c.pendingUserContent = ""
+			c.pendingUserAttachments = nil
 			c.resetWebStream()
 		} else {
 			c.appendGatewayRESTTurnHistory()
@@ -4081,7 +4153,7 @@ func (c *Client) printLiveUserTurn(content string) {
 	if len(c.opts.Prompts) > 0 || !interactiveTerminalUIEnabled() || !terminalANSIEnabled() {
 		return
 	}
-	printLiveUserPrompt(content)
+	printLiveUserPrompt(attachmentDisplayContent(content, c.pendingAttachmentSummaries()))
 	// `printLiveUserPrompt` writes the submitted turn into the scrollback region.
 	// Put the terminal cursor back in the input footer immediately afterwards so
 	// any typeahead while `Building` is animating echoes in the prompt bar, not

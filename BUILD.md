@@ -20,6 +20,8 @@ Every build uses:
 - `-ldflags='-s -w -buildid= ...'` to strip symbols/debug metadata and omit the Go build ID.
 - Embedded `main.cliVersion` and `main.cliUpdateBaseURL` values for startup updates.
 
+The macOS clipboard integration uses only `/usr/bin/osascript` and `/usr/bin/sips` at runtime, and the Telegram channel uses the Go standard library. Neither feature introduces CGO, Node.js, npm, or a project-supplied dynamic library into the bacli executable. Node/npm remain optional local application-build prerequisites, not bacli runtime dependencies.
+
 Linux is statically linked in the normal ELF sense. Go's `CGO_ENABLED=0` macOS and Windows outputs contain no project-supplied dynamic libraries or CGO runtime, although platform inspection tools may still describe normal operating-system loader/framework imports.
 
 ## Release build
@@ -27,13 +29,13 @@ Linux is statically linked in the normal ELF sense. Go's `CGO_ENABLED=0` macOS a
 Run from the repository root:
 
 ```bash
-VERSION=2026.07.13.1 ./scripts/build-release.sh
+VERSION=2026.07.16.1 ./scripts/build-release.sh
 ```
 
 If `VERSION` is omitted, the script uses `YYYY.MM.DD.<short-git-sha>`. Override the publication root only when staging:
 
 ```bash
-VERSION=2026.07.13.1 BASE_URL=https://staging.example/bacli ./scripts/build-release.sh
+VERSION=2026.07.16.1 BASE_URL=https://staging.example/bacli ./scripts/build-release.sh
 ```
 
 The script creates:
@@ -115,7 +117,7 @@ go test -race -count=1 ./...
 go test -count=1 ./...
 go vet ./...
 git diff --check
-VERSION=2026.07.13.1 ./scripts/build-release.sh
+VERSION=2026.07.16.1 ./scripts/build-release.sh
 ```
 
 Inspect artifacts:

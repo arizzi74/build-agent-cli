@@ -206,6 +206,7 @@ func collectTerminalHistoryMessages(history []interface{}) []terminalHistoryMess
 		}
 		role := terminalHistoryRole(firstString(msg, "role", "author", "sender", "type"))
 		text := strings.TrimSpace(firstString(msg, "content", "text", "message"))
+		attachments := attachmentSummariesFromValue(msg["attachments"])
 		if body := asMap(msg["body"]); body != nil {
 			if role == "" {
 				role = terminalHistoryRole(firstString(body, "author_type", "author_id", "role", "sender", "type"))
@@ -213,11 +214,14 @@ func collectTerminalHistoryMessages(history []interface{}) []terminalHistoryMess
 			if text == "" {
 				text = strings.TrimSpace(firstString(body, "text", "message", "content", "label"))
 			}
+			if len(attachments) == 0 {
+				attachments = attachmentSummariesFromValue(body["attachments"])
+			}
 		}
-		if role == "" || text == "" {
+		if role == "" || (text == "" && len(attachments) == 0) {
 			continue
 		}
-		out = append(out, terminalHistoryMessage{Role: role, Content: text})
+		out = append(out, terminalHistoryMessage{Role: role, Content: attachmentDisplayContent(text, attachments)})
 	}
 	return out
 }

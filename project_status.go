@@ -139,14 +139,18 @@ func (c *Client) refreshStatusProjectPath(appID, appName, rootURI string) {
 }
 
 func classifyPersistentSyncStatus(result persistentSyncResult) string {
+	pendingPull := result.PendingPull
+	if len(pendingPull) == 0 {
+		pendingPull = result.Pulled
+	}
 	switch {
 	case len(result.Conflicts) > 0:
 		return fmt.Sprintf("conflicts (%d)", len(result.Conflicts))
-	case len(result.PendingPush) > 0 && len(result.Pulled) > 0:
+	case len(result.PendingPush) > 0 && len(pendingPull) > 0:
 		return "local changes pending push; remote changes pending pull"
 	case len(result.PendingPush) > 0:
 		return "local changes pending push"
-	case len(result.Pulled) > 0:
+	case len(pendingPull) > 0:
 		return "remote changes pending pull"
 	default:
 		return "clean"

@@ -29,6 +29,7 @@ type RichUserContent struct {
 	Sender         string                  `json:"sender"`
 	Text           string                  `json:"text"`
 	HasCheckpoints bool                    `json:"hasCheckpoints"`
+	Attachments    []RichAttachment        `json:"attachments,omitempty"`
 	Checkpoints    []RichMessageCheckpoint `json:"checkpoints,omitempty"`
 }
 

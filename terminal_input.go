@@ -43,6 +43,7 @@ const (
 	terminalInputCtrlF
 	terminalInputCtrlK
 	terminalInputCtrlU
+	terminalInputCtrlV
 	terminalInputCtrlW
 )
 
@@ -140,6 +141,8 @@ func readTerminalInputEventUntil(fd int, stop <-chan struct{}) (terminalInputEve
 		return state.takeControl(terminalInputEnter), nil
 	case 0x15:
 		return state.takeControl(terminalInputCtrlU), nil
+	case 0x16:
+		return state.takeControl(terminalInputCtrlV), nil
 	case 0x17:
 		return state.takeControl(terminalInputCtrlW), nil
 	case 0x1b:

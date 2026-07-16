@@ -39,6 +39,8 @@ func slashCommandPrintf(format string, args ...interface{}) {
 }
 
 func handleSlashCommandForTerminal(ctx context.Context, c *Client, line string, status statusBarState) (bool, error) {
+	bacliActionMu.Lock()
+	defer bacliActionMu.Unlock()
 	if !slashCommandOutputCanBeCaptured(line) {
 		return handleSlashCommand(ctx, c, line)
 	}
