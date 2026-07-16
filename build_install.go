@@ -1170,7 +1170,7 @@ func (c *Client) uploadScopedAppPackage(ctx context.Context, zipPath string, ctx
 	values.Set("sysparm_request_type", "custom_app")
 	endpoint := strings.TrimRight(c.cfg.InstanceURL, "/") + "/sn_appclient_upload_processor.do?" + values.Encode()
 	c.buildInstallProgress("install: uploading package to ServiceNow")
-	body, _, _, err := c.postMultipart(ctx, endpoint, func(writer *multipart.Writer) error {
+	body, _, _, err := c.postBrowserSessionMultipart(ctx, endpoint, func(writer *multipart.Writer) error {
 		if err := writer.WriteField("upload_type", "file"); err != nil {
 			return err
 		}

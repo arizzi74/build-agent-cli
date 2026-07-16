@@ -656,6 +656,17 @@ func (c *Client) getRaw(ctx context.Context, endpoint, accept string) ([]byte, s
 }
 
 func (c *Client) postMultipart(ctx context.Context, endpoint string, build func(*multipart.Writer) error) ([]byte, string, int, error) {
+	return c.postMultipartWithHeaders(ctx, endpoint, c.setGliderWebHeaders, build)
+}
+
+func (c *Client) postBrowserSessionMultipart(ctx context.Context, endpoint string, build func(*multipart.Writer) error) ([]byte, string, int, error) {
+	return c.postMultipartWithHeaders(ctx, endpoint, func(req *http.Request) {
+		c.setGatewayHeaders(req)
+		c.setBrowserSessionHeaders(req)
+	}, build)
+}
+
+func (c *Client) postMultipartWithHeaders(ctx context.Context, endpoint string, setHeaders func(*http.Request), build func(*multipart.Writer) error) ([]byte, string, int, error) {
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 	if err := build(writer); err != nil {
@@ -669,7 +680,7 @@ func (c *Client) postMultipart(ctx context.Context, endpoint string, build func(
 	if err != nil {
 		return nil, "", 0, err
 	}
-	c.setGliderWebHeaders(req)
+	setHeaders(req)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("Accept", "*/*")
 	res, err := c.httpClient.Do(req)
@@ -710,6 +721,17 @@ func (c *Client) postWebJSON(ctx context.Context, endpoint string, payload inter
 
 func (c *Client) setGliderWebHeaders(req *http.Request) {
 	c.setGatewayHeaders(req)
+	// Nirvana OAuth can remain valid after the saved browser session expires.
+	// Prefer that bearer for Glider REST calls; replacing it with a stale
+	// session cookie makes workspace refresh fail silently and leaves app and
+	// conversation pickers scoped by an obsolete per-machine cache.
+	if c.opts.Nirvana && c.nirvanaRESTAccessToken() != "" {
+		return
+	}
+	c.setBrowserSessionHeaders(req)
+}
+
+func (c *Client) setBrowserSessionHeaders(req *http.Request) {
 	if c.sessionCookieHeader != "" {
 		req.Header.Set("Cookie", c.sessionCookieHeader)
 		if c.gatewayAuth != authModeBasic {

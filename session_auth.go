@@ -321,7 +321,8 @@ func (c *Client) sessionValidationGET(ctx context.Context, path string) ([]byte,
 		// Session validation must exercise the browser session itself. Generic
 		// Nirvana REST headers prefer cached OAuth, which can hide an expired
 		// cookie or make a valid session endpoint reject the request.
-		c.setGliderWebHeaders(req)
+		c.setGatewayHeaders(req)
+		c.setBrowserSessionHeaders(req)
 		req.Header.Set("Accept", "application/json,text/html;q=0.8,*/*;q=0.5")
 	})
 	body, status := result.Body, result.Status
