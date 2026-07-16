@@ -919,7 +919,7 @@ func prepareTerminalScrollbackOutput() bool {
 	return true
 }
 
-func drawTerminalFooterWorkingLine(text string, status statusBarState) bool {
+func drawTerminalFooterTurnStatusLine(text string, status statusBarState) bool {
 	if terminalPickerActive() {
 		return false
 	}
@@ -934,13 +934,16 @@ func drawTerminalFooterWorkingLine(text string, status statusBarState) bool {
 	}
 	fmt.Fprintf(os.Stderr, "\x1b[s")
 	fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", metrics.TurnTop, ansiEraseLine)
-	fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", metrics.TurnRow, ansiEraseLine, fitPromptLine(text, metrics.Width))
+	// Keep the final terminal cell unused. Terminals with delayed autowrap
+	// (notably iTerm2) can otherwise advance a full-width animated line after
+	// the synchronized frame ends and corrupt the footer geometry.
+	fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", metrics.TurnRow, ansiEraseLine, fitTerminalMutableLine(text, metrics.Width))
 	fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", metrics.TurnBottom, ansiEraseLine)
 	fmt.Fprintf(os.Stderr, "\x1b[u")
 	return true
 }
 
-func clearTerminalFooterWorkingLine(status statusBarState) bool {
+func clearTerminalFooterTurnStatusLine(status statusBarState) bool {
 	if terminalPickerActive() {
 		return false
 	}
@@ -958,6 +961,18 @@ func clearTerminalFooterWorkingLine(status statusBarState) bool {
 	}
 	fmt.Fprintf(os.Stderr, "\x1b[u")
 	return true
+}
+
+func fitTerminalMutableLine(line string, terminalWidth int) string {
+	return fitPromptLine(line, maxInt(terminalWidth-1, 1))
+}
+
+func fitTerminalStderrMutableLine(line string) string {
+	width, _, err := term.GetSize(terminalStderrFD())
+	if err != nil || width <= 0 {
+		width = terminalStatusWidth()
+	}
+	return fitTerminalMutableLine(line, width)
 }
 
 func restoreTerminalFooter() {
@@ -1114,16 +1129,40 @@ func fitStatusBarText(text string, width int) string {
 	return plain + strings.Repeat(" ", maxInt(width-plainWidth, 0))
 }
 
-func workingStatusText(color bool) string {
-	return style("Working...", ansiWasabiGreen, color)
+var statusAnimationColors = [...]int{28, 34, 40, 46, 82, 118, 154, 190}
+
+func animatedTurnStatus(elapsed time.Duration, frame int, color bool) string {
+	plain := fmt.Sprintf("• Building (%s • esc to interrupt)", formatTurnElapsed(elapsed))
+	if !color {
+		return plain
+	}
+
+	var out strings.Builder
+	pulse := statusAnimationPosition(frame, len(statusAnimationColors))
+	fmt.Fprintf(&out, "\x1b[1;38;5;%dm•%s ", statusAnimationColors[pulse], ansiReset)
+	out.WriteString(animatedStatusText("Building", frame))
+	// The elapsed time and interrupt hint intentionally use the terminal's
+	// default foreground rather than participating in the glow animation.
+	out.WriteString(ansiReset)
+	fmt.Fprintf(&out, " (%s • esc to interrupt)", formatTurnElapsed(elapsed))
+	return out.String()
 }
 
-func animatedWorkingStatus(frame int) string {
-	return animatedStatusText("Working...", frame)
-}
-
-func animatedBuildingStatus(frame int) string {
-	return animatedStatusText("Building...", frame)
+func formatTurnElapsed(elapsed time.Duration) string {
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	totalSeconds := int64(elapsed / time.Second)
+	hours := totalSeconds / 3600
+	minutes := (totalSeconds % 3600) / 60
+	seconds := totalSeconds % 60
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm %ds", hours, minutes, seconds)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
 
 func animatedConnectingStatus(frame int) string {
@@ -1135,22 +1174,29 @@ func animatedStatusText(label string, frame int) string {
 	if len(text) == 0 {
 		return ""
 	}
-	span := len(text)*2 - 2
-	if span <= 0 {
-		span = 1
-	}
-	pos := frame % span
-	if pos >= len(text) {
-		pos = span - pos
-	}
-	colors := []int{28, 34, 40, 46, 82, 118, 154, 190}
+	pos := statusAnimationPosition(frame, len(text))
 	var out strings.Builder
 	for i, r := range text {
 		dist := absInt(i - pos)
-		level := len(colors) - 1 - minInt(dist, len(colors)-1)
-		fmt.Fprintf(&out, "\x1b[1;38;5;%dm%c%s", colors[level], r, ansiReset)
+		level := len(statusAnimationColors) - 1 - minInt(dist, len(statusAnimationColors)-1)
+		fmt.Fprintf(&out, "\x1b[1;38;5;%dm%c%s", statusAnimationColors[level], r, ansiReset)
 	}
 	return out.String()
+}
+
+func statusAnimationPosition(frame, length int) int {
+	if length <= 1 {
+		return 0
+	}
+	span := length*2 - 2
+	pos := frame % span
+	if pos < 0 {
+		pos += span
+	}
+	if pos >= length {
+		pos = span - pos
+	}
+	return pos
 }
 
 var connectingLogoRows = []string{

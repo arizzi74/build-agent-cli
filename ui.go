@@ -820,7 +820,7 @@ func (l *fixedPromptLayout) submit(prompt, _ string) {
 	l.drawnMenuRows = 0
 	// The submitted text is copied into the managed transcript by the REPL
 	// immediately after Enter. Keep the footer prompt ready for the next input
-	// while `Working...` and the assistant response render above it.
+	// while `Building` and the assistant response render above it.
 	l.drawPrompt(prompt, "", 0)
 	placeTerminalFooterComposerCursorUnlocked(prompt, "", 0)
 }
@@ -1405,6 +1405,16 @@ func startProcessingInputCapture(prompt string, status *statusBarState, cancel f
 	return capture
 }
 
+func (c *processingInputCapture) handleTurnInterruptInput(kind terminalInputEventKind) bool {
+	if kind != terminalInputEscape && kind != terminalInputCtrlC {
+		return false
+	}
+	if c != nil && c.cancel != nil {
+		c.cancel()
+	}
+	return true
+}
+
 func (c *processingInputCapture) Stop() {
 	if c == nil {
 		return
@@ -1451,7 +1461,6 @@ func (c *processingInputCapture) run(prompt string, status statusBarState) {
 	historyIndex := len(history)
 	draftLine, draftCursor := composer.Text(), composer.CursorByte()
 	draftSaved := false
-	var escapeArmedUntil time.Time
 	currentStatus := func() statusBarState {
 		lastTerminalFooterStatus.Lock()
 		defer lastTerminalFooterStatus.Unlock()
@@ -1532,24 +1541,7 @@ func (c *processingInputCapture) run(prompt string, status statusBarState) {
 			return
 		}
 
-		switch event.Kind {
-		case terminalInputEscape:
-			now := time.Now()
-			if !escapeArmedUntil.IsZero() && now.Before(escapeArmedUntil) {
-				escapeArmedUntil = time.Time{}
-				if c.cancel != nil {
-					c.cancel()
-				}
-			} else {
-				escapeArmedUntil = now.Add(2 * time.Second)
-				showTerminalFooterTempMessageWithStyle(currentStatus(), "Press Esc again within 2 seconds to cancel action", 2*time.Second, ansiYellow+ansiBold)
-			}
-			continue
-		case terminalInputCtrlC:
-			escapeArmedUntil = time.Time{}
-			if c.cancel != nil {
-				c.cancel()
-			}
+		if c.handleTurnInterruptInput(event.Kind) {
 			continue
 		}
 		if submitted {

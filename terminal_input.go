@@ -195,9 +195,12 @@ func (state *terminalInputState) readEscapeEvent(fd int, stop <-chan struct{}) (
 	case 'O':
 		return state.readSS3Event(fd, stop)
 	default:
-		// A standalone Escape followed by ordinary text is two events. Leave the
-		// printable byte buffered for the next call instead of swallowing it as
-		// an unknown escape sequence.
+		// macOS terminals commonly encode Option+key as ESC followed by a
+		// printable byte. Keep that distinct from a bare Escape so an unsupported
+		// Option shortcut cannot accidentally interrupt an active turn.
+		if state.pending[1] >= 0x20 && state.pending[1] < 0x7f {
+			return state.takeEscape(2, terminalInputUnknown, terminalInputModifierAlt), nil
+		}
 		return state.takeEscape(1, terminalInputEscape, 0), nil
 	}
 }

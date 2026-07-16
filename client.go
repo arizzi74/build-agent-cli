@@ -968,6 +968,7 @@ func (c *Client) sendGatewayMessage(ctx context.Context, content string) error {
 	}
 	c.resetWebStream()
 	c.pendingUserContent = content
+	c.turnStartedAt = time.Now()
 	c.turnDone = make(chan error, 1)
 	c.processing = true
 	streamReady := false
@@ -1058,6 +1059,7 @@ func (c *Client) sendCodeAssistGatewayMessage(_ context.Context, content string)
 	} else {
 		c.conversationID = uuidV4()
 	}
+	c.turnStartedAt = time.Now()
 	c.turnDone = make(chan error, 1)
 	c.processing = true
 	if err := c.sendCodeAssistPayload(content); err != nil {
@@ -2441,8 +2443,13 @@ func (c *Client) showTurnStatus() {
 	done := make(chan struct{})
 	c.turnStatusStop = stop
 	c.turnStatusDone = done
+	startedAt := c.turnStartedAt
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+		c.turnStartedAt = startedAt
+	}
 	c.statusMu.Unlock()
-	go c.animateTurnStatus(stop, done)
+	go c.animateTurnStatus(stop, done, startedAt)
 }
 
 func (c *Client) clearTurnStatus() bool {
@@ -2466,7 +2473,7 @@ func (c *Client) clearTurnStatus() bool {
 	c.statusMu.Lock()
 	if terminalStatusANSIEnabled() {
 		if interactiveTerminalUIEnabled() {
-			clearTerminalFooterWorkingLine(c.statusBarState())
+			clearTerminalFooterTurnStatusLine(c.statusBarState())
 		} else {
 			fmt.Fprintf(os.Stderr, "\r%s", ansiEraseLine)
 		}
@@ -2483,18 +2490,19 @@ func (c *Client) ensureTurnStatusVisible() bool {
 	return true
 }
 
-func (c *Client) animateTurnStatus(stop <-chan struct{}, done chan<- struct{}) {
+func (c *Client) animateTurnStatus(stop <-chan struct{}, done chan<- struct{}, startedAt time.Time) {
 	defer close(done)
 	ticker := time.NewTicker(110 * time.Millisecond)
 	defer ticker.Stop()
 	frame := 0
 	for {
+		text := animatedTurnStatus(time.Since(startedAt), frame, true)
 		c.statusMu.Lock()
 		if terminalStatusANSIEnabled() {
 			if interactiveTerminalUIEnabled() {
-				drawTerminalFooterWorkingLine(animatedWorkingStatus(frame), c.statusBarState())
+				drawTerminalFooterTurnStatusLine(text, c.statusBarState())
 			} else {
-				fmt.Fprintf(os.Stderr, "\r%s%s", ansiEraseLine, animatedWorkingStatus(frame))
+				fmt.Fprintf(os.Stderr, "\r%s%s", ansiEraseLine, fitTerminalStderrMutableLine(text))
 			}
 		}
 		c.statusMu.Unlock()
@@ -2508,7 +2516,7 @@ func (c *Client) animateTurnStatus(stop <-chan struct{}, done chan<- struct{}) {
 }
 
 func (c *Client) finishGatewayStreamOutput() {
-	// Keep the animated Working indicator alive while text streams; clear it only
+	// Keep the animated Building indicator alive while text streams; clear it only
 	// when the server closes the turn and final output is committed.
 	c.clearTurnStatus()
 	assistantText := strings.TrimSpace(c.webStreamText)
@@ -3859,8 +3867,8 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 		}
 	}
 	// Some client-side prompts (notably approvals) temporarily clear the animated
-	// Working footer so the blocking picker can own the terminal. Once the local
-	// answer is ready, restore the Working indicator before handing control back
+	// Building footer so the blocking picker can own the terminal. Once the local
+	// answer is ready, restore the Building indicator before handing control back
 	// to the server; it should remain visible until turn_end/turn_error.
 	c.ensureTurnStatusVisible()
 	return c.sendElicitationResponse(elicitationID, status, result)
@@ -4076,7 +4084,7 @@ func (c *Client) printLiveUserTurn(content string) {
 	printLiveUserPrompt(content)
 	// `printLiveUserPrompt` writes the submitted turn into the scrollback region.
 	// Put the terminal cursor back in the input footer immediately afterwards so
-	// any typeahead while `Working...` is animating echoes in the prompt bar, not
+	// any typeahead while `Building` is animating echoes in the prompt bar, not
 	// in the transcript/working area.
 	placeTerminalFooterPromptCursor("ba> ", 0)
 }
