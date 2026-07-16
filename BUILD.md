@@ -124,8 +124,8 @@ Inspect artifacts:
 file dist/bacli-*
 ldd dist/bacli-linux-arm64 || true
 ldd dist/bacli-linux-amd64 || true
-sha256sum -c dist/SHA256SUMS
+(cd dist && sha256sum -c SHA256SUMS)
 ls -lh dist/
 ```
 
-Expected Linux output includes `ELF 64-bit`, `ARM aarch64`, `statically linked`, and `stripped`; `ldd` reports that it is not a dynamic executable. Darwin outputs are Mach-O for their requested architectures. Windows output is PE32+ x86-64.
+Expected Linux output includes `ELF 64-bit`, `ARM aarch64`, `statically linked`, and `stripped`; `ldd` reports that it is not a dynamic executable. Darwin outputs are Mach-O for their requested architectures. Windows outputs are PE32+ for x86-64 and Aarch64 respectively.

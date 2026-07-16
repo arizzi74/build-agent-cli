@@ -25,20 +25,32 @@ const (
 	// ANSI erase commands inherit the active background color on BCE terminals
 	// such as iTerm2. Non-prompt clears must therefore establish the default
 	// rendition first; prompt bands deliberately use their own final-cell EL.
-	ansiEraseLine = ansiReset + "\x1b[2K"
-	ansiBold      = "\x1b[1m"
-	ansiDim       = "\x1b[2m"
-	ansiBlue      = "\x1b[34m"
-	ansiRed       = "\x1b[31m"
-	ansiCyan      = "\x1b[36m"
-	ansiGreen     = "\x1b[32m"
-	ansiYellow    = "\x1b[33m"
-	ansiMagenta   = "\x1b[35m"
-	ansiGrayFG    = "\x1b[38;5;250m"
-	ansiUserBG    = "\x1b[48;5;236m"
+	ansiEraseLine  = ansiReset + "\x1b[2K"
+	ansiBold       = "\x1b[1m"
+	ansiDim        = "\x1b[2m"
+	ansiBlue       = "\x1b[34m"
+	ansiRed        = "\x1b[31m"
+	ansiCyan       = "\x1b[36m"
+	ansiGreen      = "\x1b[32m"
+	ansiYellow     = "\x1b[33m"
+	ansiMagenta    = "\x1b[35m"
+	ansiGrayFG     = "\x1b[38;5;250m"
+	ansiUserBG     = "\x1b[48;5;236m"
+	ansiCursorHide = "\x1b[?25l"
+	ansiCursorShow = "\x1b[?25h"
+	ansiSyncBegin  = "\x1b[?2026h"
+	ansiSyncEnd    = "\x1b[?2026l"
 	// Bright wasabi-ish green for transient status text.
 	ansiWasabiGreen = "\x1b[1;38;5;118m"
 )
+
+func beginTerminalFrame() {
+	_ = writeTerminalString(os.Stderr, ansiSyncBegin+ansiCursorHide)
+}
+
+func endTerminalFrame() {
+	_ = writeTerminalString(os.Stderr, ansiReset+ansiCursorShow+ansiSyncEnd)
+}
 
 func printAssistantText(text string) {
 	text = strings.TrimSpace(text)
@@ -381,7 +393,7 @@ func terminalStatusANSIEnabled() bool {
 }
 
 func interactiveTerminalUIEnabled() bool {
-	return terminalStatusANSIEnabled() && term.IsTerminal(int(os.Stdin.Fd()))
+	return !strings.EqualFold(os.Getenv("TERM"), "dumb") && term.IsTerminal(terminalStderrFD()) && term.IsTerminal(int(os.Stdin.Fd()))
 }
 
 func terminalStatusWidth() int {
@@ -405,8 +417,44 @@ type terminalFooterMetrics struct {
 	PromptTop    int
 	PromptRow    int
 	PromptBottom int
+	PromptRows   int
 	StatusRow    int
 	TempRow      int
+}
+
+const terminalComposerMaxRows = 5
+
+var terminalPromptRowsState = struct {
+	sync.Mutex
+	rows int
+}{rows: 1}
+
+func setTerminalPromptRows(rows int) bool {
+	rows = maxInt(rows, 1)
+	terminalPromptRowsState.Lock()
+	changed := terminalPromptRowsState.rows != rows
+	terminalPromptRowsState.rows = rows
+	terminalPromptRowsState.Unlock()
+	return changed
+}
+
+func currentTerminalPromptRows() int {
+	terminalPromptRowsState.Lock()
+	defer terminalPromptRowsState.Unlock()
+	return maxInt(terminalPromptRowsState.rows, 1)
+}
+
+func terminalComposerRowsForHeight(height int) int {
+	// Seven non-composer rows are reserved for transcript separation, the
+	// working indicator, status, and temporary messages. Keep at least one
+	// transcript row even in the smallest supported viewport.
+	return maxInt(1, minInt(terminalComposerMaxRows, height-8))
+}
+
+func terminalComposerLayoutForSize(prompt, line string, cursor, width, height int) terminalComposerLayout {
+	contentWidth := maxInt(1, width-terminalDisplayWidth(prompt)-2)
+	composer := newTerminalComposerAt(line, cursor)
+	return composer.Layout(prompt, contentWidth, terminalComposerRowsForHeight(height))
 }
 
 var lastTerminalFooterMetrics struct {
@@ -443,17 +491,19 @@ func terminalFooterMetricsForTTY() (terminalFooterMetrics, bool) {
 	if err != nil || width < 20 || height < 9 {
 		return terminalFooterMetrics{}, false
 	}
-	promptTop := height - 4
+	promptRows := minInt(currentTerminalPromptRows(), terminalComposerRowsForHeight(height))
+	promptTop := height - promptRows - 3
 	return terminalFooterMetrics{
 		Width:        width,
 		Height:       height,
-		ScrollBottom: height - 8,
-		TurnTop:      height - 7,
-		TurnRow:      height - 6,
-		TurnBottom:   height - 5,
+		ScrollBottom: height - promptRows - 7,
+		TurnTop:      height - promptRows - 6,
+		TurnRow:      height - promptRows - 5,
+		TurnBottom:   height - promptRows - 4,
 		PromptTop:    promptTop,
 		PromptRow:    promptTop + 1,
-		PromptBottom: promptTop + 2,
+		PromptBottom: promptTop + promptRows + 1,
+		PromptRows:   promptRows,
 		StatusRow:    height - 1,
 		TempRow:      height,
 	}, true
@@ -489,7 +539,7 @@ func clearStaleFooterAfterResize(metrics terminalFooterMetrics) {
 		return
 	}
 	old := lastTerminalFooterMetrics.metrics
-	if old.Height == metrics.Height && old.Width == metrics.Width && old.StatusRow == metrics.StatusRow && old.TempRow == metrics.TempRow {
+	if old.Height == metrics.Height && old.Width == metrics.Width && old.ScrollBottom == metrics.ScrollBottom && old.PromptTop == metrics.PromptTop && old.PromptBottom == metrics.PromptBottom && old.StatusRow == metrics.StatusRow && old.TempRow == metrics.TempRow {
 		return
 	}
 	top := minInt(old.ScrollBottom, metrics.ScrollBottom)
@@ -507,7 +557,28 @@ func clearStaleFooterAfterResize(metrics terminalFooterMetrics) {
 	fmt.Fprint(os.Stderr, "\x1b[u")
 }
 
+// deactivateTerminalFooterForFallback resets the managed scroll region before
+// a viewport becomes too small for the footer. It must be called with
+// terminalRenderMu held.
+func deactivateTerminalFooterForFallback(oldTurnTop int) {
+	fmt.Fprint(os.Stderr, ansiReset+"\x1b[r")
+	_, height, err := term.GetSize(terminalStderrFD())
+	if err == nil && height > 0 {
+		top := maxInt(1, minInt(oldTurnTop, height))
+		for row := top; row <= height; row++ {
+			fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", row, ansiEraseLine)
+		}
+		fmt.Fprintf(os.Stderr, "\x1b[%d;1H", height)
+	}
+	lastTerminalFooterMetrics.set = false
+	setTerminalPromptRows(1)
+}
+
 func drawTerminalFooterStatus(status statusBarState) bool {
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	metrics, ok := activateTerminalFooter(status)
 	if !ok {
 		return false
@@ -523,7 +594,7 @@ func drawTerminalFooterStatusAt(metrics terminalFooterMetrics, status statusBarS
 }
 
 func drawTerminalFooterStatusLine(metrics terminalFooterMetrics, status statusBarState) {
-	line := formatStatusBar(status, true, metrics.Width)
+	line := formatStatusBar(status, terminalStatusANSIEnabled(), metrics.Width)
 	fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", metrics.StatusRow, ansiEraseLine, line)
 }
 
@@ -532,13 +603,13 @@ func drawTerminalFooterTempLine(metrics terminalFooterMetrics, message, code str
 	if strings.TrimSpace(message) == "" {
 		line = strings.Repeat(" ", maxInt(metrics.Width, 0))
 	} else if code != "" {
-		line = style(line, code, true)
+		line = style(line, code, terminalStatusANSIEnabled())
 	}
 	fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", metrics.TempRow, ansiEraseLine, line)
 }
 
 func drawTerminalFooterSecondaryLine(metrics terminalFooterMetrics) {
-	if line := terminalFooterSubagentLine(metrics.Width, true); line != "" {
+	if line := terminalFooterSubagentLine(metrics.Width, terminalStatusANSIEnabled()); line != "" {
 		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", metrics.TempRow, ansiEraseLine, line)
 		return
 	}
@@ -564,7 +635,7 @@ func terminalFooterSubagentLine(width int, color bool) string {
 		return label
 	}
 	content := strings.TrimRight(label, " ")
-	return animatedStatusText(content, frame) + strings.Repeat(" ", maxInt(width-runeLen(content), 0))
+	return animatedStatusText(content, frame) + strings.Repeat(" ", maxInt(width-terminalDisplayWidth(content), 0))
 }
 
 func advanceTerminalFooterSubagentFrame() {
@@ -637,6 +708,8 @@ func compactTerminalFooterSubagentOrder(order []string, entries map[string]strin
 func redrawTerminalFooterSecondaryLine() {
 	terminalRenderMu.Lock()
 	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	if terminalPickerActive() {
 		return
 	}
@@ -685,12 +758,19 @@ func showTerminalFooterTempMessageWithStyle(status statusBarState, message strin
 	terminalFooterTempStatus.expires = expires
 	terminalFooterTempStatus.Unlock()
 	terminalRenderMu.Lock()
+	beginTerminalFrame()
+	lastTerminalFooterStatus.Lock()
+	if lastTerminalFooterStatus.set {
+		status = lastTerminalFooterStatus.state
+	}
+	lastTerminalFooterStatus.Unlock()
 	metrics, ok := activateTerminalFooter(status)
 	if ok {
 		fmt.Fprint(os.Stderr, "\x1b[s")
 		drawTerminalFooterSecondaryLine(metrics)
 		fmt.Fprint(os.Stderr, "\x1b[u")
 	}
+	endTerminalFrame()
 	terminalRenderMu.Unlock()
 	if duration > 0 {
 		time.AfterFunc(duration, func() {
@@ -705,6 +785,8 @@ func showTerminalFooterTempMessageWithStyle(status statusBarState, message strin
 			terminalFooterTempStatus.Unlock()
 			terminalRenderMu.Lock()
 			defer terminalRenderMu.Unlock()
+			beginTerminalFrame()
+			defer endTerminalFrame()
 			if terminalPickerActive() {
 				return
 			}
@@ -729,6 +811,8 @@ func clearTerminalFooterTempMessage() {
 	terminalFooterTempStatus.Unlock()
 	terminalRenderMu.Lock()
 	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	if terminalPickerActive() {
 		return
 	}
@@ -783,30 +867,43 @@ func redrawPendingFooterPromptFromState() bool {
 	}
 	terminalRenderMu.Lock()
 	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	return redrawPendingFooterPromptFromStateUnlocked()
 }
 
 func redrawPendingFooterPromptFromStateUnlocked() bool {
-	line, _ := peekPendingCommandInput()
+	line, cursor, _ := peekPendingCommandInputAt()
 	lastTerminalFooterStatus.Lock()
 	status, ok := lastTerminalFooterStatus.state, lastTerminalFooterStatus.set
 	lastTerminalFooterStatus.Unlock()
 	if !ok {
-		return placeTerminalFooterPromptCursor("ba> ", len([]rune(line)))
+		return placeTerminalFooterComposerCursorUnlocked("ba> ", line, cursor)
 	}
-	return drawTerminalFooterPromptUnlocked("ba> ", line, len([]rune(line)), status)
+	return drawTerminalFooterPromptUnlocked("ba> ", line, cursor, status)
 }
 
 func placeTerminalFooterPromptCursor(prompt string, cursor int) bool {
+	return placeTerminalFooterComposerCursor(prompt, "", cursor)
+}
+
+func placeTerminalFooterComposerCursor(prompt, line string, cursor int) bool {
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
+	return placeTerminalFooterComposerCursorUnlocked(prompt, line, cursor)
+}
+
+func placeTerminalFooterComposerCursorUnlocked(prompt, line string, cursor int) bool {
 	metrics, ok := terminalFooterMetricsForTTY()
 	if !ok {
 		return false
 	}
-	col := commandInputCursorColumn(prompt, cursor)
-	if col > metrics.Width {
-		col = metrics.Width
-	}
-	fmt.Fprintf(os.Stderr, "\x1b[%d;%dH", metrics.PromptRow, col)
+	layout := terminalComposerLayoutForSize(prompt, line, cursor, metrics.Width, metrics.Height)
+	row := metrics.PromptTop + 1 + layout.CursorRow
+	col := minInt(layout.CursorColumn, metrics.Width)
+	fmt.Fprintf(os.Stderr, "\x1b[%d;%dH", row, col)
 	return true
 }
 
@@ -828,6 +925,8 @@ func drawTerminalFooterWorkingLine(text string, status statusBarState) bool {
 	}
 	terminalRenderMu.Lock()
 	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	advanceTerminalFooterSubagentFrame()
 	metrics, ok := activateTerminalFooter(status)
 	if !ok {
@@ -847,6 +946,8 @@ func clearTerminalFooterWorkingLine(status statusBarState) bool {
 	}
 	terminalRenderMu.Lock()
 	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	metrics, ok := activateTerminalFooter(status)
 	if !ok {
 		return false
@@ -860,15 +961,20 @@ func clearTerminalFooterWorkingLine(status statusBarState) bool {
 }
 
 func restoreTerminalFooter() {
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	metrics, ok := terminalFooterMetricsForTTY()
-	if !ok {
-		return
-	}
-	fmt.Fprint(os.Stderr, "\x1b[r")
+	fmt.Fprint(os.Stderr, "\x1b[?2004l\x1b[r")
 	lastTerminalFooterMetrics.set = false
 	lastTerminalFooterStatus.Lock()
 	lastTerminalFooterStatus.set = false
 	lastTerminalFooterStatus.Unlock()
+	setTerminalPromptRows(1)
+	if !ok {
+		return
+	}
 	for row := metrics.TurnTop; row <= metrics.TempRow; row++ {
 		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", row, ansiEraseLine)
 	}
@@ -909,9 +1015,12 @@ func formatStatusBar(state statusBarState, color bool, width int) string {
 	}
 	text := fmt.Sprintf(" model=%s  input_messages=%d  workspace=%s  app=%s  project=%s  instance=%s ", model, state.InputMessages, workspace, app, project, instance)
 	if !color {
+		if width > 0 {
+			return fitStatusBarText(text, width)
+		}
 		return strings.TrimSpace(text)
 	}
-	if width > 0 && runeLen(text) > width {
+	if width > 0 && terminalDisplayWidth(text) > width {
 		return style(fitStatusBarText(text, width), ansiCyan+ansiBold, true)
 	}
 	segments := []statusBarSegment{
@@ -958,7 +1067,7 @@ func colorStatusSegments(segments []statusBarSegment, width int) string {
 	plainLen := 0
 	for _, segment := range segments {
 		out.WriteString(style(segment.Text, segment.Code, segment.Code != ""))
-		plainLen += runeLen(segment.Text)
+		plainLen += terminalDisplayWidth(segment.Text)
 	}
 	if width > plainLen {
 		out.WriteString(strings.Repeat(" ", width-plainLen))
@@ -993,14 +1102,16 @@ func fitStatusBarText(text string, width int) string {
 	if width <= 0 {
 		return strings.TrimSpace(text)
 	}
-	runes := []rune(stripANSI(text))
-	if len(runes) > width {
+	plain := stripANSI(text)
+	plainWidth := terminalDisplayWidth(plain)
+	if plainWidth > width {
 		if width == 1 {
 			return "…"
 		}
-		return string(runes[:width-1]) + "…"
+		plain = terminalFitCells(plain, width-1) + "…"
+		plainWidth = terminalDisplayWidth(plain)
 	}
-	return string(runes) + strings.Repeat(" ", width-len(runes))
+	return plain + strings.Repeat(" ", maxInt(width-plainWidth, 0))
 }
 
 func workingStatusText(color bool) string {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"golang.org/x/term"
 )
@@ -25,6 +26,7 @@ var commandHistory = struct {
 var pendingCommandInput = struct {
 	sync.Mutex
 	line      string
+	cursor    int
 	submitted bool
 }{}
 
@@ -104,15 +106,28 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 		rememberCommand(line)
 		return line, nil
 	}
-	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
+	terminalControls := !strings.EqualFold(os.Getenv("TERM"), "dumb")
+	if terminalControls {
+		terminalRenderMu.Lock()
+		_ = writeTerminalString(os.Stderr, "\x1b[?2004h"+ansiCursorShow)
+		terminalRenderMu.Unlock()
+	}
+	defer func() {
+		if terminalControls {
+			terminalRenderMu.Lock()
+			_ = writeTerminalString(os.Stderr, "\x1b[?2004l"+ansiReset+ansiCursorShow)
+			terminalRenderMu.Unlock()
+		}
+		_ = term.Restore(int(os.Stdin.Fd()), oldState)
+	}()
+
 	layout := newFixedPromptLayout(status)
 	defer layout.clear()
 
-	snapshot := commandHistorySnapshot()
-	historyIndex := len(snapshot)
-	initialLine, initialSubmitted := takePendingCommandInput()
-	line := []rune(initialLine)
-	cursor := len(line)
+	history := commandHistorySnapshot()
+	historyIndex := len(history)
+	initialLine, initialCursor, initialSubmitted := takePendingCommandInputAt()
+	editor := newTerminalComposerAt(initialLine, initialCursor)
 	if initialSubmitted {
 		result := strings.TrimSpace(initialLine)
 		if layout.enabled {
@@ -123,19 +138,48 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 		rememberCommand(result)
 		return result, nil
 	}
+
+	type promptSnapshot struct {
+		line     string
+		cursor   int
+		menuOpen bool
+		menu     []SlashCommandSuggestion
+		selected int
+	}
+
+	var stateMu sync.Mutex
+	var redrawMu sync.Mutex
 	menuOpen := false
 	menu := []SlashCommandSuggestion{}
 	selected := 0
+	draftLine, draftCursor := editor.Text(), editor.CursorByte()
+	draftSaved := false
 	lastCtrlD := time.Time{}
 	var ctrlDMu sync.Mutex
+	var ctrlDTimer *time.Timer
+	promptDone := make(chan struct{})
+	defer func() {
+		close(promptDone)
+		ctrlDMu.Lock()
+		if ctrlDTimer != nil {
+			ctrlDTimer.Stop()
+		}
+		ctrlDMu.Unlock()
+	}()
 
-	refreshMenu := func() {
+	refreshMenuLocked := func() {
 		if !menuOpen {
 			menu = nil
 			selected = 0
 			return
 		}
-		menu = filterSlashSuggestionsForClient(string(line), client)
+		if !strings.HasPrefix(editor.Text(), "/") || strings.ContainsAny(editor.Text(), "\r\n") {
+			menuOpen = false
+			menu = nil
+			selected = 0
+			return
+		}
+		menu = filterSlashSuggestionsForClient(editor.Text(), client)
 		if selected >= len(menu) {
 			selected = len(menu) - 1
 		}
@@ -144,222 +188,391 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 		}
 	}
 
-	redraw := func() {
-		if layout.enabled {
-			layout.redraw(prompt, string(line), cursor, slashMenuLines(menuOpen, menu, selected))
-			return
-		}
-		fmt.Fprintf(os.Stderr, "\r%s%s", ansiEraseLine, commandInputLine(prompt, string(line)))
-		fmt.Fprintf(os.Stderr, "%s\x1b[J", ansiReset)
-		lines := boundedSlashMenuLines(slashMenuLines(menuOpen, menu, selected), terminalSlashMenuMaxRows())
-		for _, menuLine := range lines {
-			fmt.Fprintf(os.Stderr, "\r\n%s", menuLine)
-		}
-		if len(lines) > 0 {
-			fmt.Fprintf(os.Stderr, "\x1b[%dA\r", len(lines))
-			col := len([]rune(prompt)) + cursor
-			if terminalStatusANSIEnabled() {
-				col++
-			}
-			if col > 0 {
-				fmt.Fprintf(os.Stderr, "\x1b[%dC", col)
-			}
-		} else if tail := len(line) - cursor; tail > 0 {
-			fmt.Fprintf(os.Stderr, "\x1b[%dD", tail)
+	snapshotLocked := func() promptSnapshot {
+		return promptSnapshot{
+			line:     editor.Text(),
+			cursor:   editor.CursorByte(),
+			menuOpen: menuOpen,
+			menu:     append([]SlashCommandSuggestion(nil), menu...),
+			selected: selected,
 		}
 	}
 
-	if layout.enabled {
-		layout.redraw(prompt, string(line), cursor, nil)
-	} else {
-		fmt.Fprint(os.Stderr, commandInputLine(prompt, string(line)))
-	}
-	stopResizeNotifications := startTerminalResizeNotifications(func() {
+	redrawSnapshot := func(snapshot promptSnapshot) {
+		menuLines := slashMenuLines(snapshot.menuOpen, snapshot.menu, snapshot.selected)
+		layout.redraw(prompt, snapshot.line, snapshot.cursor, menuLines)
 		if layout.enabled {
-			redraw()
+			return
 		}
+
+		// Tiny terminals use a compact, one-row fallback until the next resize can
+		// activate the fixed footer. Newlines are made visible without allowing a
+		// draft to move the physical terminal cursor unpredictably.
+		displayPrefix := strings.ReplaceAll(strings.ReplaceAll(snapshot.line[:snapshot.cursor], "\n", "↵ "), "\t", "    ")
+		displaySuffix := strings.ReplaceAll(strings.ReplaceAll(snapshot.line[snapshot.cursor:], "\n", "↵ "), "\t", "    ")
+		width, _, sizeErr := term.GetSize(terminalStderrFD())
+		if sizeErr != nil || width <= 0 {
+			width = 80
+		}
+		leadingCells := 0
+		if terminalStatusANSIEnabled() {
+			leadingCells = 1
+		}
+		available := maxInt(1, width-terminalDisplayWidth(prompt)-leadingCells-1)
+		visiblePrefix := displayPrefix
+		leftMarker := ""
+		if terminalDisplayWidth(visiblePrefix) > available {
+			leftMarker = "…"
+			visiblePrefix = terminalTailCells(visiblePrefix, maxInt(available-1, 0))
+		}
+		cursorCells := terminalDisplayWidth(leftMarker + visiblePrefix)
+		displayLine := leftMarker + visiblePrefix + terminalFitCells(displaySuffix, maxInt(available-cursorCells, 0))
+		terminalRenderMu.Lock()
+		beginTerminalFrame()
+		fmt.Fprintf(os.Stderr, "\r%s%s", ansiEraseLine, commandInputLine(prompt, displayLine))
+		fmt.Fprintf(os.Stderr, "%s\x1b[J", ansiReset)
+		lines := boundedSlashMenuLines(menuLines, terminalSlashMenuMaxRows())
+		for _, menuLine := range lines {
+			fmt.Fprintf(os.Stderr, "\r\n%s", fitPromptLine(menuLine, maxInt(width-1, 1)))
+		}
+		if len(lines) > 0 {
+			fmt.Fprintf(os.Stderr, "\x1b[%dA\r", len(lines))
+		} else {
+			fmt.Fprint(os.Stderr, "\r")
+		}
+		col := terminalDisplayWidth(prompt) + leadingCells + cursorCells
+		if col > 0 {
+			fmt.Fprintf(os.Stderr, "\x1b[%dC", col)
+		}
+		endTerminalFrame()
+		terminalRenderMu.Unlock()
+	}
+
+	redraw := func() {
+		redrawMu.Lock()
+		defer redrawMu.Unlock()
+		stateMu.Lock()
+		snapshot := snapshotLocked()
+		stateMu.Unlock()
+		redrawSnapshot(snapshot)
+	}
+
+	finishPrompt := func(result string, abort bool, marker string) {
+		redrawMu.Lock()
+		defer redrawMu.Unlock()
+		if layout.enabled {
+			if abort {
+				layout.abort(marker)
+			} else {
+				layout.submit(prompt, result)
+			}
+			return
+		}
+		terminalRenderMu.Lock()
+		beginTerminalFrame()
+		if marker != "" {
+			fmt.Fprintf(os.Stderr, "\r%s%s\r\n", ansiEraseLine, marker)
+		} else {
+			fmt.Fprint(os.Stderr, "\r\n")
+		}
+		endTerminalFrame()
+		terminalRenderMu.Unlock()
+	}
+
+	showCtrlDMessage := func(message string) {
+		redrawMu.Lock()
+		defer redrawMu.Unlock()
+		if layout.enabled {
+			layout.drawTempMessage(message)
+			return
+		}
+		terminalRenderMu.Lock()
+		beginTerminalFrame()
+		width, _, sizeErr := term.GetSize(terminalStderrFD())
+		if sizeErr != nil || width <= 0 {
+			width = 80
+		}
+		fmt.Fprint(os.Stderr, "\r"+ansiEraseLine+fitPromptLine(message, maxInt(width-1, 1))+"\r")
+		endTerminalFrame()
+		terminalRenderMu.Unlock()
+	}
+
+	clearCtrlDMessage := func() {
+		redrawMu.Lock()
+		defer redrawMu.Unlock()
+		if layout.enabled {
+			layout.clearTempMessage()
+			return
+		}
+		stateMu.Lock()
+		snapshot := snapshotLocked()
+		stateMu.Unlock()
+		redrawSnapshot(snapshot)
+	}
+
+	redraw()
+	stopResizeNotifications := startTerminalResizeNotifications(func() {
+		redraw()
 	})
 	defer stopResizeNotifications()
-	buf := make([]byte, 1)
-	for {
-		if _, err := os.Stdin.Read(buf); err != nil {
-			return "", err
+
+	contentWidth := func() int {
+		width, _, sizeErr := term.GetSize(terminalStderrFD())
+		if sizeErr != nil || width <= 0 {
+			width = terminalStatusWidth()
 		}
-		switch b := buf[0]; b {
-		case '\r', '\n':
+		return maxInt(1, width-terminalDisplayWidth(prompt)-2)
+	}
+
+	for {
+		event, readErr := readTerminalInputEvent(int(os.Stdin.Fd()))
+		if readErr != nil {
+			return "", readErr
+		}
+
+		changed := false
+		redrawNeeded := false
+		warning := ""
+		stateMu.Lock()
+		switch event.Kind {
+		case terminalInputEnter:
 			if menuOpen && len(menu) > 0 {
 				choice := slashMenuChoice(menu, selected)
-				line = []rune(slashMenuInsertText(choice))
-				cursor = len(line)
+				inserted := slashMenuInsertText(choice)
+				editor.Reset(inserted, len(inserted))
 				menuOpen = false
-				refreshMenu()
+				refreshMenuLocked()
 				if slashMenuEnterSubmits(choice) {
-					result := strings.TrimSpace(string(line))
-					if layout.enabled {
-						layout.submit(prompt, result)
-					} else {
-						fmt.Fprint(os.Stderr, "\r\n")
-					}
+					result := strings.TrimSpace(editor.Text())
+					stateMu.Unlock()
+					finishPrompt(result, false, "")
 					rememberCommand(result)
 					return result, nil
 				}
-				redraw()
-				continue
+				redrawNeeded = true
+				break
 			}
-			result := strings.TrimSpace(string(line))
-			if layout.enabled {
-				layout.submit(prompt, result)
-			} else {
-				fmt.Fprint(os.Stderr, "\r\n")
-			}
+			result := strings.TrimSpace(editor.Text())
+			stateMu.Unlock()
+			finishPrompt(result, false, "")
 			rememberCommand(result)
 			return result, nil
-		case '\t':
+
+		case terminalInputNewline:
+			changed = editor.Insert("\n")
+
+		case terminalInputTab:
 			if menuOpen && len(menu) > 0 {
 				choice := slashMenuChoice(menu, selected)
-				line = []rune(slashMenuInsertText(choice))
-				cursor = len(line)
+				inserted := slashMenuInsertText(choice)
+				editor.Reset(inserted, len(inserted))
 				menuOpen = false
-				refreshMenu()
-				redraw()
+				refreshMenuLocked()
+				redrawNeeded = true
 			}
-		case 3: // Ctrl-C
-			if layout.enabled {
-				layout.abort("^C")
-			} else {
-				fmt.Fprint(os.Stderr, "^C\r\n")
-			}
+
+		case terminalInputCtrlC:
+			stateMu.Unlock()
+			finishPrompt("", true, "^C")
 			return "", errors.New("interrupted")
-		case 4: // Ctrl-D
+
+		case terminalInputCtrlD:
+			stateMu.Unlock()
 			now := time.Now()
 			ctrlDMu.Lock()
 			if !lastCtrlD.IsZero() && now.Sub(lastCtrlD) <= 2*time.Second {
-				ctrlDMu.Unlock()
-				if layout.enabled {
-					layout.abort("")
-				} else {
-					fmt.Fprint(os.Stderr, "\r\n")
+				lastCtrlD = time.Time{}
+				if ctrlDTimer != nil {
+					ctrlDTimer.Stop()
+					ctrlDTimer = nil
 				}
+				ctrlDMu.Unlock()
+				finishPrompt("", true, "")
 				return "", errors.New("EOF")
 			}
 			lastCtrlD = now
-			ctrlDMu.Unlock()
-			if layout.enabled {
-				layout.drawTempMessage("Press Ctrl-D again to exit ....")
-			} else {
-				fmt.Fprint(os.Stderr, "Press Ctrl-D again to exit ....\r")
+			if ctrlDTimer != nil {
+				ctrlDTimer.Stop()
 			}
-			time.AfterFunc(2*time.Second, func() {
+			ctrlDTimer = time.AfterFunc(2*time.Second, func() {
+				select {
+				case <-promptDone:
+					return
+				default:
+				}
 				ctrlDMu.Lock()
-				if lastCtrlD.Equal(now) {
-					lastCtrlD = time.Time{}
+				if !lastCtrlD.Equal(now) {
 					ctrlDMu.Unlock()
-					if layout.enabled {
-						layout.clearTempMessage()
-					}
 					return
 				}
+				lastCtrlD = time.Time{}
+				ctrlDTimer = nil
 				ctrlDMu.Unlock()
+				select {
+				case <-promptDone:
+					return
+				default:
+				}
+				clearCtrlDMessage()
 			})
+			ctrlDMu.Unlock()
+			showCtrlDMessage("Press Ctrl-D again to exit ....")
 			continue
-		case 127, 8: // Backspace
-			if cursor > 0 {
-				line = append(line[:cursor-1], line[cursor:]...)
-				cursor--
-				if menuOpen {
-					if len(line) == 0 || line[0] != '/' {
-						menuOpen = false
+
+		case terminalInputBackspace:
+			changed = editor.BackspaceGrapheme()
+
+		case terminalInputDelete:
+			changed = editor.DeleteGrapheme()
+
+		case terminalInputEscape:
+			if menuOpen {
+				menuOpen = false
+				editor.Reset("", 0)
+				refreshMenuLocked()
+				redrawNeeded = true
+			}
+
+		case terminalInputLeft, terminalInputCtrlB:
+			if event.Kind == terminalInputLeft && event.Modifiers&(terminalInputModifierAlt|terminalInputModifierCtrl) != 0 {
+				changed = editor.MoveWordLeft()
+			} else {
+				changed = editor.MoveGraphemeLeft()
+			}
+
+		case terminalInputRight, terminalInputCtrlF:
+			if event.Kind == terminalInputRight && event.Modifiers&(terminalInputModifierAlt|terminalInputModifierCtrl) != 0 {
+				changed = editor.MoveWordRight()
+			} else {
+				changed = editor.MoveGraphemeRight()
+			}
+
+		case terminalInputHome, terminalInputCtrlA:
+			changed = editor.MoveLogicalHome()
+
+		case terminalInputEnd, terminalInputCtrlE:
+			changed = editor.MoveLogicalEnd()
+
+		case terminalInputCtrlW:
+			changed = editor.DeleteWordBackward()
+
+		case terminalInputCtrlU:
+			end := editor.CursorByte()
+			if editor.MoveLogicalHome() {
+				changed = true
+				for editor.CursorByte() < end {
+					before := len(editor.Text())
+					if !editor.DeleteGrapheme() {
+						break
 					}
-					refreshMenu()
+					end -= before - len(editor.Text())
 				}
-				redraw()
 			}
-		case 27: // Escape key or escape sequence.
-			seq := readPendingEscapeSequence()
-			if len(seq) == 0 {
-				if menuOpen {
-					menuOpen = false
-					line = nil
-					cursor = 0
-					refreshMenu()
-					redraw()
+
+		case terminalInputCtrlK:
+			probe := editor
+			probe.MoveLogicalEnd()
+			end := probe.CursorByte()
+			for editor.CursorByte() < end {
+				before := len(editor.Text())
+				if !editor.DeleteGrapheme() {
+					break
 				}
-				continue
+				end -= before - len(editor.Text())
+				changed = true
 			}
-			if seq[0] != '[' {
-				if menuOpen {
-					menuOpen = false
-					refreshMenu()
-					redraw()
-				}
-				continue
-			}
-			if len(seq) < 2 {
-				continue
-			}
-			switch seq[1] {
-			case 'A': // Up
-				if menuOpen {
-					if len(menu) > 0 {
-						selected--
-						if selected < 0 {
-							selected = len(menu) - 1
-						}
-						redraw()
+
+		case terminalInputUp:
+			if menuOpen {
+				if len(menu) > 0 {
+					selected--
+					if selected < 0 {
+						selected = len(menu) - 1
 					}
-					continue
+					redrawNeeded = true
 				}
-				if len(snapshot) > 0 && historyIndex > 0 {
-					historyIndex--
-					line = []rune(snapshot[historyIndex])
-					cursor = len(line)
-					redraw()
+				break
+			}
+			if editor.MoveVisualUp(contentWidth()) {
+				changed = true
+				break
+			}
+			if len(history) > 0 && historyIndex > 0 {
+				if historyIndex == len(history) && !draftSaved {
+					draftLine, draftCursor = editor.Text(), editor.CursorByte()
+					draftSaved = true
 				}
-			case 'B': // Down
-				if menuOpen {
-					if len(menu) > 0 {
-						selected++
-						if selected >= len(menu) {
-							selected = 0
-						}
-						redraw()
+				historyIndex--
+				editor.Reset(history[historyIndex], len(history[historyIndex]))
+				changed = true
+			}
+
+		case terminalInputDown:
+			if menuOpen {
+				if len(menu) > 0 {
+					selected++
+					if selected >= len(menu) {
+						selected = 0
 					}
-					continue
+					redrawNeeded = true
 				}
-				if historyIndex < len(snapshot)-1 {
-					historyIndex++
-					line = []rune(snapshot[historyIndex])
+				break
+			}
+			if editor.MoveVisualDown(contentWidth()) {
+				changed = true
+				break
+			}
+			if historyIndex < len(history)-1 {
+				historyIndex++
+				editor.Reset(history[historyIndex], len(history[historyIndex]))
+				changed = true
+			} else if historyIndex < len(history) {
+				historyIndex = len(history)
+				if draftSaved {
+					editor.Reset(draftLine, draftCursor)
 				} else {
-					historyIndex = len(snapshot)
-					line = nil
+					editor.Reset("", 0)
 				}
-				cursor = len(line)
-				redraw()
-			case 'C': // Right
-				if cursor < len(line) {
-					cursor++
-					fmt.Fprint(os.Stderr, "\x1b[C")
-				}
-			case 'D': // Left
-				if cursor > 0 {
-					cursor--
-					fmt.Fprint(os.Stderr, "\x1b[D")
-				}
+				draftSaved = false
+				changed = true
 			}
-		default:
-			if b >= 32 {
-				r := rune(b)
-				line = append(line[:cursor], append([]rune{r}, line[cursor:]...)...)
-				cursor++
-				if len(line) == 1 && line[0] == '/' {
+
+		case terminalInputPaste:
+			if event.Truncated {
+				warning = "Paste rejected: input exceeds 1 MiB"
+			} else {
+				changed = editor.Insert(event.Text)
+			}
+
+		case terminalInputText:
+			if !unicode.IsControl(event.Rune) {
+				wasEmpty := editor.Text() == ""
+				changed = editor.Insert(string(event.Rune))
+				if changed && wasEmpty && editor.Text() == "/" {
 					menuOpen = true
 					selected = 0
 				}
-				if menuOpen {
-					refreshMenu()
-				}
-				redraw()
 			}
+		}
+
+		if changed {
+			refreshMenuLocked()
+			redrawNeeded = true
+		}
+		stateMu.Unlock()
+		if warning != "" {
+			showCtrlDMessage(warning)
+			time.AfterFunc(2*time.Second, func() {
+				select {
+				case <-promptDone:
+					return
+				default:
+				}
+				clearCtrlDMessage()
+			})
+		}
+		if redrawNeeded {
+			redraw()
 		}
 	}
 }
@@ -373,6 +586,7 @@ type fixedPromptLayout struct {
 	promptRow     int
 	promptTop     int
 	promptBottom  int
+	promptRows    int
 	statusRow     int
 	tempRow       int
 	drawnMenuRows int
@@ -390,6 +604,7 @@ func (l *fixedPromptLayout) refresh() {
 	if l == nil || l.status == nil {
 		return
 	}
+	l.enabled = false
 	metrics, ok := terminalFooterMetricsForTTY()
 	if !ok {
 		return
@@ -407,31 +622,44 @@ func (l *fixedPromptLayout) applyMetrics(metrics terminalFooterMetrics) {
 	l.promptTop = metrics.PromptTop
 	l.promptRow = metrics.PromptRow
 	l.promptBottom = metrics.PromptBottom
+	l.promptRows = metrics.PromptRows
 	l.statusRow = metrics.StatusRow
 	l.tempRow = metrics.TempRow
 }
 
 func (l *fixedPromptLayout) redraw(prompt, line string, cursor int, menuLines []string) {
-	if l == nil || !l.enabled {
+	if l == nil {
 		return
 	}
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	oldWidth, oldHeight := l.width, l.height
 	oldTurnTop, oldTempRow := l.turnTop, l.tempRow
+	oldPromptRows := l.promptRows
+	oldEnabled := l.enabled
 	oldMenuOpen := l.drawnMenuRows > 0
 	newMenuOpen := len(menuLines) > 0
 	l.refresh()
 	if !l.enabled {
+		if oldEnabled {
+			deactivateTerminalFooterForFallback(oldTurnTop)
+		}
 		return
 	}
+	composerLayout := terminalComposerLayoutForSize(prompt, line, cursor, l.width, l.height)
+	setTerminalPromptRows(len(composerLayout.Rows))
+	l.refresh()
 	resized := oldHeight > 0 && (oldWidth != l.width || oldHeight != l.height)
-	replay := resized || (oldHeight > 0 && oldMenuOpen != newMenuOpen)
+	replay := resized || (oldHeight > 0 && (oldMenuOpen != newMenuOpen || oldPromptRows != l.promptRows))
 	if replay {
 		var metrics terminalFooterMetrics
 		var ok bool
 		if resized {
-			metrics, ok = terminalReplayManagedViewportWithScrollback(*l.status)
+			metrics, ok = terminalReplayManagedViewportWithScrollbackUnlocked(*l.status)
 		} else {
-			metrics, ok = terminalReplayManagedViewport(*l.status)
+			metrics, ok = terminalReplayManagedViewportUnlocked(*l.status)
 		}
 		if ok {
 			l.applyMetrics(metrics)
@@ -452,7 +680,7 @@ func (l *fixedPromptLayout) redraw(prompt, line string, cursor int, menuLines []
 	for i, menuLine := range menuLines {
 		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", menuTop+i, ansiEraseLine, fitPromptLine(menuLine, l.width))
 	}
-	l.drawPromptWithSeparator(prompt, line, cursor, len(menuLines) == 0)
+	l.drawPromptLayoutWithSeparator(composerLayout, len(menuLines) == 0)
 	l.drawnMenuRows = len(menuLines)
 }
 
@@ -483,6 +711,26 @@ func (l *fixedPromptLayout) drawPrompt(prompt, line string, cursor int) {
 }
 
 func (l *fixedPromptLayout) drawPromptWithSeparator(prompt, line string, cursor int, clearSeparator bool) {
+	l.refresh()
+	if !l.enabled {
+		return
+	}
+	layout := terminalComposerLayoutForSize(prompt, line, cursor, l.width, l.height)
+	rowsChanged := setTerminalPromptRows(len(layout.Rows))
+	var metrics terminalFooterMetrics
+	var ok bool
+	if rowsChanged {
+		metrics, ok = terminalReplayManagedViewportUnlocked(*l.status)
+	} else {
+		metrics, ok = activateTerminalFooter(*l.status)
+	}
+	if ok {
+		l.applyMetrics(metrics)
+	}
+	l.drawPromptLayoutWithSeparator(layout, clearSeparator)
+}
+
+func (l *fixedPromptLayout) drawPromptLayoutWithSeparator(layout terminalComposerLayout, clearSeparator bool) {
 	// Keep one guaranteed blank separator between the transcript/last startup
 	// output and the gray input band. Without this, text printed before the
 	// footer is activated can sit directly against the prompt on first launch.
@@ -491,22 +739,20 @@ func (l *fixedPromptLayout) drawPromptWithSeparator(prompt, line string, cursor 
 	if clearSeparator && l.promptTop > 1 {
 		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s", l.promptTop-1, ansiEraseLine)
 	}
-	rows := commandInputBandRows(prompt, line, l.width)
+	rows := terminalComposerBandRows(layout, terminalStatusANSIEnabled(), l.width)
 	for i, rowText := range rows {
 		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", l.promptTop+i, ansiEraseLine, rowText)
 	}
-	col := commandInputCursorColumn(prompt, cursor)
-	if col > l.width {
-		col = l.width
-	}
-	fmt.Fprintf(os.Stderr, "\x1b[%d;%dH", l.promptRow, col)
+	row := l.promptTop + 1 + layout.CursorRow
+	col := minInt(layout.CursorColumn, l.width)
+	fmt.Fprintf(os.Stderr, "\x1b[%d;%dH", row, col)
 }
 
 func (l *fixedPromptLayout) drawStatus() {
 	if l.status == nil {
 		return
 	}
-	drawTerminalFooterStatusAt(terminalFooterMetrics{Width: l.width, Height: l.height, ScrollBottom: l.scrollBottom, TurnTop: l.turnTop, TurnRow: l.turnTop + 1, TurnBottom: l.turnTop + 2, PromptTop: l.promptTop, PromptRow: l.promptRow, PromptBottom: l.promptBottom, StatusRow: l.statusRow, TempRow: l.tempRow}, *l.status)
+	drawTerminalFooterStatusAt(terminalFooterMetrics{Width: l.width, Height: l.height, ScrollBottom: l.scrollBottom, TurnTop: l.turnTop, TurnRow: l.turnTop + 1, TurnBottom: l.turnTop + 2, PromptTop: l.promptTop, PromptRow: l.promptRow, PromptBottom: l.promptBottom, PromptRows: l.promptRows, StatusRow: l.statusRow, TempRow: l.tempRow}, *l.status)
 }
 
 func (l *fixedPromptLayout) drawTempMessage(message string) {
@@ -536,11 +782,6 @@ func (l *fixedPromptLayout) clearTempMessage() {
 		return
 	}
 	clearTerminalFooterTempMessage()
-	l.refresh()
-	if !l.enabled {
-		return
-	}
-	fmt.Fprintf(os.Stderr, "\x1b[s\x1b[%d;1H%s\x1b[u", l.tempRow, ansiEraseLine)
 }
 
 func (l *fixedPromptLayout) clearMenu(rows int) {
@@ -560,12 +801,16 @@ func (l *fixedPromptLayout) submit(prompt, _ string) {
 	if l == nil || !l.enabled {
 		return
 	}
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	if l.altScreen {
 		leaveAlternatePickerScreen()
 		l.altScreen = false
 	}
 	if l.drawnMenuRows > 0 {
-		if metrics, ok := terminalReplayManagedViewport(*l.status); ok {
+		if metrics, ok := terminalReplayManagedViewportUnlocked(*l.status); ok {
 			l.applyMetrics(metrics)
 		}
 	} else {
@@ -577,19 +822,23 @@ func (l *fixedPromptLayout) submit(prompt, _ string) {
 	// immediately after Enter. Keep the footer prompt ready for the next input
 	// while `Working...` and the assistant response render above it.
 	l.drawPrompt(prompt, "", 0)
-	placeTerminalFooterPromptCursor(prompt, 0)
+	placeTerminalFooterComposerCursorUnlocked(prompt, "", 0)
 }
 
 func (l *fixedPromptLayout) abort(marker string) {
 	if l == nil || !l.enabled {
 		return
 	}
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	if l.altScreen {
 		leaveAlternatePickerScreen()
 		l.altScreen = false
 	}
 	if l.drawnMenuRows > 0 {
-		if metrics, ok := terminalReplayManagedViewport(*l.status); ok {
+		if metrics, ok := terminalReplayManagedViewportUnlocked(*l.status); ok {
 			l.applyMetrics(metrics)
 		}
 	} else {
@@ -601,19 +850,23 @@ func (l *fixedPromptLayout) abort(marker string) {
 		l.drawPrompt("", marker, len([]rune(marker)))
 		return
 	}
-	placeTerminalFooterPromptCursor("ba> ", 0)
+	placeTerminalFooterComposerCursorUnlocked("ba> ", "", 0)
 }
 
 func (l *fixedPromptLayout) clear() {
 	if l == nil || !l.enabled {
 		return
 	}
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	if l.altScreen {
 		leaveAlternatePickerScreen()
 		l.altScreen = false
 	}
 	if l.drawnMenuRows > 0 {
-		if metrics, ok := terminalReplayManagedViewport(*l.status); ok {
+		if metrics, ok := terminalReplayManagedViewportUnlocked(*l.status); ok {
 			l.applyMetrics(metrics)
 		}
 	} else {
@@ -629,28 +882,38 @@ func drawTerminalFooterPrompt(prompt, line string, cursor int, status statusBarS
 	}
 	terminalRenderMu.Lock()
 	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	return drawTerminalFooterPromptUnlocked(prompt, line, cursor, status)
 }
 
 func drawTerminalFooterPromptUnlocked(prompt, line string, cursor int, status statusBarState) bool {
-	metrics, ok := activateTerminalFooter(status)
+	metrics, ok := terminalFooterMetricsForTTY()
 	if !ok {
 		return false
 	}
-	rows := commandInputBandRows(prompt, line, metrics.Width)
+	layout := terminalComposerLayoutForSize(prompt, line, cursor, metrics.Width, metrics.Height)
+	rowsChanged := setTerminalPromptRows(len(layout.Rows))
+	if rowsChanged {
+		metrics, ok = terminalReplayManagedViewportUnlocked(status)
+	} else {
+		metrics, ok = activateTerminalFooter(status)
+	}
+	if !ok {
+		return false
+	}
+	rows := terminalComposerBandRows(layout, terminalStatusANSIEnabled(), metrics.Width)
 	for i, rowText := range rows {
 		fmt.Fprintf(os.Stderr, "\x1b[%d;1H%s%s", metrics.PromptTop+i, ansiEraseLine, rowText)
 	}
-	col := commandInputCursorColumn(prompt, cursor)
-	if col > metrics.Width {
-		col = metrics.Width
-	}
-	fmt.Fprintf(os.Stderr, "\x1b[%d;%dH", metrics.PromptRow, col)
+	row := metrics.PromptTop + 1 + layout.CursorRow
+	col := minInt(layout.CursorColumn, metrics.Width)
+	fmt.Fprintf(os.Stderr, "\x1b[%d;%dH", row, col)
 	return true
 }
 
 func commandInputCursorColumn(prompt string, cursor int) int {
-	col := len([]rune(prompt)) + cursor + 1
+	col := terminalDisplayWidth(prompt) + cursor + 1
 	if terminalStatusANSIEnabled() {
 		col++ // Leading padding in the gray prompt band.
 	}
@@ -658,17 +921,14 @@ func commandInputCursorColumn(prompt string, cursor int) int {
 }
 
 func fitPromptLine(line string, width int) string {
-	if width <= 0 || runeLen(line) <= width {
+	if width <= 0 || terminalDisplayWidth(stripANSI(line)) <= width {
 		return line
 	}
-	plain := []rune(stripANSI(line))
-	if len(plain) <= width {
-		return line
-	}
+	plain := stripANSI(line)
 	if width == 1 {
 		return "…"
 	}
-	return string(plain[:width-1]) + "…"
+	return terminalFitCells(plain, width-1) + "…"
 }
 
 func commandInputLine(prompt, line string) string {
@@ -681,6 +941,22 @@ func commandInputBand(prompt, line string, width int) string {
 
 func commandInputBandRows(prompt, line string, width int) []string {
 	return formatCommandInputBandRows(prompt, line, terminalStatusANSIEnabled(), width)
+}
+
+func terminalComposerBandRows(layout terminalComposerLayout, color bool, width int) []string {
+	rows := make([]string, 0, len(layout.Rows)+2)
+	if color {
+		rows = append(rows, formatPromptBandRow("", "", width))
+		for _, row := range layout.Rows {
+			rows = append(rows, formatPromptBandRow(" "+row, ansiGrayFG, width))
+		}
+		return append(rows, formatPromptBandRow("", "", width))
+	}
+	rows = append(rows, "")
+	for _, row := range layout.Rows {
+		rows = append(rows, " "+terminalFitCells(row, maxInt(width-1, 0)))
+	}
+	return append(rows, "")
 }
 
 func formatCommandInputBandRows(prompt, line string, color bool, width int) []string {
@@ -708,14 +984,15 @@ func fitPromptBandText(text string, width int) string {
 	if width <= 0 {
 		return text
 	}
-	runes := []rune(stripANSI(text))
-	if len(runes) > width {
+	plain := stripANSI(text)
+	cellWidth := terminalDisplayWidth(plain)
+	if cellWidth > width {
 		if width == 1 {
 			return "…"
 		}
-		return string(runes[:width-1]) + "…"
+		return terminalFitCells(plain, width-1) + "…"
 	}
-	return string(runes) + strings.Repeat(" ", width-len(runes))
+	return plain + strings.Repeat(" ", width-cellWidth)
 }
 
 func filterSlashSuggestions(prefix string) []SlashCommandSuggestion {
@@ -900,7 +1177,8 @@ func promptApprovalTable(rows [][2]string, message string, defaultYes bool) (boo
 	// the turn, so leaving that capture active deadlocks: the approval UI waits
 	// for stdin, while the turn waits for the approval response. Stop it first;
 	// Stop preserves any partially typed command in pendingCommandInput.
-	suspendProcessingInputCapture()
+	resumeInputCapture := pauseProcessingInputCapture()
+	defer resumeInputCapture()
 	if strings.TrimSpace(message) != "" {
 		rows = append([][2]string{{"Question", singleLineLabel(message)}}, rows...)
 	}
@@ -930,41 +1208,34 @@ func promptApprovalTable(rows [][2]string, message string, defaultYes bool) (boo
 		printApprovalTable(rows, selected)
 	}
 	redraw()
-	buf := make([]byte, 1)
 	for {
-		if _, err := os.Stdin.Read(buf); err != nil {
+		event, err := readTerminalInputEvent(int(os.Stdin.Fd()))
+		if err != nil {
 			return false, err
 		}
-		switch b := buf[0]; b {
-		case '\r', '\n':
+		switch event.Kind {
+		case terminalInputEnter, terminalInputNewline:
 			return selected == 0, nil
-		case 'y', 'Y':
-			return true, nil
-		case 'n', 'N':
-			return false, nil
-		case 'q', 'Q':
-			return false, nil
-		case 3: // Ctrl-C
-			fmt.Fprint(os.Stderr, "^C\r\n")
-			return false, errors.New("interrupted")
-		case 4: // Ctrl-D
-			return false, nil
-		case 9: // Tab
-			selected = 1 - selected
-			redraw()
-		case 27:
-			seq := readPendingEscapeSequence()
-			if len(seq) == 0 {
+		case terminalInputText:
+			switch event.Rune {
+			case 'y', 'Y':
+				return true, nil
+			case 'n', 'N', 'q', 'Q':
 				return false, nil
 			}
-			if seq[0] != '[' || len(seq) < 2 {
-				continue
-			}
-			switch seq[1] {
-			case 'A', 'B':
-				selected = 1 - selected
-				redraw()
-			}
+		case terminalInputPaste:
+			preserveTerminalPasteForNextPrompt(event)
+		case terminalInputCtrlC:
+			fmt.Fprint(os.Stderr, "^C\r\n")
+			return false, errors.New("interrupted")
+		case terminalInputCtrlD, terminalInputEscape:
+			return false, nil
+		case terminalInputTab:
+			selected = 1 - selected
+			redraw()
+		case terminalInputUp, terminalInputDown:
+			selected = 1 - selected
+			redraw()
 		}
 	}
 }
@@ -1053,6 +1324,8 @@ type processingInputCapture struct {
 	done     chan struct{}
 	stopOnce sync.Once
 	cancel   func() bool
+	prompt   string
+	status   *statusBarState
 }
 
 type connectingInputCapture struct {
@@ -1126,7 +1399,7 @@ func startProcessingInputCapture(prompt string, status *statusBarState, cancel f
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) || status == nil {
 		return nil
 	}
-	capture := &processingInputCapture{stop: make(chan struct{}), done: make(chan struct{}), cancel: cancel}
+	capture := &processingInputCapture{stop: make(chan struct{}), done: make(chan struct{}), cancel: cancel, prompt: prompt, status: status}
 	setProcessingInputCapture(capture)
 	go capture.run(prompt, *status)
 	return capture
@@ -1134,6 +1407,13 @@ func startProcessingInputCapture(prompt string, status *statusBarState, cancel f
 
 func (c *processingInputCapture) Stop() {
 	if c == nil {
+		return
+	}
+	processingInputState.Lock()
+	current := processingInputState.capture
+	processingInputState.Unlock()
+	if current != nil && current != c {
+		current.Stop()
 		return
 	}
 	c.stopOnce.Do(func() { close(c.stop) })
@@ -1145,76 +1425,222 @@ func (c *processingInputCapture) run(prompt string, status statusBarState) {
 	defer clearProcessingInputCapture(c)
 	stdinState.Lock()
 	defer stdinState.Unlock()
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
 	if err != nil {
 		return
 	}
-	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
-	fd := int(os.Stdin.Fd())
-
-	line, submitted := peekPendingCommandInput()
-	var escapeArmedUntil time.Time
-	buf := make([]byte, 32)
-	draw := func() {
-		drawTerminalFooterPrompt(prompt, line, len([]rune(line)), status)
+	terminalControls := !strings.EqualFold(os.Getenv("TERM"), "dumb")
+	if terminalControls {
+		terminalRenderMu.Lock()
+		_ = writeTerminalString(os.Stderr, "\x1b[?2004h"+ansiCursorShow)
+		terminalRenderMu.Unlock()
 	}
-	draw()
-	for {
-		select {
-		case <-c.stop:
-			setPendingCommandInput(line, submitted)
-			draw()
-			return
-		default:
+	defer func() {
+		if terminalControls {
+			terminalRenderMu.Lock()
+			_ = writeTerminalString(os.Stderr, "\x1b[?2004l"+ansiReset+ansiCursorShow)
+			terminalRenderMu.Unlock()
 		}
-		n, err := readTerminalFD(fd, buf)
-		if n > 0 {
-			changed := false
-			for _, b := range buf[:n] {
-				switch b {
-				case 27:
-					now := time.Now()
-					if !escapeArmedUntil.IsZero() && now.Before(escapeArmedUntil) {
-						escapeArmedUntil = time.Time{}
-						if c.cancel != nil {
-							c.cancel()
-						}
-					} else {
-						escapeArmedUntil = now.Add(2 * time.Second)
-						showTerminalFooterTempMessageWithStyle(status, "Press Esc again within 2 seconds to cancel action", 2*time.Second, ansiYellow+ansiBold)
-					}
-				case '\r', '\n':
-					submitted = true
-					changed = true
-				case 127, 8:
-					if len(line) > 0 && !submitted {
-						r := []rune(line)
-						line = string(r[:len(r)-1])
-						changed = true
-					}
-				case 3:
-					escapeArmedUntil = time.Time{}
-					if c.cancel != nil {
-						c.cancel()
-					}
-				default:
-					if b >= 32 && !submitted {
-						line += string(rune(b))
-						changed = true
-					}
-				}
-			}
-			if changed {
-				setPendingCommandInput(line, submitted)
+		_ = term.Restore(fd, oldState)
+	}()
+
+	line, cursor, submitted := peekPendingCommandInputAt()
+	composer := newTerminalComposerAt(line, cursor)
+	history := commandHistorySnapshot()
+	historyIndex := len(history)
+	draftLine, draftCursor := composer.Text(), composer.CursorByte()
+	draftSaved := false
+	var escapeArmedUntil time.Time
+	currentStatus := func() statusBarState {
+		lastTerminalFooterStatus.Lock()
+		defer lastTerminalFooterStatus.Unlock()
+		if lastTerminalFooterStatus.set {
+			return lastTerminalFooterStatus.state
+		}
+		return status
+	}
+	draw := func() {
+		terminalRenderMu.Lock()
+		defer terminalRenderMu.Unlock()
+		beginTerminalFrame()
+		defer endTerminalFrame()
+		drawTerminalFooterPromptUnlocked(prompt, composer.Text(), composer.CursorByte(), currentStatus())
+	}
+	persist := func() {
+		setPendingCommandInputAt(composer.Text(), composer.CursorByte(), submitted)
+	}
+	contentWidth := func() int {
+		width, _, sizeErr := term.GetSize(terminalStderrFD())
+		if sizeErr != nil || width <= 0 {
+			width = terminalStatusWidth()
+		}
+		return maxInt(1, width-terminalDisplayWidth(prompt)-2)
+	}
+	deleteToLogicalEnd := func() bool {
+		text := composer.Text()
+		cursor := composer.CursorByte()
+		if cursor >= len(text) {
+			return false
+		}
+		end := len(text)
+		if newline := strings.IndexByte(text[cursor:], '\n'); newline >= 0 {
+			end = cursor + newline
+		}
+		if end == cursor {
+			return false
+		}
+		composer.Reset(text[:cursor]+text[end:], cursor)
+		return true
+	}
+	deleteToLogicalStart := func() bool {
+		text := composer.Text()
+		cursor := composer.CursorByte()
+		start := 0
+		if newline := strings.LastIndexByte(text[:cursor], '\n'); newline >= 0 {
+			start = newline + 1
+		}
+		if start == cursor {
+			return false
+		}
+		composer.Reset(text[:start]+text[cursor:], start)
+		return true
+	}
+
+	draw()
+	stopResizeNotifications := startTerminalResizeNotifications(func() {
+		terminalRenderMu.Lock()
+		defer terminalRenderMu.Unlock()
+		beginTerminalFrame()
+		defer endTerminalFrame()
+		pendingLine, pendingCursor, _ := peekPendingCommandInputAt()
+		drawTerminalFooterPromptUnlocked(prompt, pendingLine, pendingCursor, currentStatus())
+	})
+	defer stopResizeNotifications()
+	for {
+		event, readErr := readTerminalInputEventUntil(fd, c.stop)
+		if readErr != nil {
+			if errors.Is(readErr, errTerminalInputCanceled) {
+				persist()
 				draw()
+				return
+			}
+			if terminalReadWouldBlock(readErr) {
+				continue
+			}
+			persist()
+			return
+		}
+
+		switch event.Kind {
+		case terminalInputEscape:
+			now := time.Now()
+			if !escapeArmedUntil.IsZero() && now.Before(escapeArmedUntil) {
+				escapeArmedUntil = time.Time{}
+				if c.cancel != nil {
+					c.cancel()
+				}
+			} else {
+				escapeArmedUntil = now.Add(2 * time.Second)
+				showTerminalFooterTempMessageWithStyle(currentStatus(), "Press Esc again within 2 seconds to cancel action", 2*time.Second, ansiYellow+ansiBold)
+			}
+			continue
+		case terminalInputCtrlC:
+			escapeArmedUntil = time.Time{}
+			if c.cancel != nil {
+				c.cancel()
 			}
 			continue
 		}
-		if err != nil && !terminalReadWouldBlock(err) {
-			setPendingCommandInput(line, submitted)
-			return
+		if submitted {
+			continue
 		}
-		time.Sleep(20 * time.Millisecond)
+
+		changed := false
+		switch event.Kind {
+		case terminalInputText:
+			if !unicode.IsControl(event.Rune) {
+				changed = composer.Insert(string(event.Rune))
+			}
+		case terminalInputPaste:
+			if event.Truncated {
+				showTerminalFooterTempMessageWithStyle(currentStatus(), "Paste rejected: input exceeds 1 MiB", 2*time.Second, ansiYellow+ansiBold)
+			} else {
+				changed = composer.Insert(event.Text)
+			}
+		case terminalInputEnter:
+			submitted = true
+			changed = true
+		case terminalInputNewline:
+			changed = composer.Insert("\n")
+		case terminalInputBackspace:
+			changed = composer.BackspaceGrapheme()
+		case terminalInputDelete:
+			changed = composer.DeleteGrapheme()
+		case terminalInputLeft:
+			if event.Modifiers&(terminalInputModifierAlt|terminalInputModifierCtrl) != 0 {
+				changed = composer.MoveWordLeft()
+			} else {
+				changed = composer.MoveGraphemeLeft()
+			}
+		case terminalInputRight:
+			if event.Modifiers&(terminalInputModifierAlt|terminalInputModifierCtrl) != 0 {
+				changed = composer.MoveWordRight()
+			} else {
+				changed = composer.MoveGraphemeRight()
+			}
+		case terminalInputUp:
+			if composer.MoveVisualUp(contentWidth()) {
+				changed = true
+				break
+			}
+			if len(history) > 0 && historyIndex > 0 {
+				if historyIndex == len(history) && !draftSaved {
+					draftLine, draftCursor = composer.Text(), composer.CursorByte()
+					draftSaved = true
+				}
+				historyIndex--
+				composer.Reset(history[historyIndex], len(history[historyIndex]))
+				changed = true
+			}
+		case terminalInputDown:
+			if composer.MoveVisualDown(contentWidth()) {
+				changed = true
+				break
+			}
+			if historyIndex < len(history)-1 {
+				historyIndex++
+				composer.Reset(history[historyIndex], len(history[historyIndex]))
+				changed = true
+			} else if historyIndex < len(history) {
+				historyIndex = len(history)
+				if draftSaved {
+					composer.Reset(draftLine, draftCursor)
+				} else {
+					composer.Reset("", 0)
+				}
+				draftSaved = false
+				changed = true
+			}
+		case terminalInputHome, terminalInputCtrlA:
+			changed = composer.MoveLogicalHome()
+		case terminalInputEnd, terminalInputCtrlE:
+			changed = composer.MoveLogicalEnd()
+		case terminalInputCtrlB:
+			changed = composer.MoveGraphemeLeft()
+		case terminalInputCtrlF:
+			changed = composer.MoveGraphemeRight()
+		case terminalInputCtrlK:
+			changed = deleteToLogicalEnd()
+		case terminalInputCtrlU:
+			changed = deleteToLogicalStart()
+		case terminalInputCtrlW:
+			changed = composer.DeleteWordBackward()
+		}
+		if changed {
+			persist()
+			draw()
+		}
 	}
 }
 
@@ -1251,26 +1677,76 @@ func suspendProcessingInputCapture() bool {
 	return true
 }
 
+func pauseProcessingInputCapture() func() {
+	processingInputState.Lock()
+	capture := processingInputState.capture
+	processingInputState.Unlock()
+	if capture == nil {
+		return func() {}
+	}
+	prompt, status, cancel := capture.prompt, capture.status, capture.cancel
+	capture.Stop()
+	return func() {
+		if status != nil {
+			startProcessingInputCapture(prompt, status, cancel)
+		}
+	}
+}
+
 func setPendingCommandInput(line string, submitted bool) {
+	setPendingCommandInputAt(line, len(line), submitted)
+}
+
+func setPendingCommandInputAt(line string, cursor int, submitted bool) {
 	pendingCommandInput.Lock()
 	pendingCommandInput.line = line
+	pendingCommandInput.cursor = maxInt(0, minInt(cursor, len(line)))
 	pendingCommandInput.submitted = submitted
 	pendingCommandInput.Unlock()
 }
 
 func peekPendingCommandInput() (string, bool) {
+	line, _, submitted := peekPendingCommandInputAt()
+	return line, submitted
+}
+
+func peekPendingCommandInputAt() (string, int, bool) {
 	pendingCommandInput.Lock()
 	defer pendingCommandInput.Unlock()
-	return pendingCommandInput.line, pendingCommandInput.submitted
+	return pendingCommandInput.line, pendingCommandInput.cursor, pendingCommandInput.submitted
+}
+
+// preserveTerminalPasteForNextPrompt keeps bracketed paste from being lost if
+// it straddles the transition from background typeahead capture to an approval
+// or picker. Modal screens never interpret pasted text as navigation or an
+// approval response; the next command editor receives it verbatim instead.
+func preserveTerminalPasteForNextPrompt(event terminalInputEvent) {
+	if event.Kind != terminalInputPaste || event.Truncated || event.Text == "" {
+		return
+	}
+	line, cursor, submitted := peekPendingCommandInputAt()
+	if submitted {
+		return
+	}
+	composer := newTerminalComposerAt(line, cursor)
+	if composer.Insert(event.Text) {
+		setPendingCommandInputAt(composer.Text(), composer.CursorByte(), false)
+	}
 }
 
 func takePendingCommandInput() (string, bool) {
+	line, _, submitted := takePendingCommandInputAt()
+	return line, submitted
+}
+
+func takePendingCommandInputAt() (string, int, bool) {
 	pendingCommandInput.Lock()
 	defer pendingCommandInput.Unlock()
-	line, submitted := pendingCommandInput.line, pendingCommandInput.submitted
+	line, cursor, submitted := pendingCommandInput.line, pendingCommandInput.cursor, pendingCommandInput.submitted
 	pendingCommandInput.line = ""
+	pendingCommandInput.cursor = 0
 	pendingCommandInput.submitted = false
-	return line, submitted
+	return line, cursor, submitted
 }
 
 type conversationPickerOption struct {
@@ -1348,46 +1824,40 @@ func promptInstanceSelection(instances []ProfileInfo, currentProfile string) (st
 		}
 	}
 	redraw()
-	buf := make([]byte, 1)
 	for {
-		if _, err := os.Stdin.Read(buf); err != nil {
+		event, err := readTerminalInputEvent(int(os.Stdin.Fd()))
+		if err != nil {
 			return "", err
 		}
-		switch b := buf[0]; b {
-		case '\r', '\n':
+		switch event.Kind {
+		case terminalInputEnter, terminalInputNewline:
 			return options[selected].Value, nil
-		case '\t':
+		case terminalInputTab:
 			selected = (selected + 1) % len(options)
 			redraw()
-		case 'q', 'Q':
-			return "__cancel__", nil
-		case 3:
-			fmt.Fprint(os.Stderr, "^C\r\n")
-			return "", errors.New("interrupted")
-		case 4:
-			return "__cancel__", nil
-		case 27:
-			seq := readPendingEscapeSequence()
-			if len(seq) == 0 {
+		case terminalInputText:
+			if event.Rune == 'q' || event.Rune == 'Q' {
 				return "__cancel__", nil
 			}
-			if seq[0] != '[' || len(seq) < 2 {
-				continue
+		case terminalInputPaste:
+			preserveTerminalPasteForNextPrompt(event)
+		case terminalInputCtrlC:
+			fmt.Fprint(os.Stderr, "^C\r\n")
+			return "", errors.New("interrupted")
+		case terminalInputCtrlD, terminalInputEscape:
+			return "__cancel__", nil
+		case terminalInputUp:
+			selected--
+			if selected < 0 {
+				selected = len(options) - 1
 			}
-			switch seq[1] {
-			case 'A':
-				selected--
-				if selected < 0 {
-					selected = len(options) - 1
-				}
-				redraw()
-			case 'B':
-				selected++
-				if selected >= len(options) {
-					selected = 0
-				}
-				redraw()
+			redraw()
+		case terminalInputDown:
+			selected++
+			if selected >= len(options) {
+				selected = 0
 			}
+			redraw()
 		}
 	}
 }
@@ -1443,56 +1913,46 @@ func promptConversationSelection(conversations []WebConversation, currentID stri
 	}
 
 	redraw()
-	buf := make([]byte, 1)
 	for {
-		if _, err := os.Stdin.Read(buf); err != nil {
+		event, err := readTerminalInputEvent(int(os.Stdin.Fd()))
+		if err != nil {
 			return "", err
 		}
-		switch b := buf[0]; b {
-		case '\r', '\n':
+		switch event.Kind {
+		case terminalInputEnter, terminalInputNewline:
 			return options[selected].Value, nil
-		case '\t':
+		case terminalInputTab:
 			selected++
 			if selected >= len(options) {
 				selected = 0
 			}
 			redraw()
-		case 'n', 'N':
-			if allowNew {
+		case terminalInputText:
+			if (event.Rune == 'n' || event.Rune == 'N') && allowNew {
 				return "__new__", nil
 			}
-		case 'q', 'Q':
-			return "__cancel__", nil
-		case 3: // Ctrl-C
-			fmt.Fprint(os.Stderr, "^C\r\n")
-			return "", errors.New("interrupted")
-		case 4: // Ctrl-D
-			return "__cancel__", nil
-		case 27: // Escape closes; escape sequences handle arrows.
-			seq := readPendingEscapeSequence()
-			if len(seq) == 0 {
+			if event.Rune == 'q' || event.Rune == 'Q' {
 				return "__cancel__", nil
 			}
-			if seq[0] != '[' {
-				continue
+		case terminalInputPaste:
+			preserveTerminalPasteForNextPrompt(event)
+		case terminalInputCtrlC:
+			fmt.Fprint(os.Stderr, "^C\r\n")
+			return "", errors.New("interrupted")
+		case terminalInputCtrlD, terminalInputEscape:
+			return "__cancel__", nil
+		case terminalInputUp:
+			selected--
+			if selected < 0 {
+				selected = len(options) - 1
 			}
-			if len(seq) < 2 {
-				continue
+			redraw()
+		case terminalInputDown:
+			selected++
+			if selected >= len(options) {
+				selected = 0
 			}
-			switch seq[1] {
-			case 'A': // Up
-				selected--
-				if selected < 0 {
-					selected = len(options) - 1
-				}
-				redraw()
-			case 'B': // Down
-				selected++
-				if selected >= len(options) {
-					selected = 0
-				}
-				redraw()
-			}
+			redraw()
 		}
 	}
 }
@@ -1597,49 +2057,43 @@ func promptWorkspaceSelection(choices []WorkspaceChoice) (string, error) {
 	}
 
 	redraw()
-	buf := make([]byte, 1)
 	for {
-		if _, err := os.Stdin.Read(buf); err != nil {
+		event, err := readTerminalInputEvent(int(os.Stdin.Fd()))
+		if err != nil {
 			return "", err
 		}
-		switch b := buf[0]; b {
-		case '\r', '\n':
+		switch event.Kind {
+		case terminalInputEnter, terminalInputNewline:
 			return options[selected].Value, nil
-		case '\t':
+		case terminalInputTab:
 			selected++
 			if selected >= len(options) {
 				selected = 0
 			}
 			redraw()
-		case 'q', 'Q':
-			return "__cancel__", nil
-		case 3: // Ctrl-C
-			fmt.Fprint(os.Stderr, "^C\r\n")
-			return "", errors.New("interrupted")
-		case 4: // Ctrl-D
-			return "__cancel__", nil
-		case 27: // Escape closes; escape sequences handle arrows.
-			seq := readPendingEscapeSequence()
-			if len(seq) == 0 {
+		case terminalInputText:
+			if event.Rune == 'q' || event.Rune == 'Q' {
 				return "__cancel__", nil
 			}
-			if seq[0] != '[' || len(seq) < 2 {
-				continue
+		case terminalInputPaste:
+			preserveTerminalPasteForNextPrompt(event)
+		case terminalInputCtrlC:
+			fmt.Fprint(os.Stderr, "^C\r\n")
+			return "", errors.New("interrupted")
+		case terminalInputCtrlD, terminalInputEscape:
+			return "__cancel__", nil
+		case terminalInputUp:
+			selected--
+			if selected < 0 {
+				selected = len(options) - 1
 			}
-			switch seq[1] {
-			case 'A': // Up
-				selected--
-				if selected < 0 {
-					selected = len(options) - 1
-				}
-				redraw()
-			case 'B': // Down
-				selected++
-				if selected >= len(options) {
-					selected = 0
-				}
-				redraw()
+			redraw()
+		case terminalInputDown:
+			selected++
+			if selected >= len(options) {
+				selected = 0
 			}
+			redraw()
 		}
 	}
 }
@@ -1701,49 +2155,43 @@ func promptAppSelection(choices []AppChoice) (string, error) {
 	}
 
 	redraw()
-	buf := make([]byte, 1)
 	for {
-		if _, err := os.Stdin.Read(buf); err != nil {
+		event, err := readTerminalInputEvent(int(os.Stdin.Fd()))
+		if err != nil {
 			return "", err
 		}
-		switch b := buf[0]; b {
-		case '\r', '\n':
+		switch event.Kind {
+		case terminalInputEnter, terminalInputNewline:
 			return options[selected].Value, nil
-		case '\t':
+		case terminalInputTab:
 			selected++
 			if selected >= len(options) {
 				selected = 0
 			}
 			redraw()
-		case 'q', 'Q':
-			return "__cancel__", nil
-		case 3: // Ctrl-C
-			fmt.Fprint(os.Stderr, "^C\r\n")
-			return "", errors.New("interrupted")
-		case 4: // Ctrl-D
-			return "__cancel__", nil
-		case 27: // Escape closes; escape sequences handle arrows.
-			seq := readPendingEscapeSequence()
-			if len(seq) == 0 {
+		case terminalInputText:
+			if event.Rune == 'q' || event.Rune == 'Q' {
 				return "__cancel__", nil
 			}
-			if seq[0] != '[' || len(seq) < 2 {
-				continue
+		case terminalInputPaste:
+			preserveTerminalPasteForNextPrompt(event)
+		case terminalInputCtrlC:
+			fmt.Fprint(os.Stderr, "^C\r\n")
+			return "", errors.New("interrupted")
+		case terminalInputCtrlD, terminalInputEscape:
+			return "__cancel__", nil
+		case terminalInputUp:
+			selected--
+			if selected < 0 {
+				selected = len(options) - 1
 			}
-			switch seq[1] {
-			case 'A': // Up
-				selected--
-				if selected < 0 {
-					selected = len(options) - 1
-				}
-				redraw()
-			case 'B': // Down
-				selected++
-				if selected >= len(options) {
-					selected = 0
-				}
-				redraw()
+			redraw()
+		case terminalInputDown:
+			selected++
+			if selected >= len(options) {
+				selected = 0
 			}
+			redraw()
 		}
 	}
 }
@@ -1766,7 +2214,7 @@ func enterTerminalAppScreen() bool {
 	// scrolling region and autowrap only after entering 1049, so iTerm2 cannot
 	// inherit a stale main-screen margin/pending-wrap state into the logo frame.
 	terminalRenderMu.Lock()
-	fmt.Fprintf(os.Stderr, "\x1b[?1049h\x1b[?7h\x1b[r%s", terminalFullScreenClearAndPurgeHistorySequence())
+	fmt.Fprintf(os.Stderr, "\x1b[?1049h\x1b[?7h\x1b[?25h\x1b[r%s", terminalFullScreenClearAndPurgeHistorySequence())
 	terminalRenderMu.Unlock()
 	return true
 }
@@ -1780,7 +2228,7 @@ func leaveTerminalAppScreen() {
 	terminalAppScreenState.active = false
 	terminalAppScreenState.Unlock()
 	terminalRenderMu.Lock()
-	fmt.Fprint(os.Stderr, "\x1b[?7h\x1b[r\x1b[?1049l")
+	fmt.Fprint(os.Stderr, "\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?2026l\x1b[r\x1b[?1049l")
 	terminalRenderMu.Unlock()
 }
 
@@ -1828,31 +2276,6 @@ func leaveAlternatePickerScreen() {
 	terminalRenderMu.Lock()
 	fmt.Fprint(os.Stderr, "\x1b[?1049l")
 	terminalRenderMu.Unlock()
-}
-
-func readPendingEscapeSequence() []byte {
-	// In raw mode, arrow keys arrive as ESC-prefixed byte sequences, while a
-	// plain Escape key arrives as a lone 0x1b. A blocking read for the next byte
-	// makes Escape feel hung. Briefly wait for already-arrived bytes so a
-	// standalone Escape can close menus immediately, while still accepting
-	// arrow-key sequences such as "[A" / "[B". readTerminalFD performs a
-	// readiness poll without changing shared PTY descriptor flags.
-	time.Sleep(10 * time.Millisecond)
-	fd := int(os.Stdin.Fd())
-	buf := make([]byte, 8)
-	seq := make([]byte, 0, len(buf))
-	for len(seq) < cap(seq) {
-		n, err := readTerminalFD(fd, buf[len(seq):cap(seq)])
-		if n > 0 {
-			seq = append(seq, buf[len(seq):len(seq)+n]...)
-			continue
-		}
-		if terminalReadWouldBlock(err) || err == nil {
-			break
-		}
-		break
-	}
-	return seq
 }
 
 func conversationPickerLines(options []conversationPickerOption, selected int) []string {

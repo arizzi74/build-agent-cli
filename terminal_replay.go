@@ -182,6 +182,14 @@ func terminalTranscriptSnapshot() []terminalTranscriptEntry {
 }
 
 func terminalReplayManagedViewport(status statusBarState) (terminalFooterMetrics, bool) {
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
+	return terminalReplayManagedViewportUnlocked(status)
+}
+
+func terminalReplayManagedViewportUnlocked(status statusBarState) (terminalFooterMetrics, bool) {
 	metrics, ok := terminalFooterMetricsForTTY()
 	if !ok {
 		return terminalFooterMetrics{}, false
@@ -217,6 +225,8 @@ func terminalAppendRowsToScrollback(rows []string, status statusBarState) bool {
 	}
 	terminalRenderMu.Lock()
 	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
 	metrics, ok := terminalFooterMetricsForTTY()
 	if !ok {
 		return false
@@ -240,12 +250,20 @@ func terminalAppendRowsToScrollback(rows []string, status statusBarState) bool {
 }
 
 func terminalReplayManagedViewportWithScrollback(status statusBarState) (terminalFooterMetrics, bool) {
+	terminalRenderMu.Lock()
+	defer terminalRenderMu.Unlock()
+	beginTerminalFrame()
+	defer endTerminalFrame()
+	return terminalReplayManagedViewportWithScrollbackUnlocked(status)
+}
+
+func terminalReplayManagedViewportWithScrollbackUnlocked(status statusBarState) (terminalFooterMetrics, bool) {
 	// Semantic content may already exist when this path is reached (for example
 	// after resize). Do not use ED2/ED3 here: those are intentionally reserved
 	// for blank-screen transitions, before the first transcript row. Replaying
 	// the current viewport row-by-row preserves the transcript and keeps iTerm2
 	// alternate-screen history free of destructive repaint frames.
-	return terminalReplayManagedViewport(status)
+	return terminalReplayManagedViewportUnlocked(status)
 }
 
 func terminalReplayRows(width int) []string {

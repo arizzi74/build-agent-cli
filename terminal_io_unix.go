@@ -42,8 +42,10 @@ func terminalReadWouldBlock(err error) bool {
 func startTerminalResizeNotifications(redraw func()) func() {
 	resizeSignals := make(chan os.Signal, 1)
 	resizeDone := make(chan struct{})
+	resizeStopped := make(chan struct{})
 	signal.Notify(resizeSignals, syscall.SIGWINCH)
 	go func() {
+		defer close(resizeStopped)
 		var timer *time.Timer
 		var timerC <-chan time.Time
 		defer func() {
@@ -57,7 +59,7 @@ func startTerminalResizeNotifications(redraw func()) func() {
 				return
 			case <-resizeSignals:
 				if timer == nil {
-					timer = time.NewTimer(350 * time.Millisecond)
+					timer = time.NewTimer(50 * time.Millisecond)
 					timerC = timer.C
 					continue
 				}
@@ -67,7 +69,7 @@ func startTerminalResizeNotifications(redraw func()) func() {
 					default:
 					}
 				}
-				timer.Reset(350 * time.Millisecond)
+				timer.Reset(50 * time.Millisecond)
 			case <-timerC:
 				timerC = nil
 				timer = nil
@@ -78,5 +80,6 @@ func startTerminalResizeNotifications(redraw func()) func() {
 	return func() {
 		signal.Stop(resizeSignals)
 		close(resizeDone)
+		<-resizeStopped
 	}
 }
