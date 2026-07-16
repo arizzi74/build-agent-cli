@@ -238,6 +238,7 @@ func main() {
 
 	startupStatus := client.statusBarState()
 	client.restoreStartupConversationTranscript(startupStatus)
+	showStartupLocalBuildWarning(startupStatus)
 	defer restoreTerminalFooter()
 	if !showTerminalFooterTempMessage(startupStatus, startupReadyFooterMessage(), 5*time.Second) {
 		fmt.Fprintln(os.Stderr, "Type a message. Commands: /help, /instance, /conversation, /mcp, /workspace, /app, /exit, /quit")

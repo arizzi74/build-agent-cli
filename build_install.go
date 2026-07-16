@@ -156,6 +156,10 @@ func (c *Client) answerBuildParity(ctx context.Context, payload map[string]inter
 		return buildInstallError(err.Error(), buildInstallErrorCode(err), nil), "error"
 	}
 	defer cleanup()
+	if err := currentLocalBuildTools().requireNode(); err != nil {
+		c.buildInstallProgress("build: %s", err.Error())
+		return buildInstallError(err.Error(), buildInstallErrorCode(err), nil), "error"
+	}
 
 	missing := missingNodeDependencies(project.Dir, buildDependencies(ctxInfo.Package))
 	if len(missing) > 0 {
@@ -760,22 +764,20 @@ func missingNodeDependencies(projectDir string, deps []string) []string {
 }
 
 func (c *Client) installProjectDependencies(ctx context.Context, projectDir string, missing []string) error {
-	if _, err := exec.LookPath("node"); err != nil {
-		msg := "Node.js executable 'node' was not found in PATH; local Fluent build dependencies cannot be installed."
-		c.buildInstallProgress("build: %s", msg)
-		return codedError{Code: "NODE_NOT_FOUND", Message: msg}
+	tools := currentLocalBuildTools()
+	if err := tools.requireNode(); err != nil {
+		c.buildInstallProgress("build: %s", err.Error())
+		return err
 	}
-	npmPath, err := exec.LookPath("npm")
-	if err != nil {
-		msg := "npm executable was not found in PATH; local Fluent build dependencies cannot be installed."
-		c.buildInstallProgress("build: %s", msg)
-		return codedError{Code: "NPM_NOT_FOUND", Message: msg}
+	if err := tools.requireNPM(); err != nil {
+		c.buildInstallProgress("build: %s", err.Error())
+		return err
 	}
 	c.buildInstallProgress("build: installing %d missing dependency package(s): %s", len(missing), strings.Join(missing, ", "))
 	// package-lock.json is derived local dependency state for bacli builds, not
 	// application source. Prevent npm from creating/updating it and forcing the
 	// next conservative sync preflight into a local-change conflict.
-	output, err := runLocalCommand(ctx, projectDir, npmPath, []string{"install", "--no-audit", "--no-fund", "--package-lock=false"})
+	output, err := runLocalCommand(ctx, projectDir, tools.NPMPath, []string{"install", "--no-audit", "--no-fund", "--package-lock=false"})
 	if err != nil {
 		return codedError{Code: "DEPENDENCY_INSTALL_FAILED", Message: fmt.Sprintf("Dependency installation failed: %s", commandErrorSummary(err, output))}
 	}

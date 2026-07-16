@@ -9,15 +9,17 @@ import (
 )
 
 type terminalTranscriptEntry struct {
-	Role  string
-	Title string
-	Text  string
+	Role       string
+	Title      string
+	Text       string
+	Persistent bool
 }
 
 var terminalTranscript = struct {
 	sync.Mutex
-	entries         []terminalTranscriptEntry
-	activeAssistant string
+	entries           []terminalTranscriptEntry
+	persistentEntries []terminalTranscriptEntry
+	activeAssistant   string
 }{entries: make([]terminalTranscriptEntry, 0, 128)}
 
 const terminalTranscriptLimit = 200
@@ -63,6 +65,38 @@ func terminalRecordSystemText(title, text string) {
 
 func terminalRecordSystemTextAndAppend(title, text string, status statusBarState) bool {
 	return terminalRecordEntryAndAppend(terminalTranscriptEntry{Role: "system", Title: title, Text: text}, status)
+}
+
+func terminalRecordPersistentWarningTextAndAppend(title, text string, status statusBarState) bool {
+	entry := terminalTranscriptEntry{Role: "warning", Title: strings.TrimSpace(title), Text: strings.TrimSpace(text), Persistent: true}
+	if entry.Title == "" && entry.Text == "" {
+		return false
+	}
+	terminalTranscript.Lock()
+	replaced := false
+	for i := range terminalTranscript.persistentEntries {
+		if terminalTranscript.persistentEntries[i].Role == entry.Role && terminalTranscript.persistentEntries[i].Title == entry.Title {
+			terminalTranscript.persistentEntries[i] = entry
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		terminalTranscript.persistentEntries = append(terminalTranscript.persistentEntries, entry)
+	}
+	active := terminalTranscript.entries[:0]
+	for _, existing := range terminalTranscript.entries {
+		if existing.Persistent && existing.Role == entry.Role && existing.Title == entry.Title {
+			continue
+		}
+		active = append(active, existing)
+	}
+	terminalTranscript.entries = active
+	prior := len(terminalTranscript.entries)
+	terminalTranscript.entries = append(terminalTranscript.entries, entry)
+	terminalTrimEntriesLocked()
+	terminalTranscript.Unlock()
+	return terminalAppendRecordSnapshot(terminalRecordSnapshot{Entry: entry, Text: entry.Text, Title: entry.Title, PriorEntries: prior}, status)
 }
 
 // terminalRecordRuntimeErrorAndAppend keeps application diagnostics inside the
@@ -120,11 +154,9 @@ func terminalSetConversationHistory(title string, history []interface{}) bool {
 	for _, msg := range messages {
 		terminalTranscript.entries = append(terminalTranscript.entries, terminalTranscriptEntry{Role: msg.Role, Text: msg.Content})
 	}
-	if extra := len(terminalTranscript.entries) - terminalTranscriptLimit; extra > 0 {
-		copy(terminalTranscript.entries, terminalTranscript.entries[extra:])
-		terminalTranscript.entries = terminalTranscript.entries[:terminalTranscriptLimit]
-	}
-	changed := title != "" || len(messages) > 0
+	terminalTranscript.entries = append(terminalTranscript.entries, terminalTranscript.persistentEntries...)
+	terminalTrimEntriesLocked()
+	changed := title != "" || len(messages) > 0 || len(terminalTranscript.persistentEntries) > 0
 	terminalTranscript.Unlock()
 	return changed
 }
@@ -134,7 +166,10 @@ func terminalRecordEntry(entry terminalTranscriptEntry) {
 }
 
 func terminalRecordEntryAndAppend(entry terminalTranscriptEntry, status statusBarState) bool {
-	snapshot := terminalRecordEntrySnapshot(entry)
+	return terminalAppendRecordSnapshot(terminalRecordEntrySnapshot(entry), status)
+}
+
+func terminalAppendRecordSnapshot(snapshot terminalRecordSnapshot, status statusBarState) bool {
 	if snapshot.Text == "" && snapshot.Title == "" {
 		return false
 	}
@@ -162,12 +197,29 @@ func terminalRecordEntrySnapshot(entry terminalTranscriptEntry) terminalRecordSn
 	terminalTranscript.Lock()
 	prior := len(terminalTranscript.entries)
 	terminalTranscript.entries = append(terminalTranscript.entries, entry)
-	if extra := len(terminalTranscript.entries) - terminalTranscriptLimit; extra > 0 {
-		copy(terminalTranscript.entries, terminalTranscript.entries[extra:])
-		terminalTranscript.entries = terminalTranscript.entries[:terminalTranscriptLimit]
-	}
+	terminalTrimEntriesLocked()
 	terminalTranscript.Unlock()
 	return terminalRecordSnapshot{Entry: entry, Text: entry.Text, Title: entry.Title, PriorEntries: prior}
+}
+
+func terminalTrimEntriesLocked() {
+	extra := len(terminalTranscript.entries) - terminalTranscriptLimit
+	if extra <= 0 {
+		return
+	}
+	kept := terminalTranscript.entries[:0]
+	for _, entry := range terminalTranscript.entries {
+		if extra > 0 && !entry.Persistent {
+			extra--
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	if extra > 0 {
+		copy(kept, kept[extra:])
+		kept = kept[:len(kept)-extra]
+	}
+	terminalTranscript.entries = kept
 }
 
 func terminalTranscriptSnapshot() []terminalTranscriptEntry {
@@ -319,6 +371,16 @@ func terminalFormatTranscriptEntry(entry terminalTranscriptEntry, color bool, wi
 			title = "Error"
 		}
 		return style(title, ansiRed+ansiBold, color) + "\n" + style(strings.TrimSpace(entry.Text), ansiRed, color)
+	case "warning":
+		title := entry.Title
+		if title == "" {
+			title = "Warning"
+		}
+		body := strings.TrimRight(formatAssistantTerminal(entry.Text, color, width), "\n")
+		if body == "" {
+			return style(title, ansiYellow+ansiBold, color)
+		}
+		return style(title, ansiYellow+ansiBold, color) + "\n" + body
 	case "tool_success":
 		return formatToolResultTerminal(entry.Text, true, color)
 	case "tool_error":
