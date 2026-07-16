@@ -41,6 +41,21 @@ func slashCommandPrintf(format string, args ...interface{}) {
 func handleSlashCommandForTerminal(ctx context.Context, c *Client, line string, status statusBarState) (bool, error) {
 	bacliActionMu.Lock()
 	defer bacliActionMu.Unlock()
+	return handleSlashCommandForTerminalLocked(ctx, c, line, status)
+}
+
+func handleSlashCommandForActiveClient(ctx context.Context, clients *activeClientRef, line string) (*Client, bool, error) {
+	bacliActionMu.Lock()
+	defer bacliActionMu.Unlock()
+	client := clients.Get()
+	if client == nil {
+		return nil, false, errors.New("active client is unavailable")
+	}
+	handled, err := handleSlashCommandForTerminalLocked(ctx, client, line, client.statusBarState())
+	return client, handled, err
+}
+
+func handleSlashCommandForTerminalLocked(ctx context.Context, c *Client, line string, status statusBarState) (bool, error) {
 	if !slashCommandOutputCanBeCaptured(line) {
 		return handleSlashCommand(ctx, c, line)
 	}
@@ -166,6 +181,14 @@ func handleConversationCommand(parent context.Context, c *Client, args []string)
 	defer cancel()
 
 	if len(args) == 0 || strings.EqualFold(args[0], "select") || strings.EqualFold(args[0], "choose") {
+		if _, remote := telegramCommandSourceFromContext(parent); remote {
+			conversations, err := c.ListWebConversations(ctx)
+			if err != nil {
+				return err
+			}
+			printConversationListTo(slashCommandOutputWriter, conversations, c.conversationID)
+			return nil
+		}
 		return c.PromptWebConversation(ctx, "command")
 	}
 
@@ -175,17 +198,18 @@ func handleConversationCommand(parent context.Context, c *Client, args []string)
 		slashCommandPrintln("opens the conversation picker; choose an existing conversation or New conversation")
 		return nil
 	case "current", "show":
-		printCurrentConversation(c)
+		printCurrentConversationTo(slashCommandOutputWriter, c)
 		return nil
 	case "list", "ls":
 		conversations, err := c.ListWebConversations(ctx)
 		if err != nil {
 			return err
 		}
-		if term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(terminalStderrFD()) {
+		_, remote := telegramCommandSourceFromContext(parent)
+		if !remote && term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(terminalStderrFD()) {
 			return c.SelectWebConversation(ctx, conversations, true)
 		}
-		printConversationList(conversations, c.conversationID)
+		printConversationListTo(slashCommandOutputWriter, conversations, c.conversationID)
 		return nil
 	case "new", "create":
 		return c.StartNewWebConversation(ctx)
@@ -201,9 +225,13 @@ func handleConversationCommand(parent context.Context, c *Client, args []string)
 
 func handleWorkspaceCommand(parent context.Context, c *Client, args []string) error {
 	if len(args) == 0 {
-		ctx, cancel := conversationCommandContext(parent)
-		defer cancel()
-		return c.PromptWorkspaceSelection(ctx)
+		if _, remote := telegramCommandSourceFromContext(parent); remote {
+			args = []string{"current"}
+		} else {
+			ctx, cancel := conversationCommandContext(parent)
+			defer cancel()
+			return c.PromptWorkspaceSelection(ctx)
+		}
 	}
 	if strings.EqualFold(args[0], "help") {
 		slashCommandPrintln("usage: /workspace")
@@ -215,6 +243,9 @@ func handleWorkspaceCommand(parent context.Context, c *Client, args []string) er
 
 	switch strings.ToLower(args[0]) {
 	case "select", "choose":
+		if _, remote := telegramCommandSourceFromContext(parent); remote {
+			return handleWorkspaceCommand(parent, c, []string{"list"})
+		}
 		return c.PromptWorkspaceSelection(ctx)
 	case "current", "show":
 		ws := c.WorkspaceState()
@@ -323,9 +354,13 @@ func handleWorkspaceCommand(parent context.Context, c *Client, args []string) er
 
 func handleAppCommand(parent context.Context, c *Client, args []string) error {
 	if len(args) == 0 {
-		ctx, cancel := conversationCommandContext(parent)
-		defer cancel()
-		return c.PromptAppSelection(ctx)
+		if _, remote := telegramCommandSourceFromContext(parent); remote {
+			args = []string{"current"}
+		} else {
+			ctx, cancel := conversationCommandContext(parent)
+			defer cancel()
+			return c.PromptAppSelection(ctx)
+		}
 	}
 	if strings.EqualFold(args[0], "help") {
 		slashCommandPrintln("usage: /app")
@@ -337,6 +372,25 @@ func handleAppCommand(parent context.Context, c *Client, args []string) error {
 
 	switch strings.ToLower(args[0]) {
 	case "select", "choose", "list", "ls":
+		if _, remote := telegramCommandSourceFromContext(parent); remote {
+			choices, err := c.ListWorkspaceAppChoices(ctx)
+			if err != nil {
+				return err
+			}
+			if len(choices) == 0 {
+				slashCommandPrintln("no applications available in the active workspace")
+				return nil
+			}
+			slashCommandPrintln("applications:")
+			for i, choice := range choices {
+				marker := " "
+				if choice.Current {
+					marker = "*"
+				}
+				slashCommandPrintf("%s %d. %s  scope=%s\n", marker, i+1, choice.Label, choice.App.ScopeID)
+			}
+			return nil
+		}
 		return c.PromptAppSelection(ctx)
 	case "current", "show":
 		app := c.CurrentApp()

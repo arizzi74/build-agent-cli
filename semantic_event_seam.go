@@ -114,21 +114,25 @@ func (c *Client) activeSemanticTurn() bool {
 }
 func (c *Client) emitRetryAttempted(operation string, attempt int, category string) {
 	if c.activeSemanticTurn() {
+		c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationRetry, Text: fmt.Sprintf("Retrying %s (attempt %d, %s)", safeTelemetryLabel(operation), attempt, safeTelemetryLabel(category))})
 		c.emitSemanticEvent(EventRetryAttempted, "", RetryPayload{Operation: safeTelemetryLabel(operation), Attempt: attempt, Category: safeTelemetryLabel(category)})
 	}
 }
 func (c *Client) emitRetryScheduled(operation string, attempt int, category string, delay time.Duration) {
 	if c.activeSemanticTurn() {
+		c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationRetry, Text: fmt.Sprintf("Retry scheduled for %s in %s (attempt %d, %s)", safeTelemetryLabel(operation), delay.Round(time.Millisecond), attempt, safeTelemetryLabel(category))})
 		c.emitSemanticEvent(EventRetryScheduled, "", RetryPayload{Operation: safeTelemetryLabel(operation), Attempt: attempt, Category: safeTelemetryLabel(category), DelayMillis: delay.Milliseconds()})
 	}
 }
 func (c *Client) emitRetryExhausted(operation string, attempt int, category, reason string) {
 	if c.activeSemanticTurn() {
+		c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationRetry, Text: fmt.Sprintf("Retries exhausted for %s after attempt %d (%s)", safeTelemetryLabel(operation), attempt, safeTelemetryLabel(category+"_"+reason))})
 		c.emitSemanticEvent(EventRetryExhausted, "", RetryPayload{Operation: safeTelemetryLabel(operation), Attempt: attempt, Category: safeTelemetryLabel(category + "_" + reason)})
 	}
 }
 func (c *Client) emitTransportFallback(from, to, reason string) {
 	if c.canFallback(from, to, reason).Allowed {
+		c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationFallback, Text: fmt.Sprintf("Transport fallback: %s to %s (%s)", safeTelemetryLabel(from), safeTelemetryLabel(to), safeTelemetryLabel(reason))})
 		c.emitSemanticEvent(EventTransportFallback, "", TransportFallbackPayload{From: from, To: to, Reason: reason})
 	}
 }

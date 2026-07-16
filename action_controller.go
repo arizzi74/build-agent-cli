@@ -58,7 +58,25 @@ func runPromptForResponse(ctx context.Context, client *Client, prompt string, ti
 	return runPromptForResponseLocked(ctx, client, prompt, timeout)
 }
 
+func runPromptForActiveClient(ctx context.Context, clients *activeClientRef, prompt string, timeout time.Duration) (*Client, error) {
+	bacliActionMu.Lock()
+	defer bacliActionMu.Unlock()
+	client := clients.Get()
+	if client == nil {
+		return nil, context.Canceled
+	}
+	_, err := runPromptForResponseLocked(ctx, client, prompt, timeout)
+	return client, err
+}
+
 func runPromptForResponseLocked(ctx context.Context, client *Client, prompt string, timeout time.Duration) (string, error) {
+	attachmentOwner := "local"
+	if source, ok := telegramCommandSourceFromContext(ctx); ok {
+		attachmentOwner = telegramPendingAttachmentOwner(source.ChatID, source.UserID)
+	}
+	if err := client.requirePendingAttachmentOwner(attachmentOwner); err != nil {
+		return "", err
+	}
 	client.resetTurnFinalText()
 	turnCtx := client.beginActiveTurn(ctx)
 	defer client.endActiveTurn()

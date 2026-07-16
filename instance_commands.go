@@ -11,7 +11,15 @@ import (
 // deliberately never invokes setup or writes profile configuration.
 func handleInstanceCommand(ctx context.Context, c *Client, args []string) error {
 	if len(args) == 0 || strings.EqualFold(args[0], "select") || strings.EqualFold(args[0], "choose") {
-		return c.PromptInstanceSelection(ctx)
+		if _, remote := telegramCommandSourceFromContext(ctx); remote {
+			if len(args) == 0 {
+				args = []string{"current"}
+			} else {
+				args = []string{"list"}
+			}
+		} else {
+			return c.PromptInstanceSelection(ctx)
+		}
 	}
 	switch strings.ToLower(args[0]) {
 	case "help":

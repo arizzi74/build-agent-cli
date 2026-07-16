@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -1056,8 +1057,12 @@ func (c *Client) UseWebConversation(ctx context.Context, conv WebConversation) e
 	if err := c.saveCurrentState(); err != nil {
 		return err
 	}
-	printCurrentConversation(c)
-	printConversationHistoryScrollbackWithStatus(c.conversationTitle, c.history, c.statusBarState())
+	if _, remote := telegramCommandSourceFromContext(ctx); remote {
+		printCurrentConversationTo(slashCommandOutputWriter, c)
+	} else {
+		printCurrentConversation(c)
+		printConversationHistoryScrollbackWithStatus(c.conversationTitle, c.history, c.statusBarState())
+	}
 	return nil
 }
 
@@ -1190,6 +1195,10 @@ func (c *Client) StartNewWebConversation(ctx context.Context) error {
 	if err := c.saveCurrentState(); err != nil {
 		return err
 	}
+	if _, remote := telegramCommandSourceFromContext(ctx); remote {
+		printCurrentConversationTo(slashCommandOutputWriter, c)
+		return nil
+	}
 	terminalSetConversationHistory("New conversation", nil)
 	if replayConversationHistoryFromTranscript(c.statusBarState()) {
 		return nil
@@ -1243,7 +1252,11 @@ func (c *Client) SelectWebConversation(ctx context.Context, conversations []WebC
 func (c *Client) SelectConversationByArg(ctx context.Context, selection string, allowNew bool) error {
 	selection = strings.TrimSpace(selection)
 	if selection == "" || strings.EqualFold(selection, "current") {
-		printCurrentConversation(c)
+		if _, remote := telegramCommandSourceFromContext(ctx); remote {
+			printCurrentConversationTo(slashCommandOutputWriter, c)
+		} else {
+			printCurrentConversation(c)
+		}
 		return nil
 	}
 	if strings.EqualFold(selection, "new") || strings.EqualFold(selection, "__new__") {
@@ -1293,26 +1306,34 @@ func printConversationPicker(conversations []WebConversation, currentID string) 
 }
 
 func printConversationList(conversations []WebConversation, currentID string) {
+	printConversationListTo(os.Stderr, conversations, currentID)
+}
+
+func printConversationListTo(w io.Writer, conversations []WebConversation, currentID string) {
 	if len(conversations) == 0 {
-		fmt.Fprintln(os.Stderr, "no Build Agent conversations found")
+		fmt.Fprintln(w, "no Build Agent conversations found")
 		return
 	}
-	fmt.Fprintln(os.Stderr, "Build Agent conversations:")
+	fmt.Fprintln(w, "Build Agent conversations:")
 	if hasGlobalConversations(conversations) {
-		fmt.Fprintln(os.Stderr, "  🌐 Global / no app conversations are available across workspaces.")
+		fmt.Fprintln(w, "  🌐 Global / no app conversations are available across workspaces.")
 	}
 	for i, conv := range conversations {
 		marker := " "
 		if conversationIDMatches(conv.ID, currentID) {
 			marker = "*"
 		}
-		fmt.Fprintf(os.Stderr, "%s %2d) %s\n", marker, i+1, conversationLabelWithCurrent(conv, conversationIDMatches(conv.ID, currentID)))
+		fmt.Fprintf(w, "%s %2d) %s\n", marker, i+1, conversationLabelWithCurrent(conv, conversationIDMatches(conv.ID, currentID)))
 	}
 }
 
 func printCurrentConversation(c *Client) {
+	printCurrentConversationTo(os.Stderr, c)
+}
+
+func printCurrentConversationTo(w io.Writer, c *Client) {
 	if c.conversationID == "" || (!c.serverConversation && c.conversationTitle == "") {
-		fmt.Fprintln(os.Stderr, "conversation: <new>")
+		fmt.Fprintln(w, "conversation: <new>")
 		return
 	}
 	label := c.conversationID
@@ -1322,7 +1343,7 @@ func printCurrentConversation(c *Client) {
 	if c.conversationState != "" {
 		label += "  [" + c.conversationState + "]"
 	}
-	fmt.Fprintf(os.Stderr, "conversation: %s\n", label)
+	fmt.Fprintf(w, "conversation: %s\n", label)
 }
 
 func conversationBySelection(conversations []WebConversation, answer string) (WebConversation, bool) {

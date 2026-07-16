@@ -98,6 +98,7 @@ type Client struct {
 	lastUserMessageContent          RichUserContent
 	attachmentsMu                   sync.Mutex
 	pendingAttachments              []pendingAttachment
+	pendingAttachmentOwner          string
 	pendingAttachmentMessageKey     string
 	pendingAttachmentMessageSysID   string
 	pendingAttachmentMessageContent string
@@ -131,6 +132,10 @@ type Client struct {
 	cancelledServerTurnIDs          map[string]struct{}
 	turnResultMu                    sync.Mutex
 	turnFinalText                   string
+	turnFrontendMu                  sync.RWMutex
+	turnFrontendGeneration          uint64
+	turnPresentationSink            turnPresentationSink
+	turnInteractionProvider         turnInteractionProvider
 	semanticMu                      sync.Mutex
 	semanticState                   SemanticTurnState
 	semanticSequence                uint64
@@ -526,6 +531,31 @@ func (c *Client) PrepareConnectionAuthentication(ctx context.Context) error {
 	}
 	if err := c.configureGatewayAuth(ctx); err != nil {
 		return err
+	}
+	c.connectionAuthPrepared = true
+	return nil
+}
+
+// PrepareConnectionAuthenticationNonInteractive is used by remote front ends
+// that cannot safely answer host-terminal password, browser, or recovery
+// prompts. It may refresh persisted OAuth credentials or validate an existing
+// saved browser session, but it never reads stdin, opens a browser, deletes
+// credentials, or starts a manual authorization flow.
+func (c *Client) PrepareConnectionAuthenticationNonInteractive(ctx context.Context) error {
+	if c.connectionAuthPrepared {
+		return nil
+	}
+	if c.opts.Nirvana {
+		tok, err := c.getNirvanaAccessToken(ctx, true)
+		if err != nil {
+			return fmt.Errorf("saved credentials for profile %q are not usable noninteractively; switch locally once to reauthenticate: %w", c.opts.Profile, err)
+		}
+		c.oauthAccessToken = tok.AccessToken
+		c.connectionAuthPrepared = true
+		return nil
+	}
+	if err := c.configureGatewayAuthNonInteractive(ctx); err != nil {
+		return fmt.Errorf("saved credentials for profile %q are not usable noninteractively; switch locally once to reauthenticate: %w", c.opts.Profile, err)
 	}
 	c.connectionAuthPrepared = true
 	return nil
@@ -2980,15 +3010,22 @@ func (c *Client) handleGatewayCompleteMessage(event map[string]interface{}, type
 		c.appendWebStreamMessage()
 		c.appendCodeAssistAssistantMessage(event)
 		name, inputs := codeAssistToolUse(body)
+		presentationName := name
+		if strings.TrimSpace(presentationName) == "" {
+			presentationName = "tool"
+		}
+		c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationToolStarted, Name: presentationName})
 		if name != "" && c.debug {
 			c.debugf("\n[client tool] %s\n", name)
 		}
 		if name == "interview" {
 			c.clearTurnStatus()
 			printInterviewInputs(inputs)
+			c.setTurnFinalText(codeAssistInterviewText(inputs))
 			if err := c.saveCurrentState(); err != nil {
 				c.printRuntimeError(fmt.Sprintf("warning: could not save workspace %q: %v", c.workspaceName, err))
 			}
+			c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationToolCompleted, Name: presentationName, Success: true})
 			c.processing = false
 			if c.turnDone != nil {
 				select {
@@ -2999,6 +3036,7 @@ func (c *Client) handleGatewayCompleteMessage(event map[string]interface{}, type
 			return nil
 		}
 		err := fmt.Errorf("server requested unsupported client tool %q", name)
+		c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationToolCompleted, Name: presentationName, Text: err.Error(), Success: false})
 		c.processing = false
 		if c.turnDone != nil {
 			select {
@@ -3087,6 +3125,7 @@ func (c *Client) recordToolCall(event map[string]interface{}) (string, string) {
 		c.toolCallInputs[callID] = eventToolInput(event)
 		c.toolCallStarted[callID] = time.Now()
 	}
+	c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationToolStarted, Name: name})
 	return name, callID
 }
 
@@ -3119,6 +3158,7 @@ func eventToolInput(event map[string]interface{}) interface{} {
 func (c *Client) printToolResultStatus(name string, success bool, summary string) {
 	c.flushActiveStreamForTerminalInterruption()
 	display := toolResultDisplay(name, summary)
+	c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationToolCompleted, Name: name, Text: truncateToolSummary(summary, 160), Success: success})
 	if terminalRecordToolResultAndAppend(display, success, c.statusBarState()) {
 		return
 	}
@@ -3128,6 +3168,7 @@ func (c *Client) printToolResultStatus(name string, success bool, summary string
 func (c *Client) printToolWarning(name, warning string) {
 	c.flushActiveStreamForTerminalInterruption()
 	display := toolResultDisplay(name, warning)
+	c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationToolWarning, Name: name, Text: truncateToolSummary(warning, 160)})
 	if terminalRecordToolWarningAndAppend(display, c.statusBarState()) {
 		return
 	}
@@ -3142,6 +3183,7 @@ func (c *Client) printRuntimeError(message string) {
 	if message == "" {
 		return
 	}
+	c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationRuntimeError, Text: message})
 	if interactiveTerminalUIEnabled() && terminalRecordRuntimeErrorAndAppend(message, c.statusBarState()) {
 		return
 	}
@@ -3301,6 +3343,29 @@ func printInterviewInputs(inputs map[string]interface{}) {
 	fmt.Fprintln(os.Stderr, "Reply with your answer to continue this turn.")
 }
 
+func codeAssistInterviewText(inputs map[string]interface{}) string {
+	if inputs == nil {
+		return "Build Agent requested an answer. Reply with your answer to continue."
+	}
+	var out strings.Builder
+	if question := firstString(inputs, "question", "message"); question != "" {
+		out.WriteString(question)
+	}
+	if choices, ok := inputs["choices"].([]interface{}); ok {
+		for i, choice := range choices {
+			if out.Len() > 0 {
+				out.WriteByte('\n')
+			}
+			fmt.Fprintf(&out, "%d. %s", i+1, choiceLabel(choice))
+		}
+	}
+	if out.Len() > 0 {
+		out.WriteByte('\n')
+	}
+	out.WriteString("Reply with your answer to continue this turn.")
+	return out.String()
+}
+
 func codeAssistError(event map[string]interface{}, fallback string) error {
 	body := asMap(event["body"])
 	if body != nil {
@@ -3434,6 +3499,7 @@ func (c *Client) handleEvent(data []byte) error {
 		return c.handleElicitation(event)
 	case "turn_summary":
 		if summary, ok := event["summary"].(string); ok && summary != "" {
+			c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationSummary, Text: summary})
 			if !terminalRecordSystemTextAndAppend("Summary", summary, c.statusBarState()) {
 				fmt.Fprintf(os.Stderr, "\n[summary] %s\n", summary)
 			}
@@ -3441,10 +3507,12 @@ func (c *Client) handleEvent(data []byte) error {
 	case "sub_agent_start":
 		id, name := eventSubAgentIdentity(event)
 		setTerminalFooterSubagent(id, name)
+		c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationSubAgentStart, Name: name})
 		c.emitSemanticEvent(EventSubAgentStarted, "", SubAgentLifecyclePayload{AgentID: id, Name: name})
 	case "sub_agent_end":
 		id, name := eventSubAgentIdentity(event)
 		clearTerminalFooterSubagent(id, name)
+		c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationSubAgentEnd, Name: name})
 		c.emitSemanticEvent(EventSubAgentEnded, "", SubAgentLifecyclePayload{AgentID: id, Name: name})
 	case "turn_end":
 		// Emit final observed state before terminal lifecycle events. This keeps
@@ -3810,6 +3878,9 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 	if c.debug {
 		c.debugf("\n[client request] %s\n", action)
 	}
+	if len(c.toolCallNames) == 0 {
+		c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationToolStarted, Name: action})
+	}
 	var result map[string]interface{}
 	var status string
 	var err error
@@ -3958,13 +4029,25 @@ func (c *Client) answerInterview(payload map[string]interface{}) (map[string]int
 	if question == "" {
 		question = stringify(payload["message"])
 	}
+	if c.opts.AutoApprove {
+		if question != "" {
+			fmt.Fprintf(os.Stderr, "%s\n", question)
+		}
+		printChoices(payload)
+		return map[string]interface{}{"answer": "Please proceed with the most reasonable default option."}, "complete", nil
+	}
+	choices, _ := payload["choices"].([]interface{})
+	choiceLabels := make([]string, 0, len(choices))
+	for _, choice := range choices {
+		choiceLabels = append(choiceLabels, choiceLabel(choice))
+	}
+	if answer, handled, err := c.requestTurnInteraction(c.activeTurnContext(), turnInteractionRequest{Kind: "interview", Prompt: question, Options: choiceLabels}); handled {
+		return map[string]interface{}{"answer": answer}, "complete", err
+	}
 	if question != "" {
 		fmt.Fprintf(os.Stderr, "%s\n", question)
 	}
 	printChoices(payload)
-	if c.opts.AutoApprove {
-		return map[string]interface{}{"answer": "Please proceed with the most reasonable default option."}, "complete", nil
-	}
 	answer, err := promptLine("Answer: ")
 	return map[string]interface{}{"answer": answer}, "complete", err
 }
@@ -3973,14 +4056,21 @@ func (c *Client) answerApproval(action string, payload map[string]interface{}) (
 	if c.opts.AutoApprove || emptyWebUIApproval(action, payload) {
 		return map[string]interface{}{"approved": true}, "complete", nil
 	}
-	// The picker replaces the managed viewport. Commit and record everything
-	// streamed before it so replay restores the same semantic ordering.
-	c.flushActiveStreamForTerminalInterruption()
-	c.clearTurnStatus()
 	message := stringify(payload["message"])
 	if message == "" && action == "plan_approval" {
 		message = "Approve this plan to begin applying changes?"
 	}
+	if answer, handled, err := c.requestTurnInteraction(c.activeTurnContext(), turnInteractionRequest{Kind: "approval", Prompt: message, Rows: approvalRows(action, payload), Options: []string{"Approve", "Reject"}}); handled {
+		if err != nil {
+			return nil, "error", err
+		}
+		approved, parseErr := parseTurnApprovalAnswer(answer)
+		return map[string]interface{}{"approved": approved}, "complete", parseErr
+	}
+	// The picker replaces the managed viewport. Commit and record everything
+	// streamed before it so replay restores the same semantic ordering.
+	c.flushActiveStreamForTerminalInterruption()
+	c.clearTurnStatus()
 	approved, err := promptApprovalTable(approvalRows(action, payload), message, true)
 	return map[string]interface{}{"approved": approved}, "complete", err
 }
@@ -4031,11 +4121,29 @@ func (c *Client) answerAppPicker(payload map[string]interface{}) (map[string]int
 	if len(choices) == 0 {
 		return map[string]interface{}{"error": "No applications available to select.", "code": "NO_CHOICES"}, "error", nil
 	}
-	for i, choice := range choices {
-		fmt.Fprintf(os.Stderr, "%d) %s\n", i+1, choiceLabel(choice))
-	}
 	selected := choiceLabel(choices[0])
 	if !c.opts.AutoApprove {
+		labels := make([]string, 0, len(choices))
+		for _, choice := range choices {
+			labels = append(labels, choiceLabel(choice))
+		}
+		if answer, handled, err := c.requestTurnInteraction(c.activeTurnContext(), turnInteractionRequest{Kind: "app_picker", Prompt: "Select an application", Options: labels}); handled {
+			if err != nil {
+				return nil, "error", err
+			}
+			if answer != "" {
+				var idx int
+				if _, scanErr := fmt.Sscanf(answer, "%d", &idx); scanErr == nil && idx >= 1 && idx <= len(choices) {
+					selected = choiceLabel(choices[idx-1])
+				} else {
+					selected = answer
+				}
+			}
+			return map[string]interface{}{"success": true, "selection": selected}, "complete", nil
+		}
+		for i, choice := range choices {
+			fmt.Fprintf(os.Stderr, "%d) %s\n", i+1, choiceLabel(choice))
+		}
 		answer, err := promptLine("Select application number: ")
 		if err != nil {
 			return nil, "error", err
@@ -4128,6 +4236,10 @@ func (c *Client) recordUsage(usage map[string]interface{}) {
 	c.usageInputTokens += usageTokenValue(usage, "input_tokens", "inputTokens", "prompt_tokens", "promptTokens")
 	c.usageOutputTokens += usageTokenValue(usage, "output_tokens", "outputTokens", "completion_tokens", "completionTokens")
 	c.usageThinkingTokens += usageTokenValue(usage, "thinking_tokens", "thinkingTokens")
+	c.publishTurnPresentation(turnPresentationEvent{
+		Kind: turnPresentationUsage,
+		Text: fmt.Sprintf("Usage: input %d · output %d · thinking %d tokens", c.usageInputTokens, c.usageOutputTokens, c.usageThinkingTokens),
+	})
 	if !interactiveTerminalUIEnabled() {
 		printUsage(usage)
 	} else {

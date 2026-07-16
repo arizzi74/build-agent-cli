@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -177,6 +178,12 @@ func privateAtomicWrite(path string, v any) error {
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		return err
+	}
+	// Windows cannot FlushFileBuffers on a directory handle opened by os.Open.
+	// The file itself was already synced before the atomic rename; keep the
+	// additional parent-directory durability barrier on Unix filesystems only.
+	if runtime.GOOS == "windows" {
+		return nil
 	}
 	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {

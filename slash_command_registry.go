@@ -264,7 +264,8 @@ var slashCommandRegistry = []SlashCommandDefinition{
 	{
 		Canonical: "/telegram", Description: "inspect and manage the private Telegram channel", Category: "General", Order: 68,
 		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeAny,
-		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: false, Suggestions: []string{"/telegram status", "/telegram help"},
+		CapturePolicy: SlashCommandDoNotCaptureModal, AvailableWhileProcessing: false, Suggestions: []string{"/telegram status", "/telegram setup", "/telegram help"},
+		IsModal: func(args []string) bool { return len(args) > 0 && strings.EqualFold(args[0], "setup") },
 		Handler: func(ctx context.Context, c *Client, args []string) (bool, error) {
 			return true, handleTelegramCommand(ctx, c, args)
 		},

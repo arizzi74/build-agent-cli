@@ -1039,14 +1039,25 @@ func persistentSyncChecksEqual(local, remote map[string]string) (bool, []string)
 	return len(differing) == 0, differing
 }
 
-func (c *Client) confirmPersistentSyncPlan(plan persistentSyncPlan) error {
+func (c *Client) confirmPersistentSyncPlan(ctx context.Context, plan persistentSyncPlan) error {
 	pull, push := plan.directionCounts()
 	message := fmt.Sprintf("Reconcile this local project with ServiceNow? This will pull %d Web change(s) and upload %d Local change(s). Timestamps are advisory; approval authorizes every listed overwrite or deletion.", pull, push)
 	// A build elicitation owns the animated footer. Give the blocking picker a
 	// stable terminal and let handleElicitation restore Building afterward.
 	c.flushActiveStreamForTerminalInterruption()
 	c.clearTurnStatus()
-	approved, err := persistentSyncApprovalPrompt(persistentSyncPlanRows(plan), message)
+	rows := persistentSyncPlanRows(plan)
+	approved := false
+	var err error
+	if answer, handled, interactionErr := c.requestTurnInteraction(ctx, turnInteractionRequest{Kind: "approval", Prompt: message, Rows: rows, Options: []string{"Approve", "Reject"}}); handled {
+		if interactionErr != nil {
+			err = interactionErr
+		} else {
+			approved, err = parseTurnApprovalAnswer(answer)
+		}
+	} else {
+		approved, err = persistentSyncApprovalPrompt(rows, message)
+	}
 	if errors.Is(err, errPersistentSyncNonInteractive) {
 		return codedError{Code: "SYNC_RECONCILIATION_REQUIRED", Message: fmt.Sprintf("Sync reconciliation requires explicit interactive approval (pull %d, push %d); nothing was changed.", pull, push)}
 	}
@@ -1172,7 +1183,7 @@ func (c *Client) reconcilePersistentSyncPlan(ctx context.Context, projectDir, ap
 	if cached, ok := c.cachedPersistentSyncOutcome(plan.Fingerprint); ok {
 		return result, cached
 	}
-	if err := c.confirmPersistentSyncPlan(plan); err != nil {
+	if err := c.confirmPersistentSyncPlan(ctx, plan); err != nil {
 		c.rememberPersistentSyncOutcome(plan.Fingerprint, err)
 		return result, err
 	}

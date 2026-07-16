@@ -20,12 +20,14 @@ type telegramQueuedCommand struct {
 }
 
 type telegramService struct {
-	profile string
-	cfg     telegramConfig
-	api     *telegramAPI
-	clients *activeClientRef
-	client  *Client
-	timeout time.Duration
+	profile     string
+	cfg         telegramConfig
+	api         *telegramAPI
+	botID       string
+	fingerprint string
+	clients     *activeClientRef
+	client      *Client
+	timeout     time.Duration
 
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -33,6 +35,13 @@ type telegramService struct {
 	fatalErr chan error
 	wg       sync.WaitGroup
 	lockFile *os.File
+
+	clientMu           sync.RWMutex
+	outboundMu         sync.Mutex
+	outboundLast       time.Time
+	turnControlMu      sync.Mutex
+	activeTurn         telegramActiveTurn
+	pendingInteraction *telegramPendingInteraction
 }
 
 func maybeStartTelegramService(parent context.Context, profile string, clients *activeClientRef, timeout time.Duration, environmentToken string) (*telegramService, error) {
@@ -43,14 +52,14 @@ func maybeStartTelegramService(parent context.Context, profile string, clients *
 	if pinnedClient == nil || pinnedClient.opts.Profile != profile {
 		return nil, errors.New("Telegram channel could not pin the active profile client")
 	}
-	cfg, _, err := loadTelegramConfig(profile)
+	cfg, _, err := loadTelegramConfig()
 	if err != nil {
 		return nil, err
 	}
 	if !cfg.Enabled || cfg.DMPolicy == telegramPolicyDisabled {
 		return nil, nil
 	}
-	token, _, err := resolveTelegramTokenWithEnvironment(profile, cfg, environmentToken)
+	token, _, err := resolveTelegramTokenWithEnvironment(cfg, environmentToken)
 	if err != nil {
 		return nil, err
 	}
@@ -81,20 +90,27 @@ func maybeStartTelegramService(parent context.Context, profile string, clients *
 	if !bot.IsBot || !validTelegramNumericID(botID) {
 		return nil, errors.New("Telegram getMe did not return a valid bot identity")
 	}
-	state, err := bindTelegramState(profile, botID, fingerprint)
+	state, err := bindTelegramState(botID, fingerprint)
 	if err != nil {
 		return nil, err
 	}
 	if err := api.deleteWebhook(startupCtx); err != nil {
 		return nil, fmt.Errorf("Telegram webhook cleanup failed: %w", err)
 	}
+	if err := validateTelegramPublishedCommands(telegramPublishedCommands()); err != nil {
+		return nil, fmt.Errorf("Telegram command catalog is invalid: %w", err)
+	}
 	if err := api.setMyCommands(startupCtx); err != nil {
-		return nil, fmt.Errorf("Telegram command registration failed: %w", err)
+		// Command-menu publication is useful discovery metadata, but it is not
+		// part of the bot's authorization or polling safety boundary. Keep the
+		// authenticated channel available when Telegram temporarily rejects a
+		// menu refresh (including legacy default-scope cleanup).
+		pinnedClient.printRuntimeError("warning: Telegram command menu could not be refreshed: " + err.Error())
 	}
 
 	ctx, stop := context.WithCancel(parent)
 	service := &telegramService{
-		profile: profile, cfg: cfg, api: api, clients: clients, client: pinnedClient, timeout: timeout,
+		profile: profile, cfg: cfg, api: api, botID: botID, fingerprint: fingerprint, clients: clients, client: pinnedClient, timeout: timeout,
 		ctx: ctx, cancel: stop, commands: make(chan telegramQueuedCommand, 64), fatalErr: make(chan error, 1), lockFile: lockFile,
 	}
 	service.wg.Add(2)
@@ -172,21 +188,46 @@ func (s *telegramService) warn(message string) {
 }
 
 func (s *telegramService) pinnedClient() (*Client, bool) {
+	s.clientMu.RLock()
+	pinned := s.client
+	profile := s.profile
+	s.clientMu.RUnlock()
 	current := s.clients.Get()
-	return current, current != nil && current == s.client && current.opts.Profile == s.profile
+	return current, current != nil && current == pinned && current.opts.Profile == profile
+}
+
+func (s *telegramService) adoptClientAfterRemoteSwitch(previous *Client) bool {
+	current := s.clients.Get()
+	if current == nil || current == previous {
+		return false
+	}
+	s.clientMu.Lock()
+	s.client = current
+	s.profile = current.opts.Profile
+	s.clientMu.Unlock()
+	return true
 }
 
 func (s *telegramService) authorization(userID string) (telegramConfig, bool, error) {
-	cfg, _, err := loadTelegramConfig(s.profile)
+	var cfg telegramConfig
+	var state telegramState
+	err := withTelegramLock(func() error {
+		var err error
+		cfg, _, err = loadTelegramConfig()
+		if err != nil {
+			return err
+		}
+		state, err = readTelegramState()
+		return err
+	})
 	if err != nil {
-		return telegramConfig{}, false, err
+		return cfg, false, err
 	}
 	if !cfg.Enabled || cfg.DMPolicy == telegramPolicyDisabled {
 		return cfg, false, nil
 	}
-	state, err := readTelegramState(s.profile)
-	if err != nil {
-		return cfg, false, err
+	if state.BotID != s.botID || state.TokenFingerprint != s.fingerprint {
+		return cfg, false, errors.New("Telegram bot identity changed; restart bacli")
 	}
 	return cfg, telegramUserAuthorized(cfg, state, userID), nil
 }
@@ -223,7 +264,7 @@ func (s *telegramService) poll(offset int64) {
 			}
 			// Persist before any side effect. A crash can drop an accepted command,
 			// but it cannot replay a mutating command after restart.
-			if err := recordTelegramUpdate(s.profile, update.UpdateID); err != nil {
+			if err := recordTelegramUpdate(s.botID, s.fingerprint, update.UpdateID); err != nil {
 				err = errors.New("Telegram channel could not persist its update offset")
 				s.warn(err.Error())
 				s.fail(err)
@@ -303,18 +344,14 @@ func (s *telegramService) acceptUpdate(update telegramUpdate) {
 		return
 	}
 	if command == "/cancel" {
-		client, pinned := s.pinnedClient()
-		if !pinned {
-			s.sendAsync(chatID, "The bacli instance changed. Restart bacli before using /cancel.")
-		} else if client.cancelActiveTurn() {
-			s.sendAsync(chatID, "Cancellation requested.")
-		} else {
-			s.sendAsync(chatID, "No Build Agent turn is currently running.")
-		}
+		s.cancelAndRespond(chatID, userID)
 		return
 	}
-	if text == "" || !strings.HasPrefix(text, "/") {
-		s.sendAsync(chatID, "This bot accepts commands only. Use /ask <prompt> or /help.")
+	if s.deliverInteractionReply(chatID, userID, text) {
+		return
+	}
+	if text == "" {
+		s.sendAsync(chatID, "Send a text message to start a Build Agent turn, or use /help.")
 		return
 	}
 	if !s.enqueue(telegramQueuedCommand{chatID: chatID, userID: userID, text: text}) && s.ctx.Err() == nil {
@@ -343,7 +380,7 @@ func (s *telegramService) handleUnknownUser(cfg telegramConfig, message *telegra
 		label = strings.TrimSpace(label + " (@" + message.From.Username + ")")
 	}
 	label = safeTelegramPairingLabel(label)
-	code, created, err := createTelegramPairing(s.profile, userID, chatID, label, time.Now().UTC())
+	code, created, err := createTelegramPairing(s.botID, s.fingerprint, userID, chatID, label, time.Now().UTC())
 	if err != nil {
 		s.sendAsync(chatID, "Pairing could not be created: "+err.Error())
 		return
@@ -352,15 +389,64 @@ func (s *telegramService) handleUnknownUser(cfg telegramConfig, message *telegra
 		s.sendAsync(chatID, "A pairing request is already pending. Ask the bacli operator to inspect `bacli --telegram-status`.")
 		return
 	}
-	messageText := fmt.Sprintf("Pairing required. Your one-hour code is %s. Ask the bacli operator to run locally: bacli --profile %s --telegram-approve %s", code, s.profile, code)
+	messageText := fmt.Sprintf("Pairing required. Your one-hour code is %s. Ask the bacli operator to run locally: bacli --telegram-approve %s", code, code)
 	s.sendAsync(chatID, messageText)
 }
 
 func (s *telegramService) sendAsync(chatID, text string) {
-	ctx, cancel := context.WithTimeout(s.ctx, 45*time.Second)
+	ctx, cancel := context.WithTimeout(s.serviceContext(), telegramSendTimeout)
 	defer cancel()
-	if err := s.api.sendText(ctx, chatID, text); err != nil && s.ctx.Err() == nil {
+	if err := s.sendText(ctx, chatID, text); err != nil && s.serviceContext().Err() == nil {
 		s.warn("Telegram send failed: " + err.Error())
+	}
+}
+
+func (s *telegramService) sendText(ctx context.Context, chatID, text string) error {
+	if s == nil || s.api == nil {
+		return errors.New("Telegram API is unavailable")
+	}
+	s.outboundMu.Lock()
+	defer s.outboundMu.Unlock()
+	return s.sendTextLocked(ctx, chatID, text)
+}
+
+func (s *telegramService) sendTextLocked(ctx context.Context, chatID, text string) error {
+	if interval := s.api.messageInterval; interval > 0 && !s.outboundLast.IsZero() {
+		if delay := time.Until(s.outboundLast.Add(interval)); delay > 0 {
+			if err := waitTelegramRetry(ctx, delay); err != nil {
+				return err
+			}
+		}
+	}
+	err := s.api.sendText(ctx, chatID, text)
+	if err == nil {
+		s.outboundLast = time.Now()
+	}
+	return err
+}
+
+// cancelAndRespond takes the outbound sequencing lock before cancelling the
+// exact stored command context. Progress already in flight completes first;
+// the acknowledgement is then guaranteed to precede the command's final
+// cancellation response.
+func (s *telegramService) cancelAndRespond(chatID, userID string) {
+	s.outboundMu.Lock()
+	message := ""
+	if _, pinned := s.pinnedClient(); !pinned {
+		message = "The bacli instance changed. Restart bacli before using /cancel."
+	} else if cancelled, ownedByOther := s.cancelOwnedTurn(chatID, userID); ownedByOther {
+		message = "Another authorized user owns the active turn; only its originator can cancel it."
+	} else if cancelled {
+		message = "Cancellation requested."
+	} else {
+		message = "No Build Agent turn is currently running."
+	}
+	ctx, cancel := context.WithTimeout(s.serviceContext(), telegramSendTimeout)
+	err := s.sendTextLocked(ctx, chatID, message)
+	cancel()
+	s.outboundMu.Unlock()
+	if err != nil && s.serviceContext().Err() == nil {
+		s.warn("Telegram cancellation acknowledgement failed: " + err.Error())
 	}
 }
 
@@ -409,67 +495,83 @@ func (s *telegramService) runCommands() {
 }
 
 func (s *telegramService) dispatchCommand(in telegramQueuedCommand) string {
+	if !strings.HasPrefix(strings.TrimSpace(in.text), "/") {
+		return s.runTelegramPrompt(in, in.text)
+	}
 	command, argument := telegramCommandParts(in.text)
+	command = telegramCanonicalCommand(command)
 	switch command {
 	case "/start", "/help":
-		return telegramRemoteHelp()
+		client, _ := s.pinnedClient()
+		return telegramRemoteHelp(client)
 	case "/whoami":
 		return "Your numeric Telegram user ID is " + in.userID + "."
 	case "/ask":
 		if strings.TrimSpace(argument) == "" {
-			return "Usage: /ask <prompt>"
+			return "Send the prompt as a normal text message; /ask <prompt> remains available for compatibility."
 		}
-		bacliActionMu.Lock()
-		defer bacliActionMu.Unlock()
-		client, pinned := s.pinnedClient()
-		if !pinned {
-			return "The bacli instance changed. Restart bacli to bind Telegram to the new client securely."
-		}
-		response, err := runPromptForResponseLocked(s.ctx, client, argument, s.timeout)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return "Build Agent turn cancelled."
-			}
-			return "Build Agent turn failed: " + err.Error()
-		}
-		if strings.TrimSpace(response) == "" {
-			return "Build Agent completed without a text response."
-		}
-		return response
+		return s.runTelegramPrompt(in, argument)
 	case "/cancel":
 		return "No Build Agent turn is currently running."
 	}
-	line, ok := telegramSafeSlashLine(command, argument)
+	line, ok := telegramRemoteSlashLine(command, argument)
 	if !ok {
-		return "That command is not available through Telegram. Use /help."
+		return "Unknown command. Use /help to see every published BACLI command."
 	}
-	if interactiveTerminalUIEnabled() && telegramSlashMutatesContext(command, argument) {
-		return "That context-changing command is local-only while the interactive terminal UI is running. Use it in bacli or restart with --telegram-only."
-	}
-	return s.executeSlash(line)
+	return s.executeSlash(in, line)
 }
 
-func (s *telegramService) executeSlash(line string) string {
+func (s *telegramService) executeSlash(in telegramQueuedCommand, line string) string {
 	bacliActionMu.Lock()
-	defer bacliActionMu.Unlock()
 	client, pinned := s.pinnedClient()
 	if !pinned {
+		bacliActionMu.Unlock()
 		return "The bacli instance changed. Restart bacli to bind Telegram to the new client securely."
 	}
+	commandTimeout := s.timeout
+	if commandTimeout <= 0 {
+		commandTimeout = 30 * time.Minute
+	}
+	commandBase, commandCancel := context.WithTimeout(s.serviceContext(), commandTimeout)
+	commandCtx := withTelegramCommandContext(commandBase, in.chatID, in.userID)
+	relay := newTelegramTurnRelay(s, in.chatID)
+	restore := client.installTurnFrontend(relay.presentation, func(ctx context.Context, request turnInteractionRequest) (string, error) {
+		return s.requestInteraction(ctx, in.chatID, in.userID, relay, request)
+	})
+	s.setActiveTurn(in.chatID, in.userID, commandCancel)
 	var output strings.Builder
 	handled, err := withSlashCommandOutput(&output, func() (bool, error) {
-		return handleSlashCommand(s.ctx, client, line)
+		return handleSlashCommand(commandCtx, client, line)
 	})
+	response := ""
 	if err != nil {
 		if output.Len() > 0 {
-			return strings.TrimSpace(output.String()) + "\nError: " + err.Error()
+			response = telegramSafeRemoteText(strings.TrimSpace(output.String())+"\nError: "+err.Error(), 0)
+		} else {
+			response = "Command failed: " + telegramSafeRemoteText(err.Error(), 1000)
 		}
-		return "Command failed: " + err.Error()
+	} else if !handled {
+		response = "The command is published for BACLI parity but cannot stop this host process remotely."
+	} else {
+		command, _ := telegramCommandParts(line)
+		if command == "/instance" {
+			s.adoptClientAfterRemoteSwitch(client)
+		}
+		if text := telegramSafeRemoteText(output.String(), 0); text != "" {
+			response = text
+		} else {
+			response = "Command completed."
+		}
 	}
-	if !handled {
-		return "Command is not available through Telegram."
+	s.clearActiveTurn(in.chatID, in.userID)
+	commandCancel()
+	restore()
+	// Do not retain bacli's global state lock while Telegram drains progress.
+	bacliActionMu.Unlock()
+	if sendErr := relay.finish(); sendErr != nil && s.serviceContext().Err() == nil {
+		s.warn("Telegram command progress send failed: " + sendErr.Error())
 	}
-	return strings.TrimSpace(output.String())
+	return response
 }
 
 func telegramSlashMutatesContext(command, argument string) bool {
@@ -512,59 +614,11 @@ func telegramCommandParts(text string) (string, string) {
 }
 
 func telegramSafeSlashLine(command, argument string) (string, bool) {
-	args := strings.Fields(argument)
-	sub := ""
-	if len(args) > 0 {
-		sub = strings.ToLower(args[0])
-	}
-	safe := false
-	switch command {
-	case "/status", "/turn", "/approvals":
-		safe = argument == "" || argument == "--json"
-	case "/mcp":
-		safe = sub == "list" && len(args) == 1
-	case "/conversation":
-		safe = sub == "current" || sub == "show" || sub == "new" || sub == "create" || ((sub == "use" || sub == "open" || sub == "switch") && len(args) == 2)
-	case "/workspace":
-		safe = sub == "current" || sub == "show" || sub == "list" || sub == "ls" || ((sub == "use" || sub == "switch") && len(args) >= 2)
-	case "/app":
-		safe = sub == "current" || sub == "show" || sub == "clear" || sub == "unset" || ((sub == "use" || sub == "set") && len(args) >= 2)
-	case "/sync":
-		safe = sub == "status" && len(args) == 1
-	case "/project":
-		safe = (sub == "current" || sub == "list") && len(args) == 1
-	case "/approve", "/reject":
-		safe = len(args) == 1
-	}
-	if !safe {
-		return "", false
-	}
-	line := command
-	if argument != "" {
-		line += " " + argument
-	}
-	return line, true
+	return telegramRemoteSlashLine(command, argument)
 }
 
-func telegramRemoteHelp() string {
-	return strings.TrimSpace(`bacli Telegram commands:
-/ask <prompt> - run one Build Agent turn
-/cancel - cancel the active turn immediately
-/status, /turn - inspect runtime state
-/conversation current|new|use <id> (changes require --telegram-only)
-/workspace current|list|use <name> (changes require --telegram-only)
-/app current|use <scopeId> [name]|clear (changes require --telegram-only)
-/sync status
-/project current|list
-/mcp list
-/approvals, /approve <id>, /reject <id> (decisions require --telegram-only)
-/whoami - show your numeric Telegram user ID
-
-Only private command messages are accepted. Interactive pickers, instance switching, attachment paths, debug/export/support, and destructive sync operations stay local. After a local /instance switch, restart bacli so Telegram can bind to the new profile/client.`)
-}
-
-func telegramPendingSummary(profile string, now time.Time) (telegramState, error) {
-	state, err := readTelegramState(profile)
+func telegramPendingSummary(now time.Time) (telegramState, error) {
+	state, err := readTelegramState()
 	if err != nil {
 		return telegramState{}, err
 	}

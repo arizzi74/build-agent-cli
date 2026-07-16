@@ -18,6 +18,7 @@ import (
 
 const (
 	telegramStateSchemaVersion = 1
+	telegramMaxStateBytes      = 1 << 20
 	telegramPairingTTL         = time.Hour
 	telegramMaxPendingPairings = 3
 	telegramPairingAlphabet    = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -45,8 +46,8 @@ func defaultTelegramState() telegramState {
 	return telegramState{SchemaVersion: telegramStateSchemaVersion}
 }
 
-func telegramStateFile(profile string) string {
-	return filepath.Join(profileDir(profile), "telegram-state.json")
+func telegramStateFile() string {
+	return filepath.Join(telegramDir(), "state.json")
 }
 
 func validTelegramNumericID(id string) bool {
@@ -62,22 +63,33 @@ func validTelegramNumericID(id string) bool {
 	return err == nil && value > 0
 }
 
-func readTelegramState(profile string) (telegramState, error) {
-	path := telegramStateFile(profile)
+func readTelegramState() (telegramState, error) {
+	path := telegramStateFile()
+	if err := validateTelegramStorageDirectory(); err != nil {
+		return telegramState{}, err
+	}
 	if err := rejectSymlinkPath(path); err != nil {
 		return telegramState{}, errors.New("unsafe Telegram state path")
 	}
-	raw, err := os.ReadFile(path)
+	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return defaultTelegramState(), nil
 	}
 	if err != nil {
-		return telegramState{}, errors.New("could not read Telegram state")
+		return telegramState{}, errors.New("could not inspect Telegram state")
 	}
-	if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() {
+	if !info.Mode().IsRegular() {
 		return telegramState{}, errors.New("Telegram state must be a regular file")
-	} else if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		return telegramState{}, errors.New("Telegram state permissions must be 0600")
+	}
+	if info.Size() > telegramMaxStateBytes {
+		return telegramState{}, errors.New("Telegram state exceeds the size limit; access is denied")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return telegramState{}, errors.New("could not read Telegram state")
 	}
 	var state telegramState
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -155,11 +167,11 @@ func validateTelegramState(state *telegramState) error {
 	return nil
 }
 
-func updateTelegramState(profile string, fn func(*telegramState) error) (telegramState, error) {
+func updateTelegramState(fn func(*telegramState) error) (telegramState, error) {
 	var state telegramState
-	err := withProfileLock(profile, "telegram.lock", func() error {
+	err := withTelegramLock(func() error {
 		var err error
-		state, err = readTelegramState(profile)
+		state, err = readTelegramState()
 		if err != nil {
 			return err
 		}
@@ -169,7 +181,7 @@ func updateTelegramState(profile string, fn func(*telegramState) error) (telegra
 		if err := validateTelegramState(&state); err != nil {
 			return err
 		}
-		return privateAtomicWrite(telegramStateFile(profile), state)
+		return privateAtomicWrite(telegramStateFile(), state)
 	})
 	return state, err
 }
@@ -184,10 +196,13 @@ func pruneTelegramPairings(state *telegramState, now time.Time) {
 	state.Pending = pending
 }
 
-func createTelegramPairing(profile, userID, chatID, label string, now time.Time) (string, bool, error) {
+func createTelegramPairing(botID, fingerprint, userID, chatID, label string, now time.Time) (string, bool, error) {
 	var code string
 	created := false
-	_, err := updateTelegramState(profile, func(state *telegramState) error {
+	_, err := updateTelegramState(func(state *telegramState) error {
+		if state.BotID != botID || state.TokenFingerprint != fingerprint {
+			return errors.New("Telegram bot identity changed; restart bacli")
+		}
 		pruneTelegramPairings(state, now)
 		for i := range state.Pending {
 			if state.Pending[i].UserID == userID {
@@ -224,7 +239,7 @@ func newTelegramPairingCode() (string, error) {
 	return string(raw), nil
 }
 
-func approveTelegramPairing(profile, code string, now time.Time) (string, error) {
+func approveTelegramPairing(code string, now time.Time) (string, error) {
 	code = strings.ToUpper(strings.TrimSpace(code))
 	if len(code) != 8 {
 		return "", errors.New("pairing code must be 8 characters")
@@ -235,7 +250,7 @@ func approveTelegramPairing(profile, code string, now time.Time) (string, error)
 		}
 	}
 	var approved string
-	_, err := updateTelegramState(profile, func(state *telegramState) error {
+	_, err := updateTelegramState(func(state *telegramState) error {
 		pruneTelegramPairings(state, now)
 		pending := state.Pending[:0]
 		for _, request := range state.Pending {
@@ -278,8 +293,8 @@ func telegramUserAuthorized(cfg telegramConfig, state telegramState, userID stri
 	return false
 }
 
-func bindTelegramState(profile, botID, fingerprint string) (telegramState, error) {
-	return updateTelegramState(profile, func(state *telegramState) error {
+func bindTelegramState(botID, fingerprint string) (telegramState, error) {
+	return updateTelegramState(func(state *telegramState) error {
 		botChanged := state.BotID != botID
 		tokenChanged := state.TokenFingerprint != fingerprint
 		if botChanged {
@@ -297,8 +312,11 @@ func bindTelegramState(profile, botID, fingerprint string) (telegramState, error
 	})
 }
 
-func recordTelegramUpdate(profile string, updateID int64) error {
-	_, err := updateTelegramState(profile, func(state *telegramState) error {
+func recordTelegramUpdate(botID, fingerprint string, updateID int64) error {
+	_, err := updateTelegramState(func(state *telegramState) error {
+		if state.BotID != botID || state.TokenFingerprint != fingerprint {
+			return errors.New("Telegram bot identity changed; restart bacli")
+		}
 		if updateID > state.LastUpdateID {
 			state.LastUpdateID = updateID
 		}

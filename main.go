@@ -50,6 +50,7 @@ type Options struct {
 	ApplicationIDList   string
 	TurnTimeout         time.Duration
 	TelegramOnly        bool
+	TelegramSetup       bool
 	TelegramStatus      bool
 	TelegramApprove     string
 	Version             bool
@@ -74,6 +75,8 @@ func main() {
 		fatal(fmt.Errorf("could not open debug trace file %q: %w", opts.DebugFile, err))
 	}
 	defer closeDebugOutputLog()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if handled, err := handleInstanceFlags(opts); handled {
 		if err != nil {
 			fatal(err)
@@ -86,7 +89,7 @@ func main() {
 		}
 		return
 	}
-	if handled, err := handleTelegramOfflineFlags(opts); handled {
+	if handled, err := handleTelegramOfflineFlags(ctx, opts); handled {
 		if err != nil {
 			fatal(err)
 		}
@@ -101,9 +104,6 @@ func main() {
 	// Keep the optional bot token out of OAuth/browser, Node/npm, and other child
 	// process environments. The in-memory copy is passed only to the bot client.
 	telegramEnvironmentToken := takeTelegramEnvironmentToken()
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	if err := selectStartupInstance(&opts); err != nil {
 		fatal(err)
@@ -167,15 +167,23 @@ func main() {
 	stopConnectingInput()
 	stopConnectingStatus()
 	cancel()
-	defer func() { _ = client.Close() }()
 	clientRef := newActiveClientRef(client)
+	defer func() {
+		if active := clientRef.Get(); active != nil {
+			_ = active.Close()
+		}
+	}()
 
 	var switchInstance func(context.Context, string) error
 	switchInstance = func(switchCtx context.Context, selector string) error {
-		old := client
+		old := clientRef.Get()
+		if old == nil {
+			return errors.New("active client is unavailable")
+		}
+		_, remoteSwitch := telegramCommandSourceFromContext(switchCtx)
 		wasAppScreen := appScreenEntered
 		restoreOldScreen := func() {
-			if !wasAppScreen {
+			if remoteSwitch || !wasAppScreen {
 				return
 			}
 			if !appScreenEntered && enterTerminalAppScreen() {
@@ -185,13 +193,16 @@ func main() {
 			old.restoreStartupConversationTranscript(status)
 			_ = showTerminalFooterTempMessage(status, startupReadyFooterMessage(), 5*time.Second)
 		}
-		prepare := func(ctx context.Context, candidate *Client) error {
+		prepare := func(authCtx context.Context, candidate *Client) error {
+			if remoteSwitch {
+				return candidate.PrepareConnectionAuthenticationNonInteractive(authCtx)
+			}
 			if wasAppScreen && appScreenEntered {
 				restoreTerminalFooter()
 				leaveTerminalAppScreen()
 				appScreenEntered = false
 			}
-			if err := candidate.PrepareConnectionAuthentication(ctx); err != nil {
+			if err := candidate.PrepareConnectionAuthentication(authCtx); err != nil {
 				return err
 			}
 			if wasAppScreen && enterTerminalAppScreen() {
@@ -202,6 +213,9 @@ func main() {
 		connect := func(ctx context.Context, candidate *Client) error {
 			connectCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer cancel()
+			if remoteSwitch {
+				return candidate.Connect(connectCtx)
+			}
 			stopConnectingStatus := func() {}
 			stopConnectingInput := startConnectingInputCapture(cancel)
 			if appScreenEntered {
@@ -228,7 +242,6 @@ func main() {
 		}
 
 		candidate.instanceSwitch = switchInstance
-		client = candidate
 		clientRef.Set(candidate)
 		candidate.drawPersistentStatus()
 		if wasAppScreen {
@@ -239,14 +252,14 @@ func main() {
 		slashCommandPrintf("switched instance: %s (profile %s)\n", candidate.cfg.InstanceURL, profile)
 		return nil
 	}
-	client.instanceSwitch = switchInstance
+	clientRef.Get().instanceSwitch = switchInstance
 
 	telegram, telegramErr := maybeStartTelegramService(ctx, opts.Profile, clientRef, opts.TurnTimeout, telegramEnvironmentToken)
 	if telegramErr != nil {
 		if opts.TelegramOnly {
 			fatal(telegramErr)
 		}
-		client.printRuntimeError("warning: Telegram channel unavailable: " + telegramErr.Error())
+		clientRef.Get().printRuntimeError("warning: Telegram channel unavailable: " + telegramErr.Error())
 	}
 	if telegram != nil {
 		defer telegram.Close()
@@ -268,29 +281,31 @@ func main() {
 
 	if len(opts.Prompts) > 0 {
 		for _, prompt := range opts.Prompts {
-			if err := runPrompt(ctx, client, prompt, opts.TurnTimeout); err != nil {
+			if _, err := runPromptForActiveClient(ctx, clientRef, prompt, opts.TurnTimeout); err != nil {
 				fatal(err)
 			}
 		}
 		return
 	}
 
-	startupStatus := client.statusBarState()
-	client.restoreStartupConversationTranscript(startupStatus)
+	startupClient := clientRef.Get()
+	startupStatus := startupClient.statusBarState()
+	startupClient.restoreStartupConversationTranscript(startupStatus)
 	showStartupLocalBuildWarning(startupStatus)
 	defer restoreTerminalFooter()
 	if !showTerminalFooterTempMessage(startupStatus, startupReadyFooterMessage(), 5*time.Second) {
 		fmt.Fprintln(os.Stderr, "Type a message. Commands: /help, /instance, /conversation, /mcp, /workspace, /app, /exit, /quit")
 	}
 	for {
-		status := client.statusBarState()
-		line, err := promptCommandLineForClient("ba> ", &status, client)
+		promptClient := clientRef.Get()
+		status := promptClient.statusBarState()
+		line, err := promptCommandLineForClient("ba> ", &status, promptClient)
 		if err != nil {
 			fmt.Fprintln(os.Stderr)
 			return
 		}
 		line = strings.TrimSpace(line)
-		if line == "" && client.pendingAttachmentCount() == 0 {
+		if line == "" && clientRef.Get().pendingAttachmentCount() == 0 {
 			continue
 		}
 		switch strings.ToLower(line) {
@@ -298,10 +313,10 @@ func main() {
 			return
 		}
 		if strings.HasPrefix(line, "/") {
-			handled, err := handleSlashCommandForTerminal(ctx, client, line, status)
+			active, handled, err := handleSlashCommandForActiveClient(ctx, clientRef, line)
 			if err != nil {
 				message := fmt.Sprintf("error: %v", err)
-				if !terminalRecordSystemTextAndAppend("Command", message, status) {
+				if active == nil || !terminalRecordSystemTextAndAppend("Command", message, active.statusBarState()) {
 					fmt.Fprintln(os.Stderr, message)
 				}
 			}
@@ -309,17 +324,26 @@ func main() {
 				continue
 			}
 		}
-		client.printLiveUserTurn(line)
-		capture := startProcessingInputCapture("ba> ", &status, client.cancelActiveTurn)
-		err = runPrompt(ctx, client, line, opts.TurnTimeout)
+		bacliActionMu.Lock()
+		active := clientRef.Get()
+		status = active.statusBarState()
+		active.printLiveUserTurn(line)
+		capture := startProcessingInputCapture("ba> ", &status, func() bool {
+			if current := clientRef.Get(); current != nil {
+				return current.cancelActiveTurn()
+			}
+			return false
+		})
+		_, err = runPromptForResponseLocked(ctx, active, line, opts.TurnTimeout)
 		capture.Stop()
+		bacliActionMu.Unlock()
 		if errors.Is(err, context.Canceled) {
 			clearTerminalFooterTempMessage()
 			if !terminalRecordSystemTextAndAppend("Action", "Cancelled", status) {
 				fmt.Fprintln(os.Stderr, "Action cancelled")
 			}
 		} else if err != nil {
-			client.printRuntimeError(fmt.Sprintf("error: %v", err))
+			active.printRuntimeError(fmt.Sprintf("error: %v", err))
 		}
 	}
 }
@@ -399,7 +423,7 @@ func parseFlags() Options {
 	flag.BoolVar(&opts.InstanceList, "instances", false, "alias for --instance-list")
 	flag.StringVar(&opts.InstanceDelete, "instance-delete", "", "delete configured instance by profile, FQDN, or URL and exit")
 	flag.StringVar(&opts.WSURL, "ws-url", "", "override Build Agent websocket URL")
-	flag.StringVar(&opts.Profile, "profile", "default", "profile name; stores config/token under ~/.ba-cli/profiles/<profile>/")
+	flag.StringVar(&opts.Profile, "profile", "default", "ServiceNow runtime profile; Telegram channel configuration is global")
 	flag.BoolVar(&opts.ProfileList, "profile-list", false, "list configured profiles and exit")
 	flag.StringVar(&opts.ProfileDelete, "profile-delete", "", "delete a named profile and exit; refuses to delete the active --profile")
 	flag.BoolVar(&opts.Setup, "setup", false, "prompt for instance URL and save it to the active profile")
@@ -422,7 +446,8 @@ func parseFlags() Options {
 	flag.BoolVar(&opts.AdvertiseLocalTools, "advertise-local-tools", false, "advertise tools.execute; local tools are mostly not implemented in this first Go version")
 	flag.StringVar(&opts.ApplicationIDList, "application-id-list", "", "comma-separated sys_app ids for Build Agent conversation listing; mirrors the web UI application_id_list query")
 	flag.BoolVar(&opts.TelegramOnly, "telegram-only", false, "run headless with the private Telegram command channel")
-	flag.BoolVar(&opts.TelegramStatus, "telegram-status", false, "show local Telegram pairing/configuration status and exit without connecting")
+	flag.BoolVar(&opts.TelegramSetup, "telegram-setup", false, "configure the global private Telegram channel with a guided wizard and exit")
+	flag.BoolVar(&opts.TelegramStatus, "telegram-status", false, "show global Telegram pairing/configuration status and exit without connecting")
 	flag.StringVar(&opts.TelegramApprove, "telegram-approve", "", "approve a one-hour Telegram pairing code offline and exit")
 	turnTimeout := flag.Duration("turn-timeout", 10*time.Minute, "timeout per agent turn")
 	flag.Usage = func() {

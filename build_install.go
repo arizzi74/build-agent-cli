@@ -87,6 +87,7 @@ func (c *Client) buildInstallProgress(format string, args ...interface{}) {
 	if message == "" {
 		return
 	}
+	c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationBuildProgress, Text: message})
 	c.flushActiveStreamForTerminalInterruption()
 	if terminalRecordSystemTextAndAppend("Build", message, c.statusBarState()) {
 		return
@@ -360,6 +361,12 @@ func (c *Client) recoverCanonicalBuildProject(ctx context.Context, collision *ca
 	var approved bool
 	if c.projectRecoveryApproval != nil {
 		approved, err = c.projectRecoveryApproval(rows, message)
+	} else if answer, handled, interactionErr := c.requestTurnInteraction(ctx, turnInteractionRequest{Kind: "approval", Prompt: message, Rows: rows, Options: []string{"Approve", "Reject"}}); handled {
+		if interactionErr != nil {
+			err = interactionErr
+		} else {
+			approved, err = parseTurnApprovalAnswer(answer)
+		}
 	} else {
 		if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) {
 			return "", codedError{Code: "PROJECT_RECOVERY_NONINTERACTIVE", Message: fmt.Sprintf("Local-project recovery requires an interactive explicit confirmation; nothing was changed. %s", diagnostics.summary())}

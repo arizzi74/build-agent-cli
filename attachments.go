@@ -88,6 +88,10 @@ type attachmentUploadResponse struct {
 }
 
 func (c *Client) addPendingAttachmentFile(path string) (attachmentSummary, error) {
+	return c.addPendingAttachmentFileOwned(path, "local")
+}
+
+func (c *Client) addPendingAttachmentFileOwned(path, owner string) (attachmentSummary, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return attachmentSummary{}, errors.New("attachment path is required")
@@ -117,10 +121,14 @@ func (c *Client) addPendingAttachmentFile(path string) (attachmentSummary, error
 	if len(data) > attachmentMaxFileBytes {
 		return attachmentSummary{}, fmt.Errorf("attachment exceeds the %s per-file limit", formatAttachmentBytes(attachmentMaxFileBytes))
 	}
-	return c.addPendingAttachmentBytes(filepath.Base(path), mime.TypeByExtension(strings.ToLower(filepath.Ext(path))), data)
+	return c.addPendingAttachmentBytesOwned(filepath.Base(path), mime.TypeByExtension(strings.ToLower(filepath.Ext(path))), data, owner)
 }
 
 func (c *Client) addPendingAttachmentBytes(name, mediaType string, data []byte) (attachmentSummary, error) {
+	return c.addPendingAttachmentBytesOwned(name, mediaType, data, "local")
+}
+
+func (c *Client) addPendingAttachmentBytesOwned(name, mediaType string, data []byte, owner string) (attachmentSummary, error) {
 	if c == nil {
 		return attachmentSummary{}, errors.New("attachment client is unavailable")
 	}
@@ -146,6 +154,13 @@ func (c *Client) addPendingAttachmentBytes(name, mediaType string, data []byte) 
 	}
 	c.attachmentsMu.Lock()
 	defer c.attachmentsMu.Unlock()
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		owner = "local"
+	}
+	if len(c.pendingAttachments) > 0 && c.pendingAttachmentOwner != "" && c.pendingAttachmentOwner != owner {
+		return attachmentSummary{}, errors.New("pending attachments belong to another bacli front end; send or clear them there first")
+	}
 	if len(c.pendingAttachments) >= attachmentMaxCount {
 		return attachmentSummary{}, fmt.Errorf("attachment count exceeds the limit of %d", attachmentMaxCount)
 	}
@@ -157,7 +172,37 @@ func (c *Client) addPendingAttachmentBytes(name, mediaType string, data []byte) 
 		return attachmentSummary{}, fmt.Errorf("attachments exceed the %s total limit", formatAttachmentBytes(attachmentMaxTotalBytes))
 	}
 	c.pendingAttachments = append(c.pendingAttachments, item)
+	c.pendingAttachmentOwner = owner
 	return summarizePendingAttachment(item), nil
+}
+
+func telegramPendingAttachmentOwner(chatID, userID string) string {
+	return "telegram:" + chatID + ":" + userID
+}
+
+func attachmentCommandOwner(ctx context.Context) string {
+	if source, ok := telegramCommandSourceFromContext(ctx); ok {
+		return telegramPendingAttachmentOwner(source.ChatID, source.UserID)
+	}
+	return "local"
+}
+
+func (c *Client) requirePendingAttachmentOwner(owner string) error {
+	if c == nil {
+		return errors.New("attachment client is unavailable")
+	}
+	c.attachmentsMu.Lock()
+	defer c.attachmentsMu.Unlock()
+	if len(c.pendingAttachments) == 0 {
+		return nil
+	}
+	if c.pendingAttachmentOwner == "" {
+		c.pendingAttachmentOwner = "local"
+	}
+	if c.pendingAttachmentOwner != strings.TrimSpace(owner) {
+		return errors.New("pending attachments belong to another bacli front end; send or clear them there first")
+	}
+	return nil
 }
 
 func normalizedAttachmentMediaType(provided, name string, data []byte) string {
@@ -241,6 +286,9 @@ func (c *Client) removePendingAttachment(ctx context.Context, selector string) (
 	last := len(c.pendingAttachments) - 1
 	c.pendingAttachments[last] = pendingAttachment{}
 	c.pendingAttachments = c.pendingAttachments[:last]
+	if len(c.pendingAttachments) == 0 {
+		c.pendingAttachmentOwner = ""
+	}
 	// Removing an item explicitly abandons any partially persisted attachment
 	// turn locally. The remote row/attachment may remain because the HAR does
 	// not establish safe delete semantics.
@@ -602,6 +650,9 @@ func (c *Client) consumePendingAttachments(items []pendingAttachment) {
 		all[i] = pendingAttachment{}
 	}
 	c.pendingAttachments = kept
+	if len(c.pendingAttachments) == 0 {
+		c.pendingAttachmentOwner = ""
+	}
 	c.pendingAttachmentMessageKey = ""
 	c.pendingAttachmentMessageSysID = ""
 	c.pendingAttachmentMessageContent = ""
@@ -809,6 +860,14 @@ func handleAttachmentCommand(ctx context.Context, c *Client, args []string) erro
 	if c == nil {
 		return errors.New("attachment client is unavailable")
 	}
+	owner := attachmentCommandOwner(ctx)
+	clearAllOwners := len(args) == 1 && strings.EqualFold(args[0], "clear-all")
+	clearAllOwners = clearAllOwners || (len(args) == 2 && strings.EqualFold(args[0], "clear") && strings.EqualFold(args[1], "all"))
+	if !clearAllOwners {
+		if err := c.requirePendingAttachmentOwner(owner); err != nil {
+			return err
+		}
+	}
 	if len(args) == 0 || strings.EqualFold(args[0], "list") {
 		items := c.pendingAttachmentSummaries()
 		if len(items) == 0 {
@@ -830,7 +889,7 @@ func handleAttachmentCommand(ctx context.Context, c *Client, args []string) erro
 		if len(args) < 2 {
 			return errors.New("usage: /attach add <path>")
 		}
-		item, err := c.addPendingAttachmentFile(attachmentCommandPath(args[1:]))
+		item, err := c.addPendingAttachmentFileOwned(attachmentCommandPath(args[1:]), owner)
 		if err != nil {
 			return err
 		}
@@ -843,7 +902,7 @@ func handleAttachmentCommand(ctx context.Context, c *Client, args []string) erro
 		if err != nil {
 			return err
 		}
-		item, err := c.addPendingAttachmentBytes(name, mediaType, data)
+		item, err := c.addPendingAttachmentBytesOwned(name, mediaType, data, owner)
 		if err != nil {
 			return err
 		}
@@ -862,8 +921,8 @@ func handleAttachmentCommand(ctx context.Context, c *Client, args []string) erro
 			slashCommandPrintln("warning: it was already uploaded; the remote attachment was not deleted")
 		}
 		return nil
-	case "clear":
-		if len(args) != 1 {
+	case "clear", "clear-all":
+		if !clearAllOwners && len(args) != 1 {
 			return errors.New("usage: /attach clear")
 		}
 		items := c.pendingAttachmentSummaries()
@@ -872,6 +931,9 @@ func handleAttachmentCommand(ctx context.Context, c *Client, args []string) erro
 			return err
 		}
 		slashCommandPrintf("cleared attachments: %d\n", removed)
+		if clearAllOwners {
+			slashCommandPrintln("cleared the host-wide pending attachment queue, regardless of front-end owner")
+		}
 		for _, item := range items {
 			if item.Uploaded {
 				slashCommandPrintln("warning: one or more items were already uploaded; remote attachments were not deleted")
@@ -880,11 +942,12 @@ func handleAttachmentCommand(ctx context.Context, c *Client, args []string) erro
 		}
 		return nil
 	case "help":
-		slashCommandPrintln("usage: /attach [list|add <path>|paste|remove <number|id|filename>|clear]")
+		slashCommandPrintln("usage: /attach [list|add <path>|paste|remove <number|id|filename>|clear|clear-all]")
+		slashCommandPrintln("/attach clear-all explicitly purges an abandoned queue owned by any front end.")
 		slashCommandPrintln("On macOS, Ctrl-V or /attach paste reads an image from the local clipboard.")
 		return nil
 	default:
-		return errors.New("usage: /attach [list|add <path>|paste|remove <number|id|filename>|clear]")
+		return errors.New("usage: /attach [list|add <path>|paste|remove <number|id|filename>|clear|clear-all]")
 	}
 }
 

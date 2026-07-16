@@ -127,6 +127,29 @@ func (c *Client) configureGatewayAuth(ctx context.Context) error {
 	}
 }
 
+func (c *Client) configureGatewayAuthNonInteractive(ctx context.Context) error {
+	mode, err := normalizeAuthMode(c.opts.AuthMode)
+	if err != nil {
+		return err
+	}
+	if mode == authModeBasic {
+		return errors.New("basic authentication requires a host-terminal password prompt")
+	}
+	session, ok := loadMatchingWebSession(c.opts.Profile, c.cfg.InstanceURL)
+	if !ok {
+		return errors.New("no matching saved web session")
+	}
+	if err := c.initGatewayHTTPClient(); err != nil {
+		return err
+	}
+	c.gatewayAuth = mode
+	c.applyWebSession(session)
+	if err := c.validateWebSession(ctx); err != nil {
+		return fmt.Errorf("saved web session validation failed: %w", err)
+	}
+	return nil
+}
+
 func (c *Client) configureBasicAuth() error {
 	if c.basicUser == "" {
 		if c.opts.BasicUser != "" {
