@@ -483,7 +483,10 @@ func (c *Client) loadWebWorkspaceContent(ctx context.Context, ws *WebWorkspace) 
 	}
 	content := contents[ws.Checksum]
 	if len(content) == 0 && len(contents) == 1 {
-		for _, one := range contents {
+		for checksum, one := range contents {
+			if strings.TrimSpace(checksum) != "" {
+				ws.Checksum = strings.TrimSpace(checksum)
+			}
 			content = one
 		}
 	}

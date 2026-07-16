@@ -86,7 +86,7 @@ func (c *Client) ListWorkspaceAppChoices(ctx context.Context) ([]AppChoice, erro
 }
 
 func (c *Client) ensureWorkspaceFoldersForAppPicker(ctx context.Context) error {
-	if len(c.workspaceFolders) > 0 || strings.TrimSpace(c.workspaceURI) == "" || !c.canUseWebWorkspaceAPI() {
+	if strings.TrimSpace(c.workspaceURI) == "" || !c.canUseWebWorkspaceAPI() {
 		return nil
 	}
 	ws := WebWorkspace{
@@ -99,10 +99,26 @@ func (c *Client) ensureWorkspaceFoldersForAppPicker(ctx context.Context) error {
 	if err := c.loadWebWorkspaceContent(ctx, &ws); err != nil {
 		return err
 	}
+	if c.workspaceChecksum == ws.Checksum && c.workspaceDescription == ws.Description && sameWebWorkspaceFolders(c.workspaceFolders, ws.Folders) {
+		return nil
+	}
+	c.workspaceChecksum = ws.Checksum
 	c.workspaceDescription = ws.Description
 	c.workspaceFolders = append([]WebWorkspaceFolder(nil), ws.Folders...)
 	c.workingSet = nil
 	return c.saveCurrentState()
+}
+
+func sameWebWorkspaceFolders(left, right []WebWorkspaceFolder) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].Name != right[i].Name || left[i].URI != right[i].URI {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) appChoicesFromWorkspaceFolders(folders []WebWorkspaceFolder) []AppChoice {
