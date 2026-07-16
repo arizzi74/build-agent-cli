@@ -42,13 +42,14 @@ const (
 )
 
 type persistentSyncResult struct {
-	LocalDir    string
-	Pulled      []string
-	Pushed      []string
-	Deleted     []string
-	Conflicts   []string
-	Unchanged   int
-	PendingPush []string
+	LocalDir        string
+	NotMaterialized bool
+	Pulled          []string
+	Pushed          []string
+	Deleted         []string
+	Conflicts       []string
+	Unchanged       int
+	PendingPush     []string
 }
 
 // canonicalProjectCollisionError makes the distinction between a recoverable
@@ -683,6 +684,10 @@ func (c *Client) syncPersistentAppForBuildNamedLocked(ctx context.Context, appID
 	if appID == "" || rootURI == "" {
 		return persistentSyncResult{}, nil, errors.New("persistent local project requires an app id and Glider root URI")
 	}
+	if mode == persistentSyncStatus {
+		result, err := c.inspectPersistentAppStatus(ctx, appID, appName, rootURI)
+		return result, nil, err
+	}
 	resolution, err := c.resolvePersistentProject(appID, appName, rootURI, true)
 	if err != nil {
 		return persistentSyncResult{}, nil, err
@@ -740,6 +745,43 @@ func (c *Client) syncPersistentAppForBuildNamedLocked(ctx context.Context, appID
 	return result, cleanup, nil
 }
 
+// inspectPersistentAppStatus compares an existing checkout without running any
+// materializing resolver, migration, registry write, or canonical-directory
+// creation. When no checkout exists, the remote tree is compared with an empty
+// local baseline and the expected path is reported without claiming it.
+func (c *Client) inspectPersistentAppStatus(ctx context.Context, appID, appName, rootURI string) (persistentSyncResult, error) {
+	resolution, err := c.resolveExistingPersistentProject(appID, appName, rootURI)
+	if err == nil {
+		unlock, lockErr := acquirePersistentProjectLock(ctx, resolution.Dir)
+		if lockErr != nil {
+			return persistentSyncResult{}, lockErr
+		}
+		defer unlock()
+		return c.syncPersistentAppAtLocked(ctx, resolution.Dir, appID, rootURI, persistentSyncStatus)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return persistentSyncResult{}, err
+	}
+
+	projectDir, err := c.persistentProjectDirForAppNamed(appID, appName)
+	if err != nil {
+		return persistentSyncResult{}, err
+	}
+	instanceURL, normalizedAppID := c.projectRegistryIdentity(appID)
+	if err := canonicalProjectCollision(projectDir, instanceURL, normalizedAppID, rootURI); err != nil {
+		return persistentSyncResult{}, err
+	}
+	_, remoteFiles, err := c.fetchPersistentRemoteFiles(ctx, rootURI)
+	if err != nil {
+		return persistentSyncResult{}, err
+	}
+	return persistentSyncResult{
+		LocalDir:        projectDir,
+		NotMaterialized: true,
+		Pulled:          sortedContentKeys(remoteFiles),
+	}, nil
+}
+
 func acquirePersistentProjectLock(ctx context.Context, projectDir string) (func(), error) {
 	lockDir := filepath.Join(projectDir, persistentSyncDirName)
 	if err := ensurePersistentProjectRoot(lockDir); err != nil {
@@ -790,13 +832,11 @@ func (c *Client) syncPersistentAppAtLocked(ctx context.Context, projectDir, appI
 		if err != nil {
 			return persistentSyncResult{}, err
 		}
-		nonSyncEntries := 0
-		for _, entry := range entries {
-			if entry.Name() != persistentSyncDirName {
-				nonSyncEntries++
-			}
+		lockOnly, inspectErr := persistentProjectContainsOnlyOrphanLock(projectDir, entries)
+		if inspectErr != nil {
+			return persistentSyncResult{}, inspectErr
 		}
-		if nonSyncEntries != 0 {
+		if !lockOnly {
 			return persistentSyncResult{}, errors.New("local app folder has no sync manifest; refusing to claim an existing named folder")
 		}
 	}
@@ -970,7 +1010,10 @@ func (c *Client) syncPersistentAppAtLocked(ctx context.Context, projectDir, appI
 
 // canonicalProjectCollision checks whether a canonical target can safely be
 // created or used for this exact project. It never claims nonempty or foreign
-// directories, including directories with a stale or malformed manifest.
+// directories, including directories with a stale or malformed manifest. The
+// sole manifestless exception is the exact lock-only residue produced by older
+// `/sync status` versions before a checkout was materialized; it contains no
+// project or ownership data and is revalidated after the lock is acquired.
 func canonicalProjectCollision(targetDir, instanceURL, appID, rootURI string) error {
 	info, err := os.Lstat(targetDir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -997,9 +1040,38 @@ func canonicalProjectCollision(targetDir, instanceURL, appID, rootURI string) er
 		return err
 	}
 	if len(entries) != 0 {
+		lockOnly, inspectErr := persistentProjectContainsOnlyOrphanLock(targetDir, entries)
+		if inspectErr != nil {
+			return inspectErr
+		}
+		if lockOnly {
+			return nil
+		}
 		return &canonicalProjectCollisionError{Target: targetDir, Reason: "existing nonempty directory has no matching sync manifest", Recoverable: true}
 	}
 	return nil
+}
+
+func persistentProjectContainsOnlyOrphanLock(targetDir string, entries []os.DirEntry) (bool, error) {
+	if len(entries) != 1 || entries[0].Name() != persistentSyncDirName || entries[0].Type()&os.ModeSymlink != 0 || !entries[0].IsDir() {
+		return false, nil
+	}
+	metadataDir := filepath.Join(targetDir, persistentSyncDirName)
+	metadataEntries, err := os.ReadDir(metadataDir)
+	if err != nil {
+		return false, err
+	}
+	if len(metadataEntries) == 0 {
+		return true, nil
+	}
+	if len(metadataEntries) != 1 || metadataEntries[0].Name() != "project.lock" || metadataEntries[0].Type()&os.ModeSymlink != 0 {
+		return false, nil
+	}
+	info, err := metadataEntries[0].Info()
+	if err != nil {
+		return false, err
+	}
+	return info.Mode().IsRegular() && info.Size() == 0, nil
 }
 
 // migratePersistentProject moves a verified checkout into the canonical target
@@ -1201,8 +1273,19 @@ func sortedContentKeys(files map[string][]byte) []string {
 	return keys
 }
 
-func formatPersistentSyncResult(result persistentSyncResult) string {
-	parts := []string{fmt.Sprintf("local project: %s", result.LocalDir)}
+func formatPersistentSyncResult(result persistentSyncResult, mode persistentSyncMode) string {
+	localProject := result.LocalDir
+	if result.NotMaterialized {
+		localProject = fmt.Sprintf("not materialized (expected: %s)", result.LocalDir)
+	}
+	parts := []string{fmt.Sprintf("local project: %s", localProject)}
+	if mode == persistentSyncStatus {
+		parts = append(parts, fmt.Sprintf("pending pull: %d", len(result.Pulled)), fmt.Sprintf("pending push: %d", len(result.PendingPush)), fmt.Sprintf("unchanged: %d", result.Unchanged))
+		if len(result.Conflicts) > 0 {
+			parts = append(parts, fmt.Sprintf("conflicts: %s", strings.Join(result.Conflicts, ", ")))
+		}
+		return strings.Join(parts, "\n")
+	}
 	parts = append(parts, fmt.Sprintf("pulled: %d", len(result.Pulled)), fmt.Sprintf("pushed: %d", len(result.Pushed)), fmt.Sprintf("deleted: %d", len(result.Deleted)), fmt.Sprintf("unchanged: %d", result.Unchanged))
 	if len(result.Conflicts) > 0 {
 		parts = append(parts, fmt.Sprintf("conflicts: %s", strings.Join(result.Conflicts, ", ")))
@@ -1230,7 +1313,7 @@ func handleSyncCommand(ctx context.Context, c *Client, args []string) error {
 	}
 	result, err := c.syncPersistentApp(ctx, mode)
 	if result.LocalDir != "" {
-		slashCommandPrintln(formatPersistentSyncResult(result))
+		slashCommandPrintln(formatPersistentSyncResult(result, mode))
 	}
 	return err
 }
