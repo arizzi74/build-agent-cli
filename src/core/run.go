@@ -260,7 +260,11 @@ func Run() {
 		if opts.TelegramOnly {
 			fatal(telegramErr)
 		}
-		clientRef.Get().printRuntimeError("warning: Telegram channel unavailable: " + telegramErr.Error())
+		if errors.Is(telegramErr, errTelegramChannelInUse) {
+			showTelegramChannelInUseWarning(clientRef.Get().statusBarState())
+		} else {
+			clientRef.Get().printRuntimeError("warning: Telegram channel unavailable: " + telegramErr.Error())
+		}
 	}
 	if telegram != nil {
 		defer telegram.Close()

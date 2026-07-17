@@ -45,6 +45,12 @@ type telegramService struct {
 	pendingInteraction *telegramPendingInteraction
 }
 
+// errTelegramChannelInUse is returned only when the per-bot polling lock is
+// held. That lock is retained for the lifetime of an active Telegram service,
+// so contention means another local bacli instance is currently using the
+// same configured bot channel.
+var errTelegramChannelInUse = errors.New("another bacli instance is using this Telegram channel")
+
 func maybeStartTelegramService(parent context.Context, profile string, clients *activeClientRef, timeout time.Duration, environmentToken string) (*telegramService, error) {
 	if !isValidProfile(profile) {
 		return nil, fmt.Errorf("invalid profile %q", profile)
@@ -148,9 +154,26 @@ func acquireTelegramPollerLock(fingerprint string) (*os.File, error) {
 	}
 	if !locked {
 		_ = file.Close()
-		return nil, errors.New("another bacli process is already polling this Telegram bot")
+		return nil, errTelegramChannelInUse
 	}
 	return file, nil
+}
+
+// showTelegramChannelInUseWarning distinguishes an active-channel conflict
+// from ordinary Telegram startup failures. It is persistent in the terminal
+// transcript because this process deliberately continues without a Telegram
+// service for the remainder of its lifetime.
+func showTelegramChannelInUseWarning(status statusBarState) {
+	const title = "Telegram channel warning"
+	const message = "Another bacli instance is using this Telegram channel. This instance will continue without Telegram."
+	if terminalRecordPersistentWarningTextAndAppend(title, message, status) {
+		return
+	}
+	if terminalStatusANSIEnabled() {
+		fmt.Fprintf(os.Stderr, "%s%s%s\n%s%s%s\n", ansiYellow+ansiBold, title, ansiReset, ansiYellow, message, ansiReset)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s\n%s\n", title, message)
 }
 
 func (s *telegramService) Close() {
