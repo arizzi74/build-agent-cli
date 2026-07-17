@@ -150,7 +150,7 @@ func telegramRemoteSlashLine(command, argument string) (string, bool) {
 
 func telegramRemoteHelp(c *Client) string {
 	var out strings.Builder
-	out.WriteString("Send any private text message to run a Build Agent turn; /ask remains a compatibility alias.\n")
+	out.WriteString("Send any private text message to run a Build Agent turn.\n")
 	out.WriteString("/cancel cancels your active turn. Replies to an interview or approval are accepted directly while it is waiting.\n\n")
 	out.WriteString("BACLI commands:\n")
 	for _, command := range slashCommandRegistry {

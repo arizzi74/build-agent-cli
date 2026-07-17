@@ -23,7 +23,31 @@ type telegramSetupWizardIO struct {
 	Secret      func(string) (string, error)
 	Confirm     func(string, bool) (bool, error)
 	VerifyBot   func(context.Context, string) (telegramUser, error)
+	PairUser    func(context.Context, telegramSetupPairingRequest) (telegramSetupPairingResult, error)
 	Output      io.Writer
+}
+
+const (
+	telegramSetupPairingTimeout     = 2 * time.Minute
+	telegramSetupPairingPollSeconds = 10
+	telegramSetupConfirmTimeout     = 15 * time.Second
+)
+
+type telegramSetupPairingRequest struct {
+	Token       string
+	BotID       string
+	Fingerprint string
+	Challenge   string
+}
+
+type telegramSetupPairingResult struct {
+	UserID string
+}
+
+type telegramSetupPairingAPI interface {
+	deleteWebhook(context.Context) error
+	getUpdates(context.Context, int64, int) ([]telegramUpdate, error)
+	sendText(context.Context, string, string) error
 }
 
 var errTelegramSetupCanceled = errors.New("Telegram setup canceled")
@@ -56,7 +80,8 @@ func defaultTelegramSetupWizardIO(ctx context.Context) telegramSetupWizardIO {
 			defer cancel()
 			return newTelegramAPI(token).getMe(verifyCtx)
 		},
-		Output: os.Stderr,
+		PairUser: waitForTelegramSetupPairing,
+		Output:   os.Stderr,
 	}
 }
 
@@ -218,6 +243,80 @@ func confirmTelegramWizardTTY(ctx context.Context, prompt string, defaultYes boo
 	}
 }
 
+func waitForTelegramSetupPairing(ctx context.Context, request telegramSetupPairingRequest) (telegramSetupPairingResult, error) {
+	if err := validateTelegramToken(request.Token); err != nil ||
+		telegramTokenFingerprint(request.Token) != request.Fingerprint ||
+		!validTelegramNumericID(request.BotID) ||
+		!strings.HasPrefix(request.Token, request.BotID+":") ||
+		!validTelegramSetupChallenge(request.Challenge) {
+		return telegramSetupPairingResult{}, errors.New("invalid Telegram setup pairing request")
+	}
+	return waitForTelegramSetupPairingWithAPI(ctx, newTelegramAPI(request.Token), request)
+}
+
+// waitForTelegramSetupPairingWithAPI is an authorization-only polling loop.
+// It never dispatches commands: every observed update is consumed durably, and
+// authority is granted only when the fresh local challenge arrives from a
+// non-bot sender in that sender's numeric private chat.
+func waitForTelegramSetupPairingWithAPI(ctx context.Context, api telegramSetupPairingAPI, request telegramSetupPairingRequest) (telegramSetupPairingResult, error) {
+	if api == nil {
+		return telegramSetupPairingResult{}, errors.New("Telegram setup pairing is unavailable")
+	}
+	state, err := readTelegramState()
+	if err != nil {
+		return telegramSetupPairingResult{}, err
+	}
+	if state.BotID != request.BotID || state.TokenFingerprint != request.Fingerprint {
+		return telegramSetupPairingResult{}, errors.New("Telegram bot identity changed; restart setup")
+	}
+	offset := state.LastUpdateID + 1
+	if err := api.deleteWebhook(ctx); err != nil {
+		return telegramSetupPairingResult{}, fmt.Errorf("Telegram webhook cleanup failed: %w", err)
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return telegramSetupPairingResult{}, err
+		}
+		updates, err := api.getUpdates(ctx, offset, telegramSetupPairingPollSeconds)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return telegramSetupPairingResult{}, ctxErr
+			}
+			return telegramSetupPairingResult{}, err
+		}
+		for _, update := range updates {
+			if update.UpdateID < offset {
+				continue
+			}
+			nextOffset := update.UpdateID + 1
+			message := update.Message
+			matches := false
+			userID := ""
+			if message != nil && message.From != nil && !message.From.IsBot && message.Chat.Type == "private" {
+				userID = telegramID(message.From.ID)
+				chatID := telegramID(message.Chat.ID)
+				matches = validTelegramNumericID(userID) && validTelegramNumericID(chatID) && userID == chatID && strings.TrimSpace(message.Text) == request.Challenge
+			}
+			if matches {
+				if err := approveTelegramSetupSender(request.BotID, request.Fingerprint, userID, update.UpdateID); err != nil {
+					return telegramSetupPairingResult{}, err
+				}
+				confirmCtx, cancel := context.WithTimeout(ctx, telegramSetupConfirmTimeout)
+				_ = api.sendText(confirmCtx, userID, "Pairing confirmed for bacli on this machine.")
+				cancel()
+				return telegramSetupPairingResult{UserID: userID}, nil
+			}
+			// Consume before observing another update. The setup poller has no
+			// command dispatcher, so unrelated messages cannot cause effects.
+			if err := recordTelegramUpdate(request.BotID, request.Fingerprint, update.UpdateID); err != nil {
+				return telegramSetupPairingResult{}, err
+			}
+			offset = nextOffset
+		}
+	}
+}
+
 func runTelegramSetupWizard(ctx context.Context, wizard telegramSetupWizardIO) error {
 	if wizard.Line == nil || wizard.Secret == nil || wizard.Confirm == nil || wizard.VerifyBot == nil {
 		return errors.New("Telegram setup is unavailable")
@@ -238,7 +337,8 @@ func runTelegramSetupWizard(ctx context.Context, wizard telegramSetupWizardIO) e
 	if _, _, err := resolveTelegramTokenWithEnvironment(existing, ""); err != nil {
 		return fmt.Errorf("existing global Telegram token cannot be read safely: %w", err)
 	}
-	if _, err := readTelegramState(); err != nil {
+	existingState, err := readTelegramState()
+	if err != nil {
 		return fmt.Errorf("existing global Telegram authorization state cannot be read safely: %w", err)
 	}
 
@@ -310,21 +410,46 @@ func runTelegramSetupWizard(ctx context.Context, wizard telegramSetupWizardIO) e
 
 	policy := telegramPolicyPairing
 	var allowFrom []string
+	if existingConfig && existingState.BotID == botID {
+		allowFrom = append([]string(nil), existing.AllowFrom...)
+		if existing.DMPolicy == telegramPolicyPairing || existing.DMPolicy == telegramPolicyAllowlist {
+			policy = existing.DMPolicy
+		}
+	}
 	for {
-		answer, lineErr := wizard.Line("Access policy [pairing/allowlist] (pairing): ")
+		answer, lineErr := wizard.Line(fmt.Sprintf("Access policy [pairing/allowlist] (%s): ", policy))
 		if lineErr != nil {
 			return fmt.Errorf("Telegram setup canceled: %w", lineErr)
 		}
 		answer = strings.ToLower(strings.TrimSpace(answer))
-		if answer == "" || answer == telegramPolicyPairing || answer == "p" {
+		if answer == "" {
+			if policy == telegramPolicyAllowlist && len(allowFrom) == 0 {
+				var err error
+				allowFrom, err = promptTelegramAllowlist(wizard, nil)
+				if err != nil {
+					if errors.Is(err, errTelegramSetupBack) {
+						policy = telegramPolicyPairing
+						continue
+					}
+					if errors.Is(err, errTelegramSetupCanceled) {
+						fmt.Fprintln(out, "Telegram setup canceled; no configuration was changed.")
+						return nil
+					}
+					return err
+				}
+			}
+			break
+		}
+		if answer == telegramPolicyPairing || answer == "p" {
 			policy = telegramPolicyPairing
 			break
 		}
 		if answer == telegramPolicyAllowlist || answer == "a" {
 			policy = telegramPolicyAllowlist
-			allowFrom, err = promptTelegramAllowlist(wizard)
+			allowFrom, err = promptTelegramAllowlist(wizard, allowFrom)
 			if err != nil {
 				if errors.Is(err, errTelegramSetupBack) {
+					policy = telegramPolicyPairing
 					continue
 				}
 				if errors.Is(err, errTelegramSetupCanceled) {
@@ -347,11 +472,11 @@ func runTelegramSetupWizard(ctx context.Context, wizard telegramSetupWizardIO) e
 	fmt.Fprintf(out, "  bot: %s (ID %s)\n", botLabel, botID)
 	fmt.Fprintln(out, "  scope: global across all bacli profiles")
 	fmt.Fprintf(out, "  private-DM policy: %s\n", policy)
-	if policy == telegramPolicyAllowlist {
-		fmt.Fprintf(out, "  allowed numeric user IDs: %s\n", strings.Join(allowFrom, ", "))
+	if len(allowFrom) > 0 {
+		fmt.Fprintf(out, "  explicitly allowed numeric user IDs: %s\n", strings.Join(allowFrom, ", "))
 	}
 	fmt.Fprintln(out, "  token storage: private global file (token value is never displayed)")
-	fmt.Fprintln(out, "  startup effect: bacli removes any existing Telegram webhook; use a dedicated bot")
+	fmt.Fprintln(out, "  pairing/startup effect: bacli removes any existing Telegram webhook; use a dedicated bot")
 	fmt.Fprintln(out, "  routing: run only one poller; its selected --profile is the ServiceNow context the bot controls")
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("Telegram setup canceled: %w", err)
@@ -388,12 +513,72 @@ func runTelegramSetupWizard(ctx context.Context, wizard telegramSetupWizardIO) e
 	}
 
 	fmt.Fprintf(out, "Telegram configured globally for %s.\n", botLabel)
-	fmt.Fprintln(out, "Start the bot bridge: bacli --telegram-only --profile <ServiceNow-profile>")
+	pairedNow := false
 	if policy == telegramPolicyPairing {
-		fmt.Fprintln(out, "In Telegram send /start, then approve its one-hour code locally: bacli --telegram-approve <code>")
+		pairedNow = offerImmediateTelegramSetupPairing(ctx, wizard, telegramSetupPairingRequest{
+			Token: token, BotID: botID, Fingerprint: fingerprint,
+		}, botLabel, len(cfg.AllowFrom) == 0)
+		if !pairedNow {
+			fmt.Fprintln(out, "Later, start the bot bridge, send /start in Telegram, then approve its new one-hour code locally: bacli --telegram-approve <code>")
+		}
 	}
+	fmt.Fprintln(out, "Start the bot bridge: bacli --telegram-only --profile <ServiceNow-profile>")
 	fmt.Fprintln(out, "Inspect the global channel at any time: bacli --telegram-status")
 	return nil
+}
+
+func offerImmediateTelegramSetupPairing(ctx context.Context, wizard telegramSetupWizardIO, request telegramSetupPairingRequest, botLabel string, defaultYes bool) bool {
+	if wizard.PairUser == nil {
+		return false
+	}
+	state, err := readTelegramState()
+	if err != nil {
+		fmt.Fprintln(wizard.Output, "Immediate Telegram pairing is unavailable; the saved configuration remains active.")
+		return false
+	}
+	if len(state.Approved) > 0 {
+		defaultYes = false
+	}
+	pairNow, err := wizard.Confirm("Pair a Telegram user on this machine now?", defaultYes)
+	if err != nil {
+		fmt.Fprintln(wizard.Output, "Immediate Telegram pairing was canceled; the saved configuration remains active.")
+		return false
+	}
+	if !pairNow {
+		fmt.Fprintln(wizard.Output, "Immediate Telegram pairing skipped; the saved configuration remains active.")
+		return false
+	}
+	challenge, err := newTelegramSetupChallenge()
+	if err != nil {
+		fmt.Fprintln(wizard.Output, "A Telegram pairing challenge could not be generated; the saved configuration remains active.")
+		return false
+	}
+	request.Challenge = challenge
+	fmt.Fprintln(wizard.Output, "")
+	fmt.Fprintf(wizard.Output, "Open the private chat with %s, press Start if Telegram asks, then send this exact one-line message:\n", botLabel)
+	fmt.Fprintf(wizard.Output, "  %s\n", challenge)
+	fmt.Fprintf(wizard.Output, "Waiting up to %s for that private Telegram message. Press Ctrl-C to stop waiting.\n", telegramSetupPairingTimeout.Round(time.Second))
+	pairCtx, cancel := context.WithTimeout(ctx, telegramSetupPairingTimeout)
+	result, pairErr := wizard.PairUser(pairCtx, request)
+	cancel()
+	if pairErr != nil {
+		if errors.Is(pairErr, context.DeadlineExceeded) {
+			fmt.Fprintln(wizard.Output, "Immediate Telegram pairing timed out; the saved configuration remains active.")
+		} else if errors.Is(pairErr, context.Canceled) {
+			fmt.Fprintln(wizard.Output, "Immediate Telegram pairing was canceled; the saved configuration remains active.")
+		} else if apiErr := new(telegramAPIError); errors.As(pairErr, &apiErr) && apiErr.Code == 409 {
+			fmt.Fprintln(wizard.Output, "Telegram reports another poller for this bot. Stop bacli on the old machine and rerun setup; the saved configuration remains active.")
+		} else {
+			fmt.Fprintln(wizard.Output, "Immediate Telegram pairing could not be completed; the saved configuration remains active.")
+		}
+		return false
+	}
+	if !validTelegramNumericID(result.UserID) {
+		fmt.Fprintln(wizard.Output, "Immediate Telegram pairing returned an invalid identity; the saved configuration remains active.")
+		return false
+	}
+	fmt.Fprintf(wizard.Output, "Telegram user %s is paired on this machine.\n", result.UserID)
+	return true
 }
 
 func readTelegramSetupSnapshot() (telegramSetupSnapshot, error) {
@@ -418,11 +603,18 @@ func readTelegramSetupSnapshot() (telegramSetupSnapshot, error) {
 	return snapshot, err
 }
 
-func promptTelegramAllowlist(wizard telegramSetupWizardIO) ([]string, error) {
+func promptTelegramAllowlist(wizard telegramSetupWizardIO, existing []string) ([]string, error) {
 	for {
-		line, err := wizard.Line("Numeric Telegram user IDs (comma or space separated; type back to choose pairing first): ")
+		prompt := "Numeric Telegram user IDs (comma or space separated; type back to choose pairing first): "
+		if len(existing) > 0 {
+			prompt = fmt.Sprintf("Numeric Telegram user IDs (Enter keeps %s; type back to choose pairing first): ", strings.Join(existing, ", "))
+		}
+		line, err := wizard.Line(prompt)
 		if err != nil {
 			return nil, fmt.Errorf("Telegram setup canceled: %w", err)
+		}
+		if strings.TrimSpace(line) == "" && len(existing) > 0 {
+			return append([]string(nil), existing...), nil
 		}
 		if strings.EqualFold(strings.TrimSpace(line), "q") || strings.EqualFold(strings.TrimSpace(line), "quit") {
 			return nil, errTelegramSetupCanceled
@@ -547,8 +739,16 @@ func commitTelegramSetup(cfg telegramConfig, token, botID, fingerprint string, b
 			state.BotID = botID
 			state.TokenFingerprint = fingerprint
 		} else {
+			tokenChanged := state.TokenFingerprint != fingerprint
 			state.TokenFingerprint = fingerprint
-			state.Pending = nil
+			// Exact-token pairing setup is a local configuration refresh, so
+			// its still-valid pending requests remain usable. A token rotation
+			// or leaving pairing policy invalidates them.
+			if tokenChanged || cfg.DMPolicy != telegramPolicyPairing {
+				state.Pending = nil
+			} else {
+				pruneTelegramPairings(&state, time.Now().UTC())
+			}
 		}
 		if err := validateTelegramState(&state); err != nil {
 			return err

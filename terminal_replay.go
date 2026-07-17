@@ -277,6 +277,12 @@ func terminalAppendRowsToScrollback(rows []string, status statusBarState) bool {
 	}
 	terminalRenderMu.Lock()
 	defer terminalRenderMu.Unlock()
+	// Modal pickers own the whole physical screen. The semantic entry has already
+	// been recorded above; leave it untouched here and let picker teardown replay
+	// the managed transcript once the overlay is gone.
+	if deferTerminalReplayWhilePickerActive() {
+		return true
+	}
 	beginTerminalFrame()
 	defer endTerminalFrame()
 	metrics, ok := terminalFooterMetricsForTTY()
@@ -296,7 +302,9 @@ func terminalAppendRowsToScrollback(rows []string, status statusBarState) bool {
 	fmt.Fprint(os.Stderr, "\x1b[?7h")
 	lastTerminalFooterMetrics.set = false
 	if _, ok := activateTerminalFooter(status); ok {
-		redrawPendingFooterPromptFromStateUnlocked()
+		if !redrawTerminalActivePromptUnlocked() {
+			redrawPendingFooterPromptFromStateUnlocked()
+		}
 	}
 	return true
 }

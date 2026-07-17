@@ -132,10 +132,15 @@ type Client struct {
 	cancelledServerTurnIDs          map[string]struct{}
 	turnResultMu                    sync.Mutex
 	turnFinalText                   string
+	turnFinalRendered               bool
+	turnRenderedAssistantText       string
+	turnResultGeneration            uint64
 	turnFrontendMu                  sync.RWMutex
 	turnFrontendGeneration          uint64
 	turnPresentationSink            turnPresentationSink
 	turnInteractionProvider         turnInteractionProvider
+	frontendActionCancel            context.CancelFunc
+	frontendActionGeneration        uint64
 	semanticMu                      sync.Mutex
 	semanticState                   SemanticTurnState
 	semanticSequence                uint64
@@ -823,10 +828,39 @@ func (c *Client) activeTurnContext() context.Context {
 	return context.Background()
 }
 
+// installFrontendActionCancel exposes a serialized non-chat action (for
+// example a Telegram slash build) to the idle TUI's Escape handler. Build
+// Agent message turns continue to use activeTurnCancel and take precedence.
+func (c *Client) installFrontendActionCancel(cancel context.CancelFunc) func() {
+	if c == nil || cancel == nil {
+		return func() {}
+	}
+	c.activeTurnMu.Lock()
+	c.frontendActionGeneration++
+	generation := c.frontendActionGeneration
+	c.frontendActionCancel = cancel
+	c.activeTurnMu.Unlock()
+	return func() {
+		c.activeTurnMu.Lock()
+		if c.frontendActionGeneration == generation {
+			c.frontendActionCancel = nil
+		}
+		c.activeTurnMu.Unlock()
+	}
+}
+
 func (c *Client) cancelActiveTurn() bool {
 	c.activeTurnMu.Lock()
 	if c.activeTurnCancel == nil || c.activeTurnStopping {
+		cancel := c.frontendActionCancel
+		if cancel != nil {
+			c.frontendActionCancel = nil
+		}
 		c.activeTurnMu.Unlock()
+		if cancel != nil {
+			cancel()
+			return true
+		}
 		return false
 	}
 	c.activeTurnStopping = true
@@ -1888,6 +1922,7 @@ func (c *Client) printLegacyBuildAgentResponse(ctx context.Context, body []byte,
 		c.setTurnFinalText(assistantText)
 		c.clearTurnStatus()
 		printAssistantText(assistantText)
+		c.noteTurnAssistantRendered(assistantText)
 		if err := c.persistWebAssistantMessage(ctx, assistantText); err != nil {
 			return err
 		}
@@ -2617,6 +2652,7 @@ func (c *Client) finishGatewayStreamOutput() {
 	if assistantText == "" {
 		return
 	}
+	defer c.noteTurnAssistantRendered(assistantText)
 	if c.webStreamRows > 0 {
 		c.commitAssistantStreamRows(true)
 		c.recordActiveStreamTranscriptDelta()
@@ -2837,6 +2873,7 @@ func (c *Client) appendWebStreamMessage() {
 	if c.webStreamText == "" {
 		return
 	}
+	c.noteTurnAssistantRendered(c.webStreamText)
 	c.setTurnFinalText(c.webStreamText)
 	messageType := c.webStreamType
 	if messageType == "" {

@@ -44,13 +44,77 @@ var terminalAppScreenState = struct {
 
 var terminalPickerState = struct {
 	sync.Mutex
-	active bool
+	active         bool
+	replayDeferred bool
 }{}
+
+var terminalActivePromptView = struct {
+	sync.Mutex
+	layout    *fixedPromptLayout
+	prompt    string
+	line      string
+	cursor    int
+	menuLines []string
+}{}
+
+func updateTerminalActivePromptView(layout *fixedPromptLayout, prompt, line string, cursor int, menuLines []string) {
+	terminalActivePromptView.Lock()
+	terminalActivePromptView.layout = layout
+	terminalActivePromptView.prompt = prompt
+	terminalActivePromptView.line = line
+	terminalActivePromptView.cursor = cursor
+	terminalActivePromptView.menuLines = append(terminalActivePromptView.menuLines[:0], menuLines...)
+	terminalActivePromptView.Unlock()
+}
+
+func clearTerminalActivePromptView(layout *fixedPromptLayout) {
+	terminalActivePromptView.Lock()
+	if terminalActivePromptView.layout == layout {
+		terminalActivePromptView.layout = nil
+		terminalActivePromptView.prompt = ""
+		terminalActivePromptView.line = ""
+		terminalActivePromptView.cursor = 0
+		terminalActivePromptView.menuLines = nil
+	}
+	terminalActivePromptView.Unlock()
+}
+
+// redrawTerminalActivePromptUnlocked is called only while terminalRenderMu is
+// held. The immutable snapshot avoids taking the command editor's state lock in
+// the opposite order from asynchronous transcript rendering.
+func redrawTerminalActivePromptUnlocked() bool {
+	terminalActivePromptView.Lock()
+	layout := terminalActivePromptView.layout
+	prompt := terminalActivePromptView.prompt
+	line := terminalActivePromptView.line
+	cursor := terminalActivePromptView.cursor
+	menuLines := append([]string(nil), terminalActivePromptView.menuLines...)
+	terminalActivePromptView.Unlock()
+	if layout == nil {
+		return false
+	}
+	layout.redrawUnlocked(prompt, line, cursor, menuLines)
+	return layout.enabled
+}
 
 func terminalPickerActive() bool {
 	terminalPickerState.Lock()
 	defer terminalPickerState.Unlock()
 	return terminalPickerState.active
+}
+
+// deferTerminalReplayWhilePickerActive atomically records that semantic
+// transcript state changed while a modal picker owned the physical display.
+// Picker teardown consumes the flag only after it has released screen
+// ownership, so no remote output can overwrite the picker.
+func deferTerminalReplayWhilePickerActive() bool {
+	terminalPickerState.Lock()
+	defer terminalPickerState.Unlock()
+	if !terminalPickerState.active {
+		return false
+	}
+	terminalPickerState.replayDeferred = true
+	return true
 }
 
 func promptLine(prompt string) (string, error) {
@@ -124,6 +188,7 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 
 	layout := newFixedPromptLayout(status)
 	defer layout.clear()
+	defer clearTerminalActivePromptView(layout)
 
 	history := commandHistorySnapshot()
 	historyIndex := len(history)
@@ -210,6 +275,7 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 	redrawSnapshot := func(snapshot promptSnapshot) {
 		livePrompt := promptLabel()
 		menuLines := slashMenuLines(snapshot.menuOpen, snapshot.menu, snapshot.selected)
+		updateTerminalActivePromptView(layout, livePrompt, snapshot.line, snapshot.cursor, menuLines)
 		layout.redraw(livePrompt, snapshot.line, snapshot.cursor, menuLines)
 		if layout.enabled {
 			return
@@ -441,6 +507,9 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 				editor.Reset("", 0)
 				refreshMenuLocked()
 				redrawNeeded = true
+			} else if client != nil && client.cancelActiveTurn() {
+				warning = "Cancellation requested"
+				redrawNeeded = true
 			}
 
 		case terminalInputLeft, terminalInputCtrlB:
@@ -665,6 +734,13 @@ func (l *fixedPromptLayout) redraw(prompt, line string, cursor int, menuLines []
 	defer terminalRenderMu.Unlock()
 	beginTerminalFrame()
 	defer endTerminalFrame()
+	l.redrawUnlocked(prompt, line, cursor, menuLines)
+}
+
+func (l *fixedPromptLayout) redrawUnlocked(prompt, line string, cursor int, menuLines []string) {
+	if l == nil {
+		return
+	}
 	oldWidth, oldHeight := l.width, l.height
 	oldTurnTop, oldTempRow := l.turnTop, l.tempRow
 	oldPromptRows := l.promptRows
@@ -2271,6 +2347,7 @@ func enterAlternatePickerScreen() {
 	defer terminalRenderMu.Unlock()
 	terminalPickerState.Lock()
 	terminalPickerState.active = true
+	terminalPickerState.replayDeferred = false
 	terminalPickerState.Unlock()
 	// Conversation selection is an overlay-style UI. Outside the REPL app screen,
 	// use the terminal alternate screen so closing/canceling restores the previous
@@ -2284,20 +2361,41 @@ func enterAlternatePickerScreen() {
 }
 
 func leaveAlternatePickerScreen() {
+	// Keep teardown in the same render -> picker lock order as enter and async
+	// append. In particular, do not publish active=false while the alternate
+	// picker screen still owns the terminal: a remote append in that gap would be
+	// written into the picker and then discarded by 1049l.
+	terminalRenderMu.Lock()
 	terminalPickerState.Lock()
 	terminalPickerState.active = false
+	replayDeferred := terminalPickerState.replayDeferred
+	terminalPickerState.replayDeferred = false
 	terminalPickerState.Unlock()
 	if terminalAppScreenActive() {
-		if !replayManagedViewportFromLastStatus() {
-			terminalRenderMu.Lock()
-			fmt.Fprint(os.Stderr, ansiReset+"\x1b[r\x1b[H\x1b[2J")
-			terminalRenderMu.Unlock()
+		beginTerminalFrame()
+		lastTerminalFooterStatus.Lock()
+		status, statusSet := lastTerminalFooterStatus.state, lastTerminalFooterStatus.set
+		lastTerminalFooterStatus.Unlock()
+		replayed := false
+		if statusSet {
+			_, replayed = terminalReplayManagedViewportUnlocked(status)
 		}
+		if replayed {
+			if !redrawTerminalActivePromptUnlocked() {
+				redrawPendingFooterPromptFromStateUnlocked()
+			}
+		} else {
+			fmt.Fprint(os.Stderr, ansiReset+"\x1b[r\x1b[H\x1b[2J")
+		}
+		endTerminalFrame()
+		terminalRenderMu.Unlock()
 		return
 	}
-	terminalRenderMu.Lock()
 	fmt.Fprint(os.Stderr, "\x1b[?1049l")
 	terminalRenderMu.Unlock()
+	if replayDeferred {
+		replayManagedViewportFromLastStatus()
+	}
 }
 
 func conversationPickerLines(options []conversationPickerOption, selected int) []string {

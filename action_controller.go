@@ -32,7 +32,10 @@ func (r *activeClientRef) Set(client *Client) {
 
 func (c *Client) resetTurnFinalText() {
 	c.turnResultMu.Lock()
+	c.turnResultGeneration++
 	c.turnFinalText = ""
+	c.turnFinalRendered = false
+	c.turnRenderedAssistantText = ""
 	c.turnResultMu.Unlock()
 }
 
@@ -43,6 +46,20 @@ func (c *Client) setTurnFinalText(text string) {
 	}
 	c.turnResultMu.Lock()
 	c.turnFinalText = text
+	c.turnFinalRendered = c.turnRenderedAssistantText == text
+	c.turnResultMu.Unlock()
+}
+
+func (c *Client) noteTurnAssistantRendered(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	c.turnResultMu.Lock()
+	c.turnRenderedAssistantText = text
+	if c.turnFinalText == text {
+		c.turnFinalRendered = true
+	}
 	c.turnResultMu.Unlock()
 }
 
@@ -50,6 +67,12 @@ func (c *Client) getTurnFinalText() string {
 	c.turnResultMu.Lock()
 	defer c.turnResultMu.Unlock()
 	return c.turnFinalText
+}
+
+func (c *Client) turnFinalResult() (text string, rendered bool, generation uint64) {
+	c.turnResultMu.Lock()
+	defer c.turnResultMu.Unlock()
+	return c.turnFinalText, c.turnFinalRendered, c.turnResultGeneration
 }
 
 func runPromptForResponse(ctx context.Context, client *Client, prompt string, timeout time.Duration) (string, error) {

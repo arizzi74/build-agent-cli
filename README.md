@@ -214,7 +214,7 @@ go run . --profile scratch --profile-delete dev
 - `--profile-list` lists configured profiles and exits
 - `--profile-delete <name>` deletes a profile directory and exits; it refuses to delete the active `--profile`
 - `--auto-approve` for approval prompts
-- `--telegram-setup` opens the offline guided Telegram bot setup wizard; run it in an interactive terminal so the pasted bot token stays hidden.
+- `--telegram-setup` opens the local guided Telegram bot setup/reconfiguration wizard; run it in an interactive terminal so the pasted new or existing bot token stays hidden. Pairing policy can complete a fresh-machine user pairing inside the same wizard with a target-issued challenge.
 - `--telegram-only` runs bacli headlessly as a private Telegram command channel; it uses the global bot configuration and the selected `--profile` only as its ServiceNow runtime context.
 - `--telegram-status` shows the global Telegram configuration, paired numeric user IDs, and pending pairing codes without connecting to ServiceNow or Telegram.
 - `--telegram-approve <code>` globally approves a pending one-hour Telegram pairing code locally and exits.
@@ -263,12 +263,13 @@ Bacli can poll a Telegram bot alongside the terminal, or run headlessly with `--
 bacli --telegram-setup
 ```
 
-Run the wizard in an interactive terminal. It guides you through these steps:
+Run the wizard in an interactive terminal. It can create a bot, reuse an existing bot on a new bacli machine, or rotate an existing bot token:
 
-1. Open Telegram's verified `@BotFather` account and send `/newbot`.
-2. Choose the bot's display name and a username ending in `bot`.
-3. Copy the token returned by BotFather and paste it at bacli's hidden token prompt. The token is never accepted as a command-line argument or printed.
-4. Bacli validates the token with Telegram's `getMe` method, confirms the bot identity, and saves the channel with the private-DM `pairing` policy by default.
+1. Stop any bacli poller that is still using this bot, including one on another machine.
+2. For a new bot, open Telegram's verified `@BotFather`, send `/newbot`, and choose a username ending in `bot`. For an existing bot, obtain its current token from BotFather.
+3. Paste the token at bacli's hidden prompt. The token is never accepted as a command-line argument or printed.
+4. Bacli validates the token with Telegram's `getMe` method, confirms the bot identity, and saves the channel. Same-bot reconfiguration preserves the existing policy/allowlist by default; an exact-token refresh also preserves pending local requests, while token rotation invalidates them. A different bot never inherits the prior bot's authorization.
+5. With the `pairing` policy, choose immediate pairing to have bacli display a fresh `BACLI-…` challenge. Send that exact one-line challenge to the bot in a private Telegram chat. The wizard temporarily polls only for that challenge, verifies `from.id` equals the private chat ID, persists every consumed update, and atomically approves that numeric user.
 
 Telegram channel data is global for the local bacli installation, not duplicated per ServiceNow profile:
 
@@ -281,7 +282,7 @@ Telegram channel data is global for the local bacli installation, not duplicated
 
 On Unix systems, the wizard protects the directory with mode `0700` and its files with mode `0600`. `BACLI_TELEGRAM_BOT_TOKEN` remains an in-memory token fallback for an already enabled global configuration and is not persisted by the wizard. Earlier per-profile Telegram files are not selected or merged automatically; `bacli --telegram-status` reports them and `bacli --telegram-setup` creates the global configuration. The legacy files are left untouched.
 
-The channel accepts private messages, authenticates the numeric Telegram `from.id`, ignores groups, and never authorizes by username. An unknown private sender receives an eight-character code valid for one hour. On the bacli host, inspect and approve it with:
+The channel accepts private messages, authenticates the numeric Telegram `from.id`, ignores groups, and never authorizes by username. An unknown private sender receives an eight-character code valid for one hour. That normal runtime code is bound to the pending sender record in this machine's private `state.json`; it is not a portable credential and cannot be approved on a different machine by itself. On the bacli host that generated it, inspect and approve it with:
 
 ```bash
 bacli --telegram-status
@@ -294,9 +295,9 @@ The bot configuration, paired users, and consumed update offset remain the same 
 bacli --telegram-only --profile default
 ```
 
-Then open the bot in Telegram, send `/start`, and approve the returned code with `bacli --telegram-approve <code>`. Only one bacli process can poll a given bot token on a host at a time.
+If immediate wizard pairing was skipped, open the bot in Telegram, send `/start`, and approve the newly returned code on that same host with `bacli --telegram-approve <code>`. Only one bacli process can poll a given bot token on a host at a time; Telegram also rejects competing pollers on different hosts, so stop the old machine before moving the bot.
 
-Send ordinary text to the bot to start a Build Agent turn; `/ask <prompt>` remains only as a compatibility alias and is not published in the bot menu. During a turn Telegram receives the live Building notice, tool start/completion and capped result summaries, build progress, warnings, summaries, retry/fallback notices, sub-agent lifecycle, usage, and the complete final assistant message. Responses that fit in at most ten Telegram messages remain readable text; larger responses are attached losslessly as bounded UTF-8 `.txt` parts instead of being silently truncated. When Build Agent requests an interview, approval, or application selection, bacli first delivers the complete request and then sends an `Input required [ID] is ready` acknowledgement. Reply directly in the same chat; if an answer begins with `/`, send `/answer <ID> <answer>`. Invalid approval replies are rejected without ending the request. These replies and `/cancel` bypass the serialized command queue so the websocket reader cannot deadlock waiting for terminal input. Only the user/chat that started a Telegram turn can answer or cancel it, command/interaction waits inherit the configured turn timeout, and cancellation acknowledgements are sequenced before the final cancellation result.
+Send ordinary text to the bot to start a Build Agent turn; `/ask` has been removed completely. For the full active turn bacli immediately sends Telegram's native `typing` chat action and refreshes it every four seconds, stopping the heartbeat before the final response is sent on success, cancellation, timeout, failure, or service shutdown. During a turn Telegram receives the live Building notice, tool start/completion and capped result summaries, build progress, warnings, summaries, retry/fallback notices, sub-agent lifecycle, usage, and the complete final assistant message. When the TUI is open, each authorized Telegram input—including interaction replies—and the corresponding assistant, command, interaction, cancellation, and presentation-only progress output are also recorded/rendered in the managed terminal transcript; Esc in the idle TUI can interrupt a Telegram-originated active turn. Responses that fit in at most ten Telegram messages remain readable text; larger responses are attached losslessly as bounded UTF-8 `.txt` parts instead of being silently truncated. When Build Agent requests an interview, approval, or application selection, bacli first delivers the complete request and then sends an `Input required [ID] is ready` acknowledgement. Reply directly in the same chat; if an answer begins with `/`, send `/answer <ID> <answer>`. Invalid approval replies are rejected without ending the request. These replies and `/cancel` bypass the serialized command queue so the websocket reader cannot deadlock waiting for terminal input. Only the user/chat that started a Telegram turn can answer or cancel it, command/interaction waits inherit the configured turn timeout, and cancellation acknowledgements are sequenced before the final cancellation result.
 
 The Telegram command menu is generated from the same registry as bacli and publishes every registered top-level command. Telegram requires underscore command names, so `/support-bundle` is published as `/support_bundle` and maps back to the canonical command. Bare commands that normally open a terminal picker use a non-modal `current`, `list`, or `status` default. Explicit subcommands provide the full behavior, including context changes, sync pull/push, project operations, local support/export files, debug controls, approvals, and host attachment paths. `/help` always shows the same published catalog and labels commands unavailable in the current transport. A temporary Telegram menu-refresh failure is reported locally but does not disable the authenticated poller. These are authenticated remote-control operations with the same local and ServiceNow effects as invoking them in bacli; grant bot access only to trusted operators. `/telegram setup` still requires the host's hidden-input wizard, and remote `/exit` cannot terminate the host process. Telegram photo/document ingestion is not yet implemented; `/attach add` reads a path on the bacli host and `/attach paste` reads its clipboard. Pending attachments are tagged with their originating front end so a Telegram turn cannot accidentally consume files queued by the terminal or another user. If an owner abandons that host-wide queue, a trusted operator can explicitly purge it with `/attach clear-all`.
 

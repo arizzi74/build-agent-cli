@@ -302,6 +302,21 @@ func (api *telegramAPI) getUpdates(ctx context.Context, offset int64, timeout in
 	return updates, err
 }
 
+func (api *telegramAPI) sendChatAction(ctx context.Context, chatID, action string) error {
+	chatID = strings.TrimSpace(chatID)
+	action = strings.TrimSpace(action)
+	if !validTelegramNumericID(chatID) {
+		return errors.New("invalid Telegram chat ID")
+	}
+	if action != "typing" {
+		return errors.New("invalid Telegram chat action")
+	}
+	return api.call(ctx, "sendChatAction", map[string]interface{}{
+		"chat_id": chatID,
+		"action":  action,
+	}, nil)
+}
+
 func (api *telegramAPI) sendText(ctx context.Context, chatID, text string) error {
 	parts, overflow := splitTelegramTextLimited(text, telegramTextChunkUTF16Units, telegramMaxDirectTextMessages)
 	if overflow {

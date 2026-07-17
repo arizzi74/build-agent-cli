@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,8 @@ const (
 	telegramPairingTTL         = time.Hour
 	telegramMaxPendingPairings = 3
 	telegramPairingAlphabet    = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	telegramSetupChallengeSize = 16
+	telegramSetupChallengeTag  = "BACLI-"
 )
 
 type telegramPairingRequest struct {
@@ -229,7 +232,26 @@ func createTelegramPairing(botID, fingerprint, userID, chatID, label string, now
 }
 
 func newTelegramPairingCode() (string, error) {
-	raw := make([]byte, 8)
+	return newTelegramPairingSecret(8)
+}
+
+// newTelegramSetupChallenge creates a target-issued challenge for the setup
+// wizard. It is deliberately distinct from an ordinary pending pairing code:
+// the challenge has no authority until the same value arrives in a private
+// update from Telegram and that update's numeric sender is committed locally.
+func newTelegramSetupChallenge() (string, error) {
+	secret, err := newTelegramPairingSecret(telegramSetupChallengeSize)
+	if err != nil {
+		return "", err
+	}
+	return telegramSetupChallengeTag + secret, nil
+}
+
+func newTelegramPairingSecret(length int) (string, error) {
+	if length <= 0 {
+		return "", errors.New("invalid Telegram pairing secret length")
+	}
+	raw := make([]byte, length)
 	if _, err := rand.Read(raw); err != nil {
 		return "", errors.New("could not generate Telegram pairing code")
 	}
@@ -237,6 +259,22 @@ func newTelegramPairingCode() (string, error) {
 		raw[i] = telegramPairingAlphabet[int(raw[i])%len(telegramPairingAlphabet)]
 	}
 	return string(raw), nil
+}
+
+func validTelegramSetupChallenge(challenge string) bool {
+	if !strings.HasPrefix(challenge, telegramSetupChallengeTag) {
+		return false
+	}
+	secret := strings.TrimPrefix(challenge, telegramSetupChallengeTag)
+	if len(secret) != telegramSetupChallengeSize {
+		return false
+	}
+	for _, r := range secret {
+		if !strings.ContainsRune(telegramPairingAlphabet, r) {
+			return false
+		}
+	}
+	return true
 }
 
 func approveTelegramPairing(code string, now time.Time) (string, error) {
@@ -274,6 +312,44 @@ func approveTelegramPairing(code string, now time.Time) (string, error) {
 		return nil
 	})
 	return approved, err
+}
+
+// approveTelegramSetupSender atomically consumes the matching incoming update
+// and grants authority to its authenticated numeric private-chat sender. A
+// bare challenge is never accepted here; callers must first obtain userID from
+// the Telegram update that carried the target-issued challenge.
+func approveTelegramSetupSender(botID, fingerprint, userID string, updateID int64) error {
+	if !validTelegramNumericID(botID) || len(fingerprint) != sha256.Size*2 || !validTelegramNumericID(userID) || updateID <= 0 {
+		return errors.New("invalid Telegram setup pairing identity")
+	}
+	_, err := updateTelegramState(func(state *telegramState) error {
+		if state.BotID != botID || state.TokenFingerprint != fingerprint {
+			return errors.New("Telegram bot identity changed; restart setup")
+		}
+		if updateID <= state.LastUpdateID {
+			return errors.New("Telegram pairing update was already consumed")
+		}
+		state.LastUpdateID = updateID
+		alreadyApproved := false
+		for _, id := range state.Approved {
+			if id == userID {
+				alreadyApproved = true
+				break
+			}
+		}
+		if !alreadyApproved {
+			state.Approved = append(state.Approved, userID)
+		}
+		pending := state.Pending[:0]
+		for _, request := range state.Pending {
+			if request.UserID != userID {
+				pending = append(pending, request)
+			}
+		}
+		state.Pending = pending
+		return nil
+	})
+	return err
 }
 
 func telegramUserAuthorized(cfg telegramConfig, state telegramState, userID string) bool {

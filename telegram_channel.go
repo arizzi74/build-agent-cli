@@ -14,9 +14,10 @@ import (
 )
 
 type telegramQueuedCommand struct {
-	chatID string
-	userID string
-	text   string
+	chatID        string
+	userID        string
+	text          string
+	inputMirrored bool
 }
 
 type telegramService struct {
@@ -179,7 +180,7 @@ func (s *telegramService) fail(err error) {
 
 func (s *telegramService) warn(message string) {
 	message = singleLineLabel(message)
-	if message == "" {
+	if message == "" || s == nil || s.clients == nil {
 		return
 	}
 	if client := s.clients.Get(); client != nil {
@@ -188,6 +189,9 @@ func (s *telegramService) warn(message string) {
 }
 
 func (s *telegramService) pinnedClient() (*Client, bool) {
+	if s == nil || s.clients == nil {
+		return nil, false
+	}
 	s.clientMu.RLock()
 	pinned := s.client
 	profile := s.profile
@@ -327,7 +331,17 @@ func (s *telegramService) acceptUpdate(update telegramUpdate) {
 	text := strings.TrimSpace(message.Text)
 	command, _ := telegramCommandParts(text)
 	if command == "/whoami" {
-		s.sendAsync(chatID, "Your numeric Telegram user ID is "+userID+".")
+		response := "Your numeric Telegram user ID is " + userID + "."
+		// /whoami remains available before pairing, but only an already
+		// authorized sender may write into the managed terminal transcript.
+		if _, pinned := s.pinnedClient(); pinned {
+			if _, authorized, authErr := s.authorization(userID); authErr == nil && authorized {
+				client := s.currentTerminalClient()
+				mirrorTelegramInputToTerminal(client, text)
+				mirrorTelegramSystemToTerminal(client, response)
+			}
+		}
+		s.sendAsync(chatID, response)
 		return
 	}
 	if _, pinned := s.pinnedClient(); !pinned {
@@ -344,18 +358,54 @@ func (s *telegramService) acceptUpdate(update telegramUpdate) {
 		return
 	}
 	if command == "/cancel" {
+		mirrorTelegramInputToTerminal(s.currentTerminalClient(), text)
 		s.cancelAndRespond(chatID, userID)
 		return
+	}
+	inputMirrored := false
+	if s.telegramInteractionConsumesInput(chatID, userID, text) {
+		mirrorTelegramInputToTerminal(s.currentTerminalClient(), text)
+		inputMirrored = true
 	}
 	if s.deliverInteractionReply(chatID, userID, text) {
 		return
 	}
 	if text == "" {
-		s.sendAsync(chatID, "Send a text message to start a Build Agent turn, or use /help.")
+		s.sendAsyncMirrored(chatID, "Send a text message to start a Build Agent turn, or use /help.")
 		return
 	}
-	if !s.enqueue(telegramQueuedCommand{chatID: chatID, userID: userID, text: text}) && s.ctx.Err() == nil {
-		s.sendAsync(chatID, "The bacli command queue is full. Use /cancel for the active turn or try again later.")
+	if !s.enqueue(telegramQueuedCommand{chatID: chatID, userID: userID, text: text, inputMirrored: inputMirrored}) && s.ctx.Err() == nil {
+		if !inputMirrored {
+			mirrorTelegramInputToTerminal(s.currentTerminalClient(), text)
+		}
+		s.sendAsyncMirrored(chatID, "The bacli command queue is full. Use /cancel for the active turn or try again later.")
+	}
+}
+
+func (s *telegramService) telegramInteractionConsumesInput(chatID, userID, text string) bool {
+	if s == nil {
+		return false
+	}
+	s.turnControlMu.Lock()
+	pending := s.pendingInteraction
+	if pending == nil || pending.chatID != chatID || pending.userID != userID {
+		s.turnControlMu.Unlock()
+		return false
+	}
+	ready := pending.ready
+	s.turnControlMu.Unlock()
+	if !ready {
+		return true
+	}
+	command, _ := telegramCommandParts(strings.TrimSpace(text))
+	if command == "" {
+		return false
+	}
+	switch command {
+	case "/answer", "/turn_approve", "/turn_reject":
+		return true
+	default:
+		return !strings.HasPrefix(command, "/")
 	}
 }
 
@@ -399,6 +449,20 @@ func (s *telegramService) sendAsync(chatID, text string) {
 	if err := s.sendText(ctx, chatID, text); err != nil && s.serviceContext().Err() == nil {
 		s.warn("Telegram send failed: " + err.Error())
 	}
+}
+
+func (s *telegramService) sendAsyncMirrored(chatID, text string) {
+	if client := s.currentTerminalClient(); client != nil {
+		mirrorTelegramSystemToTerminal(client, text)
+	}
+	s.sendAsync(chatID, text)
+}
+
+func (s *telegramService) currentTerminalClient() *Client {
+	if s == nil || s.clients == nil {
+		return nil
+	}
+	return s.clients.Get()
 }
 
 func (s *telegramService) sendText(ctx context.Context, chatID, text string) error {
@@ -445,6 +509,9 @@ func (s *telegramService) cancelAndRespond(chatID, userID string) {
 	err := s.sendTextLocked(ctx, chatID, message)
 	cancel()
 	s.outboundMu.Unlock()
+	if client := s.currentTerminalClient(); client != nil {
+		mirrorTelegramSystemToTerminal(client, message)
+	}
 	if err != nil && s.serviceContext().Err() == nil {
 		s.warn("Telegram cancellation acknowledgement failed: " + err.Error())
 	}
@@ -475,8 +542,15 @@ func (s *telegramService) runCommands() {
 			if s.ctx.Err() != nil {
 				return
 			}
-			if _, pinned := s.pinnedClient(); !pinned {
-				s.sendAsync(command.chatID, "The bacli instance changed. Restart bacli to bind Telegram to the new client securely.")
+			terminalClient := s.currentTerminalClient()
+			client, pinned := s.pinnedClient()
+			if !pinned {
+				if !command.inputMirrored {
+					mirrorTelegramInputToTerminal(terminalClient, command.text)
+				}
+				message := "The bacli instance changed. Restart bacli to bind Telegram to the new client securely."
+				mirrorTelegramSystemToTerminal(terminalClient, message)
+				s.sendAsync(command.chatID, message)
 				continue
 			}
 			_, authorized, err := s.authorization(command.userID)
@@ -485,10 +559,26 @@ func (s *telegramService) runCommands() {
 				continue
 			}
 			if !authorized {
-				s.sendAsync(command.chatID, "This Telegram user is no longer authorized.")
+				if !command.inputMirrored {
+					mirrorTelegramInputToTerminal(terminalClient, command.text)
+				}
+				message := "This Telegram user is no longer authorized."
+				mirrorTelegramSystemToTerminal(terminalClient, message)
+				s.sendAsync(command.chatID, message)
 				continue
 			}
+			_, _, turnGeneration := client.turnFinalResult()
 			response := s.dispatchCommand(command)
+			// The command is bound to the pinned client for execution, but the
+			// visible response belongs on whichever TUI is safe and current when
+			// execution finishes. Force rendering after an instance switch because
+			// the old client's render history says nothing about the new viewport.
+			mirrorClient := s.currentTerminalClient()
+			mirrorGeneration := turnGeneration
+			if mirrorClient != nil && mirrorClient != client {
+				_, _, mirrorGeneration = mirrorClient.turnFinalResult()
+			}
+			mirrorTelegramResponseToTerminal(mirrorClient, command.text, response, mirrorGeneration)
 			s.sendAsync(command.chatID, response)
 		}
 	}
@@ -503,19 +593,26 @@ func (s *telegramService) dispatchCommand(in telegramQueuedCommand) string {
 	switch command {
 	case "/start", "/help":
 		client, _ := s.pinnedClient()
+		if !in.inputMirrored {
+			mirrorTelegramInputToTerminal(client, in.text)
+		}
 		return telegramRemoteHelp(client)
 	case "/whoami":
-		return "Your numeric Telegram user ID is " + in.userID + "."
-	case "/ask":
-		if strings.TrimSpace(argument) == "" {
-			return "Send the prompt as a normal text message; /ask <prompt> remains available for compatibility."
+		if !in.inputMirrored {
+			mirrorTelegramInputToTerminal(s.currentTerminalClient(), in.text)
 		}
-		return s.runTelegramPrompt(in, argument)
+		return "Your numeric Telegram user ID is " + in.userID + "."
 	case "/cancel":
+		if !in.inputMirrored {
+			mirrorTelegramInputToTerminal(s.currentTerminalClient(), in.text)
+		}
 		return "No Build Agent turn is currently running."
 	}
 	line, ok := telegramRemoteSlashLine(command, argument)
 	if !ok {
+		if !in.inputMirrored {
+			mirrorTelegramInputToTerminal(s.currentTerminalClient(), in.text)
+		}
 		return "Unknown command. Use /help to see every published BACLI command."
 	}
 	return s.executeSlash(in, line)
@@ -528,14 +625,21 @@ func (s *telegramService) executeSlash(in telegramQueuedCommand, line string) st
 		bacliActionMu.Unlock()
 		return "The bacli instance changed. Restart bacli to bind Telegram to the new client securely."
 	}
+	if !in.inputMirrored {
+		mirrorTelegramInputToTerminal(client, in.text)
+	}
 	commandTimeout := s.timeout
 	if commandTimeout <= 0 {
 		commandTimeout = 30 * time.Minute
 	}
 	commandBase, commandCancel := context.WithTimeout(s.serviceContext(), commandTimeout)
 	commandCtx := withTelegramCommandContext(commandBase, in.chatID, in.userID)
+	restoreActionCancel := client.installFrontendActionCancel(commandCancel)
 	relay := newTelegramTurnRelay(s, in.chatID)
-	restore := client.installTurnFrontend(relay.presentation, func(ctx context.Context, request turnInteractionRequest) (string, error) {
+	restore := client.installTurnFrontend(func(event turnPresentationEvent) {
+		relay.presentation(event)
+		mirrorTelegramPresentationToTerminal(client, event)
+	}, func(ctx context.Context, request turnInteractionRequest) (string, error) {
 		return s.requestInteraction(ctx, in.chatID, in.userID, relay, request)
 	})
 	s.setActiveTurn(in.chatID, in.userID, commandCancel)
@@ -563,7 +667,13 @@ func (s *telegramService) executeSlash(in telegramQueuedCommand, line string) st
 			response = "Command completed."
 		}
 	}
+	if err == nil && handled && telegramSlashRefreshesTerminalTranscript(line) {
+		if active := s.currentTerminalClient(); active != nil {
+			active.replaceTerminalConversationTranscript(active.statusBarState())
+		}
+	}
 	s.clearActiveTurn(in.chatID, in.userID)
+	restoreActionCancel()
 	commandCancel()
 	restore()
 	// Do not retain bacli's global state lock while Telegram drains progress.
@@ -572,6 +682,91 @@ func (s *telegramService) executeSlash(in telegramQueuedCommand, line string) st
 		s.warn("Telegram command progress send failed: " + sendErr.Error())
 	}
 	return response
+}
+
+func mirrorTelegramInputToTerminal(client *Client, text string) {
+	text = telegramTerminalDisplayText(text)
+	if client == nil || text == "" || !interactiveTerminalUIEnabled() {
+		return
+	}
+	printLiveUserPrompt(text)
+}
+
+func telegramTerminalDisplayText(text string) string {
+	text = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			return ' '
+		}
+		return r
+	}, text)
+	return strings.TrimSpace(text)
+}
+
+func mirrorTelegramSystemToTerminal(client *Client, text string) {
+	text = telegramSafeRemoteText(text, 0)
+	if client == nil || text == "" || !interactiveTerminalUIEnabled() {
+		return
+	}
+	if !terminalRecordSystemTextAndAppend("Telegram", text, client.statusBarState()) {
+		fmt.Fprintf(os.Stderr, "\n[Telegram]\n%s\n", text)
+	}
+}
+
+func mirrorTelegramResponseToTerminal(client *Client, input, response string, priorTurnGeneration uint64) {
+	displayResponse := telegramSafeRemoteText(response, 0)
+	if client == nil || displayResponse == "" || !interactiveTerminalUIEnabled() {
+		return
+	}
+	if strings.HasPrefix(strings.TrimSpace(input), "/") {
+		mirrorTelegramSystemToTerminal(client, displayResponse)
+		return
+	}
+	if telegramTurnFinalAlreadyRendered(client, response, priorTurnGeneration) {
+		return
+	}
+	printAssistantText(displayResponse)
+}
+
+func telegramTurnFinalAlreadyRendered(client *Client, response string, priorTurnGeneration uint64) bool {
+	if client == nil {
+		return false
+	}
+	finalText, rendered, generation := client.turnFinalResult()
+	// Compare the raw response, not its terminal-safe projection. Distinct
+	// responses can sanitize to the same display text and must not suppress one
+	// another. Generation also binds the evidence to this dispatched turn.
+	return generation != priorTurnGeneration && rendered && finalText == response
+}
+
+func mirrorTelegramPresentationToTerminal(client *Client, event turnPresentationEvent) {
+	if client == nil || !interactiveTerminalUIEnabled() {
+		return
+	}
+	switch event.Kind {
+	case turnPresentationToolStarted, turnPresentationSubAgentStart, turnPresentationSubAgentEnd,
+		turnPresentationRetry, turnPresentationFallback, turnPresentationUsage:
+		mirrorTelegramSystemToTerminal(client, telegramPresentationText(event))
+	case turnPresentationToolCompleted:
+		if client.opts.CodeAssistWS {
+			mirrorTelegramSystemToTerminal(client, telegramPresentationText(event))
+		}
+	}
+}
+
+func telegramSlashRefreshesTerminalTranscript(line string) bool {
+	command, argument := telegramCommandParts(line)
+	sub := ""
+	if fields := strings.Fields(argument); len(fields) > 0 {
+		sub = strings.ToLower(fields[0])
+	}
+	switch telegramCanonicalCommand(command) {
+	case "/conversation":
+		return sub == "new" || sub == "create" || sub == "use" || sub == "open" || sub == "switch"
+	case "/workspace":
+		return sub == "use" || sub == "switch"
+	default:
+		return false
+	}
 }
 
 func telegramSlashMutatesContext(command, argument string) bool {

@@ -14,6 +14,9 @@ const (
 	telegramSendTimeout         = 45 * time.Second
 	telegramProgressSendTimeout = 15 * time.Second
 	telegramRelayFinishTimeout  = 20 * time.Second
+	telegramTypingRefresh       = 4 * time.Second
+	telegramTypingSendTimeout   = 5 * time.Second
+	telegramTypingFinalWait     = time.Second
 )
 
 type telegramActiveTurn struct {
@@ -36,6 +39,127 @@ type telegramRelayItem struct {
 	ack  chan error
 }
 
+type telegramTypingIndicator struct {
+	cancel  context.CancelFunc
+	done    chan struct{}
+	ready   chan struct{}
+	refresh chan chan struct{}
+	once    sync.Once
+}
+
+func startTelegramTypingIndicator(parent context.Context, api *telegramAPI, chatID string, refresh, sendTimeout time.Duration, warn func(string)) *telegramTypingIndicator {
+	ctx, cancel := context.WithCancel(parent)
+	indicator := &telegramTypingIndicator{
+		cancel:  cancel,
+		done:    make(chan struct{}),
+		ready:   make(chan struct{}),
+		refresh: make(chan chan struct{}, 1),
+	}
+	if api == nil || !validTelegramNumericID(strings.TrimSpace(chatID)) {
+		close(indicator.ready)
+		close(indicator.done)
+		return indicator
+	}
+	if refresh <= 0 {
+		refresh = telegramTypingRefresh
+	}
+	if sendTimeout <= 0 {
+		sendTimeout = telegramTypingSendTimeout
+	}
+	go func() {
+		defer close(indicator.done)
+		ticker := time.NewTicker(refresh)
+		defer ticker.Stop()
+		warned := false
+		initial := true
+		var acknowledge chan struct{}
+		for {
+			sendCtx, sendCancel := context.WithTimeout(ctx, sendTimeout)
+			err := api.sendChatAction(sendCtx, chatID, "typing")
+			sendCancel()
+			if initial {
+				close(indicator.ready)
+				initial = false
+			}
+			if err != nil && ctx.Err() == nil && !warned {
+				warned = true
+				if warn != nil {
+					warn("Telegram typing indicator unavailable: " + err.Error())
+				}
+			}
+			if acknowledge != nil {
+				close(acknowledge)
+				acknowledge = nil
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case acknowledge = <-indicator.refresh:
+			case <-ticker.C:
+			}
+		}
+	}()
+	return indicator
+}
+
+// WaitReady bounds the initial ordering barrier: the first chat-action request
+// has completed (successfully or not) before the first progress message can
+// clear it. A failed action never blocks the actual Build Agent turn.
+func (indicator *telegramTypingIndicator) WaitReady(ctx context.Context) {
+	if indicator == nil {
+		return
+	}
+	select {
+	case <-indicator.ready:
+	case <-ctx.Done():
+	}
+}
+
+// Refresh requests an immediate reassertion after a progress send. Requests
+// are deliberately coalesced: one action after the newest message is enough,
+// and transport callbacks must not block on cosmetic Telegram state.
+func (indicator *telegramTypingIndicator) Refresh() {
+	if indicator == nil {
+		return
+	}
+	select {
+	case indicator.refresh <- nil:
+	default:
+	}
+}
+
+// RefreshAndWait is used only at the final relay boundary. It guarantees that
+// the most recent progress message is followed by a chat action before the
+// final response is handed back, while still respecting turn cancellation.
+func (indicator *telegramTypingIndicator) RefreshAndWait(ctx context.Context) {
+	if indicator == nil {
+		return
+	}
+	acknowledge := make(chan struct{})
+	select {
+	case indicator.refresh <- acknowledge:
+	case <-indicator.done:
+		return
+	case <-ctx.Done():
+		return
+	}
+	select {
+	case <-acknowledge:
+	case <-indicator.done:
+	case <-ctx.Done():
+	}
+}
+
+func (indicator *telegramTypingIndicator) Stop() {
+	if indicator == nil {
+		return
+	}
+	indicator.once.Do(func() {
+		indicator.cancel()
+		<-indicator.done
+	})
+}
+
 // telegramTurnRelay keeps transport callbacks non-blocking while preserving
 // their order for Telegram. Network I/O happens on its own goroutine; finish
 // drains that queue before the final assistant response is sent.
@@ -53,6 +177,7 @@ type telegramTurnRelay struct {
 	wake    chan struct{}
 	done    chan struct{}
 	err     error
+	typing  *telegramTypingIndicator
 }
 
 func newTelegramTurnRelay(service *telegramService, chatID string) *telegramTurnRelay {
@@ -60,6 +185,25 @@ func newTelegramTurnRelay(service *telegramService, chatID string) *telegramTurn
 	relay := &telegramTurnRelay{service: service, chatID: chatID, ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1), done: make(chan struct{})}
 	go relay.run()
 	return relay
+}
+
+func (r *telegramTurnRelay) setTypingIndicator(indicator *telegramTypingIndicator) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.typing = indicator
+	r.mu.Unlock()
+}
+
+func (r *telegramTurnRelay) refreshTyping() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	indicator := r.typing
+	r.mu.Unlock()
+	indicator.Refresh()
 }
 
 func (r *telegramTurnRelay) add(text string) {
@@ -228,6 +372,7 @@ func (r *telegramTurnRelay) run() {
 				r.stop(err)
 				return
 			}
+			r.refreshTyping()
 			continue
 		}
 		if r.closed {
@@ -240,6 +385,8 @@ func (r *telegramTurnRelay) run() {
 				cancel()
 				if err != nil {
 					r.stop(err)
+				} else {
+					r.refreshTyping()
 				}
 				return
 			}
@@ -360,7 +507,7 @@ func (s *telegramService) deliverInteractionReply(chatID, userID, text string) b
 		if len(fields) < 2 || !strings.EqualFold(fields[0], pending.id) {
 			expected := pending.id
 			s.turnControlMu.Unlock()
-			s.sendAsync(chatID, "That interaction reply does not match the active request. Use /answer "+expected+" <answer>.")
+			s.sendAsyncMirrored(chatID, "That interaction reply does not match the active request. Use /answer "+expected+" <answer>.")
 			return true
 		}
 		text = strings.TrimSpace(strings.TrimPrefix(argument, fields[0]))
@@ -376,13 +523,13 @@ func (s *telegramService) deliverInteractionReply(chatID, userID, text string) b
 	}
 	if strings.TrimSpace(text) == "" {
 		s.turnControlMu.Unlock()
-		s.sendAsync(chatID, "The interaction reply cannot be empty.")
+		s.sendAsyncMirrored(chatID, "The interaction reply cannot be empty.")
 		return true
 	}
 	if pending.kind == "approval" {
 		if _, err := parseTurnApprovalAnswer(text); err != nil {
 			s.turnControlMu.Unlock()
-			s.sendAsync(chatID, "Reply Approve or Reject for the active request.")
+			s.sendAsyncMirrored(chatID, "Reply Approve or Reject for the active request.")
 			return true
 		}
 	}
@@ -413,8 +560,12 @@ func (s *telegramService) requestInteraction(ctx context.Context, chatID, userID
 		}
 		s.turnControlMu.Unlock()
 	}()
-	if err := relay.sendRequired(ctx, formatTelegramInteraction(pending.id, request)); err != nil {
+	requestMessage := formatTelegramInteraction(pending.id, request)
+	if err := relay.sendRequired(ctx, requestMessage); err != nil {
 		return "", fmt.Errorf("Telegram could not deliver the interaction request: %w", err)
+	}
+	if client, pinned := s.pinnedClient(); pinned {
+		mirrorTelegramSystemToTerminal(client, requestMessage)
 	}
 	readyMessage := fmt.Sprintf("Input required [%s] is ready. Reply now", pending.id)
 	if request.Kind == "approval" {
@@ -424,6 +575,9 @@ func (s *telegramService) requestInteraction(ctx context.Context, chatID, userID
 	}
 	if err := relay.sendRequired(ctx, readyMessage); err != nil {
 		return "", fmt.Errorf("Telegram could not confirm the interaction request: %w", err)
+	}
+	if client, pinned := s.pinnedClient(); pinned {
+		mirrorTelegramSystemToTerminal(client, readyMessage)
 	}
 	s.turnControlMu.Lock()
 	if s.pendingInteraction == pending {
@@ -494,21 +648,34 @@ func (s *telegramService) runTelegramPrompt(in telegramQueuedCommand, prompt str
 		bacliActionMu.Unlock()
 		return "The bacli instance changed. Restart bacli to bind Telegram to the new client securely."
 	}
+	if !in.inputMirrored {
+		mirrorTelegramInputToTerminal(client, in.text)
+	}
 	if err := client.requirePendingAttachmentOwner(telegramPendingAttachmentOwner(in.chatID, in.userID)); err != nil {
 		bacliActionMu.Unlock()
 		return "Build Agent turn not started: " + err.Error()
 	}
+	turnBase, turnCancel := context.WithCancel(s.serviceContext())
+	turnCtx := withTelegramCommandContext(turnBase, in.chatID, in.userID)
+	promptCtx, promptCancel := context.WithCancel(turnCtx)
+	s.setActiveTurn(in.chatID, in.userID, promptCancel)
+	defer turnCancel()
+	defer s.clearActiveTurn(in.chatID, in.userID)
+	defer promptCancel()
+	typing := startTelegramTypingIndicator(turnCtx, s.api, in.chatID, telegramTypingRefresh, telegramTypingSendTimeout, s.warn)
+	defer typing.Stop()
+	typing.WaitReady(promptCtx)
 	relay := newTelegramTurnRelay(s, in.chatID)
+	relay.setTypingIndicator(typing)
 	relay.add("Building… Use /cancel to interrupt.")
-	restore := client.installTurnFrontend(relay.presentation, func(ctx context.Context, request turnInteractionRequest) (string, error) {
+	restore := client.installTurnFrontend(func(event turnPresentationEvent) {
+		relay.presentation(event)
+		mirrorTelegramPresentationToTerminal(client, event)
+	}, func(ctx context.Context, request turnInteractionRequest) (string, error) {
 		return s.requestInteraction(ctx, in.chatID, in.userID, relay, request)
 	})
-	promptBase, promptCancel := context.WithCancel(s.serviceContext())
-	s.setActiveTurn(in.chatID, in.userID, promptCancel)
-	promptCtx := withTelegramCommandContext(promptBase, in.chatID, in.userID)
 	response, err := runPromptForResponseLocked(promptCtx, client, prompt, s.timeout)
 	s.clearActiveTurn(in.chatID, in.userID)
-	promptCancel()
 	restore()
 	// The terminal and Telegram command paths may proceed once client state is
 	// stable. Slow progress delivery must not retain the global action lock.
@@ -516,6 +683,9 @@ func (s *telegramService) runTelegramPrompt(in telegramQueuedCommand, prompt str
 	if sendErr := relay.finish(); sendErr != nil && s.serviceContext().Err() == nil {
 		s.warn("Telegram progress send failed: " + sendErr.Error())
 	}
+	typingFinalCtx, typingFinalCancel := context.WithTimeout(turnCtx, telegramTypingFinalWait)
+	typing.RefreshAndWait(typingFinalCtx)
+	typingFinalCancel()
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return "Build Agent turn cancelled."
