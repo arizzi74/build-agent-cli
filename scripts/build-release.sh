@@ -11,7 +11,7 @@ if [ -x /usr/local/go/bin/go ]; then
 else
   GO=${GO:-go}
 fi
-LDFLAGS="-s -w -buildid= -X main.cliVersion=$VERSION -X main.cliUpdateBaseURL=$BASE_URL"
+LDFLAGS="-s -w -buildid= -X build-agent-go-cli/src/core.cliVersion=$VERSION -X build-agent-go-cli/src/core.cliUpdateBaseURL=$BASE_URL"
 
 mkdir -p "$DIST"
 rm -f "$DIST"/bacli-linux-arm64 "$DIST"/bacli-linux-amd64 "$DIST"/bacli-darwin-amd64 "$DIST"/bacli-darwin-arm64 "$DIST"/bacli-windows-amd64.exe "$DIST"/bacli-windows-arm64.exe "$DIST"/version.json
@@ -21,7 +21,7 @@ build() {
   goarch=$2
   output=$3
   printf 'Building %s/%s -> %s\n' "$goos" "$goarch" "$output"
-  CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" "$GO" build -trimpath -ldflags="$LDFLAGS" -o "$DIST/$output" .
+  CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" "$GO" build -trimpath -ldflags="$LDFLAGS" -o "$DIST/$output" ./src/cmd/bacli
 }
 
 build linux arm64 bacli-linux-arm64
