@@ -1,10 +1,10 @@
 # Build Agent Go CLI
 
-Minimal Go CLI for talking to the ServiceNow Build Agent backend.
+`bacli` is a cross-platform terminal client for ServiceNow Build Agent. It combines AI-assisted conversations and tool execution with a local application-development workflow, keeping source projects and builds on your machine while synchronizing the relevant ServiceNow state.
 
-## Install
+## Quick install
 
-macOS or Linux aarch64:
+macOS or Linux:
 
 ```bash
 curl -fsSL https://nowdemo.it/bacli/install.sh | sh
@@ -16,11 +16,30 @@ Windows PowerShell:
 irm https://nowdemo.it/bacli/install.ps1 | iex
 ```
 
+Configure your first ServiceNow instance, then start the interactive client:
+
+```bash
+bacli --setup
+bacli
+```
+
+## Key features
+
+- **Local project scaffolding and builds:** scaffold and maintain app projects under a configurable local root, prepare app-local Node/npm dependencies, run the bundled project build workflow, and package/install the result on the instance.
+- **Glide VFS synchronization:** use conflict-aware `/sync status`, `/sync pull`, and `/sync push` workflows to reconcile local scaffolding with the application's Glide VFS files on the ServiceNow instance.
+- **Workspaces and conversations:** discover and switch Web UI workspaces, refresh their Glider folders and working set, and create, resume, and synchronize server-backed Build Agent conversations and history.
+- **Multiple ServiceNow instances:** keep credentials, OAuth sessions, projects, workspaces, apps, and conversations isolated in per-instance profiles, with safe interactive switching.
+- **Telegram channel:** connect an authenticated private bot as a companion to the TUI or as a headless channel, with Build Agent turns, commands, progress, interactions, cancellation, and transcript parity.
+
+## Installation and updates
+
 The installer selects the correct published binary, verifies its SHA-256 checksum, creates `~/.local/bin` when needed, installs the executable as `bacli` (`bacli.exe` on Windows), and adds that directory to the user's PATH without duplicating existing entries. Open a new terminal if the installer reports that PATH was changed.
 
 Every released `bacli` checks `https://nowdemo.it/bacli/version.json` at startup. If a newer version exists, it downloads and verifies the matching platform binary, installs/stages the update, exits, and prints a message asking you to relaunch `bacli`. Update-check failures are non-fatal; set `BACLI_NO_UPDATE=1` to disable the check temporarily.
 
 Supported release platforms are Linux arm64, Linux amd64, macOS Intel, macOS Apple Silicon, Windows amd64, and Windows ARM64. See [BUILD.md](BUILD.md) for artifact names, publication ordering, release commands, and update-manifest details.
+
+## Runtime and reliability
 
 The primary/default mode is now the Glider Build Agent Nirvana websocket transport, matching the web UI path observed in Chrome HARs. It supports real streaming and advertises the same WDF/static MCP server configs as the Glider client. The older web Build Agent gateway/AMB transport remains available with `--web-gateway` for compatibility testing.
 
