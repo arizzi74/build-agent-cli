@@ -312,16 +312,20 @@ func (r *telegramTurnRelay) relayError() error {
 }
 
 func (r *telegramTurnRelay) presentation(event turnPresentationEvent) {
+	if !telegramPresentationIsUserVisible(event.Kind) {
+		return
+	}
 	if text := telegramPresentationText(event); text != "" {
-		if telegramPresentationUsesTerminalStyle(event.Kind) {
-			r.addPreformatted(telegramTerminalPresentationText(event, text))
-			return
-		}
-		r.add(text)
+		r.addPreformatted(telegramTerminalPresentationText(event, text))
 	}
 }
 
-func telegramPresentationUsesTerminalStyle(kind string) bool {
+// telegramPresentationIsUserVisible deliberately excludes lifecycle and
+// diagnostic events. Telegram already has a typing indicator, while messages
+// such as startup, retries, usage, summaries, and transport fallbacks only add
+// noise to an otherwise normal answer. Concrete tool and build progress remain
+// visible because they describe work the user explicitly asked bacli to do.
+func telegramPresentationIsUserVisible(kind string) bool {
 	switch kind {
 	case turnPresentationToolStarted, turnPresentationToolCompleted, turnPresentationToolWarning, turnPresentationBuildProgress:
 		return true
@@ -716,7 +720,6 @@ func (s *telegramService) runTelegramPrompt(in telegramQueuedCommand, prompt str
 	typing.WaitReady(promptCtx)
 	relay := newTelegramTurnRelay(s, in.chatID)
 	relay.setTypingIndicator(typing)
-	relay.add("Building… Use /cancel to interrupt.")
 	restore := client.installTurnFrontend(func(event turnPresentationEvent) {
 		relay.presentation(event)
 		mirrorTelegramPresentationToTerminal(client, event)
