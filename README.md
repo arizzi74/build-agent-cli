@@ -50,7 +50,7 @@ Use \`bacli --help\` for the generated flag help and \`/help\` in the interactiv
 | \`--conversation <latest\\|id\\|prefix\\|new>\` | Select or create a conversation before prompts or the REPL. |
 | \`--prompt <text>\` | Send a prompt after connecting; repeat for scripted multi-turn use. |
 | \`--provider <name>\`, \`--model <name>\` | Override the configured model provider or large model. |
-| \`--turn-timeout <duration>\` | Set the per-turn timeout (default: 10 minutes). |
+| \`--turn-timeout <duration>\` | Set the per-turn timeout (default: 60 minutes). |
 | \`--nirvana\` | Use the default Glider Build Agent streaming WebSocket transport. |
 | \`--web-gateway\` | Use the legacy Build Agent gateway/AMB compatibility transport. |
 | \`--code-assist-ws\` | Use the experimental Code Assist WebSocket diagnostic transport. |

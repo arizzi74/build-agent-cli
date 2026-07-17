@@ -468,7 +468,7 @@ func parseFlags() Options {
 	flag.BoolVar(&opts.TelegramSetup, "telegram-setup", false, "configure the global private Telegram channel with a guided wizard and exit")
 	flag.BoolVar(&opts.TelegramStatus, "telegram-status", false, "show global Telegram pairing/configuration status and exit without connecting")
 	flag.StringVar(&opts.TelegramApprove, "telegram-approve", "", "approve a one-hour Telegram pairing code offline and exit")
-	turnTimeout := flag.Duration("turn-timeout", 10*time.Minute, "timeout per agent turn")
+	turnTimeout := flag.Duration("turn-timeout", 60*time.Minute, "timeout per agent turn")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options]\n\n", os.Args[0])
 		fmt.Fprintln(flag.CommandLine.Output(), "  -debug filename")
