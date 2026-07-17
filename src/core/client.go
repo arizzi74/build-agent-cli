@@ -91,9 +91,8 @@ type Client struct {
 	webStreamBulletStarted          bool
 	nirvanaMCPServers               []MCPServer
 	nirvanaMCPServersReady          bool
-	toolCallNames                   map[string]string
-	toolCallInputs                  map[string]interface{}
-	toolCallStarted                 map[string]time.Time
+	nirvanaToolCalls                map[string]nirvanaToolCall
+	nirvanaToolCallOrder            []string
 	lastUserMessageSysID            string
 	lastUserMessageContent          RichUserContent
 	attachmentsMu                   sync.Mutex
@@ -173,6 +172,18 @@ type Client struct {
 	instanceSwitch func(context.Context, string) error
 }
 
+// nirvanaToolCall is the client-side counterpart of the Web UI's pending tool
+// call.  The server protocol deliberately carries both a human-facing display
+// name and the concrete action name: the former is rendered, while the latter
+// is used to correlate client elicitations.
+type nirvanaToolCall struct {
+	ID          string
+	DisplayName string
+	ActualName  string
+	Input       interface{}
+	Started     time.Time
+}
+
 type WebAgentConfig struct {
 	Model           string
 	ProviderURL     string
@@ -200,9 +211,7 @@ func NewClient(cfg CLIConfig, opts Options) (*Client, error) {
 		opts:                opts,
 		runtime:             runtimeCfg,
 		streamTypes:         map[string]string{},
-		toolCallNames:       map[string]string{},
-		toolCallInputs:      map[string]interface{}{},
-		toolCallStarted:     map[string]time.Time{},
+		nirvanaToolCalls:    map[string]nirvanaToolCall{},
 		semanticState:       NewSemanticTurnState(),
 		semanticLifecycleID: uuidV4Compact(),
 		connected:           make(chan error, 1),
@@ -3121,69 +3130,73 @@ func codeAssistToolUse(body map[string]interface{}) (string, map[string]interfac
 }
 
 func (c *Client) resetTurnToolTracking() {
-	if c.toolCallNames == nil {
-		c.toolCallNames = map[string]string{}
-		return
-	}
-	for key := range c.toolCallNames {
-		delete(c.toolCallNames, key)
-	}
-	if c.toolCallInputs == nil {
-		c.toolCallInputs = map[string]interface{}{}
-	}
-	if c.toolCallStarted == nil {
-		c.toolCallStarted = map[string]time.Time{}
-	}
-	for key := range c.toolCallInputs {
-		delete(c.toolCallInputs, key)
-	}
-	for key := range c.toolCallStarted {
-		delete(c.toolCallStarted, key)
-	}
+	c.nirvanaToolCalls = map[string]nirvanaToolCall{}
+	c.nirvanaToolCallOrder = nil
 }
 
-func (c *Client) recordToolCall(event map[string]interface{}) (string, string) {
-	name := eventToolName(event)
+func (c *Client) recordToolCall(event map[string]interface{}) (nirvanaToolCall, bool) {
 	callID := eventToolCallID(event)
+	if callID == "" {
+		// The Web UI keys every visible call by call_id.  A result without this
+		// correlation key cannot be represented as a tool card there either.
+		return nirvanaToolCall{}, false
+	}
+	actualName := eventToolActualName(event)
+	name := eventToolDisplayName(event)
 	if name == "" {
 		name = "tool"
 	}
-	if callID != "" {
-		if c.toolCallNames == nil {
-			c.toolCallNames = map[string]string{}
-		}
-		if c.toolCallInputs == nil {
-			c.toolCallInputs = map[string]interface{}{}
-		}
-		if c.toolCallStarted == nil {
-			c.toolCallStarted = map[string]time.Time{}
-		}
-		c.toolCallNames[callID] = name
-		c.toolCallInputs[callID] = eventToolInput(event)
-		c.toolCallStarted[callID] = time.Now()
+	if actualName == "" {
+		actualName = name
 	}
+	if c.nirvanaToolCalls == nil {
+		c.nirvanaToolCalls = map[string]nirvanaToolCall{}
+	}
+	if _, exists := c.nirvanaToolCalls[callID]; !exists {
+		c.nirvanaToolCallOrder = append(c.nirvanaToolCallOrder, callID)
+	}
+	call := nirvanaToolCall{ID: callID, DisplayName: name, ActualName: actualName, Input: eventToolInput(event), Started: time.Now()}
+	c.nirvanaToolCalls[callID] = call
 	c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationToolStarted, Name: name})
-	return name, callID
+	return call, true
 }
 
-func (c *Client) recordToolResult(event map[string]interface{}) (string, string, bool, string) {
+func (c *Client) recordToolResult(event map[string]interface{}) (nirvanaToolCall, bool, bool, string) {
 	callID := eventToolCallID(event)
-	name := eventToolName(event)
-	if name == "" && callID != "" && c.toolCallNames != nil {
-		name = c.toolCallNames[callID]
+	if callID == "" || c.nirvanaToolCalls == nil {
+		return nirvanaToolCall{}, false, eventToolSuccess(event), eventToolSummary(event)
 	}
-	if name == "" {
-		name = "tool"
+	call, ok := c.nirvanaToolCalls[callID]
+	if !ok {
+		return nirvanaToolCall{}, false, eventToolSuccess(event), eventToolSummary(event)
 	}
-	if callID != "" && c.toolCallNames != nil {
-		delete(c.toolCallNames, callID)
+	delete(c.nirvanaToolCalls, callID)
+	for i, id := range c.nirvanaToolCallOrder {
+		if id == callID {
+			c.nirvanaToolCallOrder = append(c.nirvanaToolCallOrder[:i], c.nirvanaToolCallOrder[i+1:]...)
+			break
+		}
 	}
-	return name, callID, eventToolSuccess(event), eventToolSummary(event)
+	return call, true, eventToolSuccess(event), eventToolSummary(event)
+}
+
+func (c *Client) pendingToolCallForAction(action string) (nirvanaToolCall, bool) {
+	action = strings.TrimSpace(action)
+	if action == "" {
+		return nirvanaToolCall{}, false
+	}
+	for _, callID := range c.nirvanaToolCallOrder {
+		call, ok := c.nirvanaToolCalls[callID]
+		if ok && call.ActualName == action {
+			return call, true
+		}
+	}
+	return nirvanaToolCall{}, false
 }
 
 func eventToolInput(event map[string]interface{}) interface{} {
 	for _, m := range eventCandidateMaps(event) {
-		for _, key := range []string{"input", "inputs", "arguments", "tool_input", "toolInput"} {
+		for _, key := range []string{"args", "input", "inputs", "arguments", "tool_input", "toolInput"} {
 			if value, ok := m[key]; ok {
 				return value
 			}
@@ -3239,22 +3252,45 @@ func toolResultDisplay(name, summary string) string {
 	return name + "\n" + summary
 }
 
-func eventToolName(event map[string]interface{}) string {
+func eventToolActualName(event map[string]interface{}) string {
+	maps := eventCandidateMaps(event)
+	name := ""
+	for _, m := range maps {
+		if name == "" {
+			name = firstString(m, "name", "tool_name", "toolName", "tool")
+		}
+	}
+	return name
+}
+
+func eventToolDisplayName(event map[string]interface{}) string {
 	maps := eventCandidateMaps(event)
 	name := ""
 	server := ""
 	for _, m := range maps {
 		if name == "" {
-			name = firstString(m, "name", "tool_name", "toolName", "displayName", "tool")
+			// Nirvana's display_name is the label rendered by the Web UI.  Keep
+			// the camelCase spelling for older gateway envelopes.
+			name = firstString(m, "display_name", "displayName")
 		}
 		if server == "" {
 			server = firstString(m, "server", "server_name", "serverName", "mcp_server", "mcpServer", "mcpServerName")
 		}
 	}
+	if name != "" {
+		return name
+	}
+	name = eventToolActualName(event)
 	if name != "" && server != "" && !strings.Contains(name, server) {
 		return server + "/" + name
 	}
 	return name
+}
+
+// eventToolName remains the presentation-oriented compatibility helper used
+// by tests and any future non-Nirvana event path.
+func eventToolName(event map[string]interface{}) string {
+	return eventToolDisplayName(event)
 }
 
 func eventToolCallID(event map[string]interface{}) string {
@@ -3498,39 +3534,49 @@ func (c *Client) handleEvent(data []byte) error {
 		c.handleNirvanaStreamEnd(streamID, contentType)
 		delete(c.streamTypes, streamID)
 	case "tool_call":
-		name, callID := c.recordToolCall(event)
-		c.emitSemanticEvent(EventToolStarted, "", ToolStartedPayload{ToolID: callID, Name: name})
+		call, tracked := c.recordToolCall(event)
+		if !tracked {
+			if c.debug {
+				c.debugf("\n[tool call ignored: missing call_id]\n")
+			}
+			break
+		}
+		c.emitSemanticEvent(EventToolStarted, "", ToolStartedPayload{ToolID: call.ID, Name: call.DisplayName})
 		if c.debug {
-			c.debugf("\n[tool call] %s %s\n", name, callID)
+			c.debugf("\n[tool call] %s %s\n", call.DisplayName, call.ID)
 		}
 	case "tool_result":
-		name, callID, success, summary := c.recordToolResult(event)
-		c.emitSemanticEvent(EventToolCompleted, "", ToolCompletedPayload{ToolID: callID, Success: success})
-		started := c.toolCallStarted[callID]
-		input := c.toolCallInputs[callID]
-		delete(c.toolCallStarted, callID)
-		delete(c.toolCallInputs, callID)
+		call, matched, success, summary := c.recordToolResult(event)
+		if !matched {
+			// The Web UI ignores result envelopes unless it previously received
+			// the matching tool_call, so do the same instead of inventing a card.
+			if c.debug {
+				c.debugf("\n[tool result ignored: no pending call] %s\n", eventToolCallID(event))
+			}
+			break
+		}
+		c.emitSemanticEvent(EventToolCompleted, "", ToolCompletedPayload{ToolID: call.ID, Success: success})
 		eventID := ""
 		if c.turnTelemetry != nil {
 			eventID = c.turnTelemetry.SysID
 		}
-		c.turnToolTelemetry = append(c.turnToolTelemetry, NewBuildAgentToolTelemetry(name, started, success, summary, eventID))
+		c.turnToolTelemetry = append(c.turnToolTelemetry, NewBuildAgentToolTelemetry(call.DisplayName, call.Started, success, summary, eventID))
 		if c.richWebPersistence {
 			duration := time.Duration(0)
-			if !started.IsZero() {
-				duration = time.Since(started)
+			if !call.Started.IsZero() {
+				duration = time.Since(call.Started)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			c.BestEffortPersistRichAssistantToolMessage(ctx, c.conversationID, RichAssistantToolContentOptions{
-				ToolUseID: callID, ToolName: name, ToolActualName: name, ToolInput: input,
-				Success: success, Result: summary, StartTime: started, Duration: duration,
+				ToolUseID: call.ID, ToolName: call.DisplayName, ToolActualName: call.ActualName, ToolInput: call.Input,
+				Success: success, Result: summary, StartTime: call.Started, Duration: duration,
 			})
 			cancel()
 		}
 		if c.debug {
-			c.debugf("\n[tool result] %s success=%v\n", callID, success)
+			c.debugf("\n[tool result] %s success=%v\n", call.ID, success)
 		}
-		c.printToolResultStatus(name, success, summary)
+		c.printToolResultStatus(call.DisplayName, success, summary)
 	case "client_elicitation":
 		c.emitSemanticEvent(EventElicitationRequested, "", ElicitationRequestedPayload{Kind: stringify(event["elicitation_type"])})
 		return c.handleElicitation(event)
@@ -3915,8 +3961,8 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 	if c.debug {
 		c.debugf("\n[client request] %s\n", action)
 	}
-	if len(c.toolCallNames) == 0 {
-		c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationToolStarted, Name: action})
+	if pending, matched := c.pendingToolCallForAction(action); matched && c.debug {
+		c.debugf("[client request matched tool] %s %s\n", pending.DisplayName, pending.ID)
 	}
 	var result map[string]interface{}
 	var status string
@@ -4035,17 +4081,10 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 	if turnCtx.Err() != nil || c.activeTurnCancelled() {
 		return nil
 	}
-	if len(c.toolCallNames) == 0 {
-		if action == "instance_skills_list" {
-			if warning := strings.TrimSpace(stringify(result["warning"])); warning != "" {
-				c.printToolWarning(action, warning)
-			} else {
-				c.printToolResultStatus(action, status == "complete", summarizeToolValue(result, 0))
-			}
-		} else {
-			c.printToolResultStatus(action, status == "complete", summarizeToolValue(result, 0))
-		}
-	}
+	// Elicitations are either an interaction within the already-visible pending
+	// tool call or an internal Web-client action.  The browser never creates a
+	// second generic tool card for either path; completion remains owned by the
+	// correlated tool_result event.
 	// Some client-side prompts (notably approvals) temporarily clear the animated
 	// Building footer so the blocking picker can own the terminal. Once the local
 	// answer is ready, restore the Building indicator before handing control back
@@ -4207,7 +4246,6 @@ func (c *Client) answerSetAppScope(payload map[string]interface{}) (map[string]i
 		return nil, "error", err
 	}
 	c.postAppSelectionStatus(context.Background())
-	fmt.Fprintf(os.Stderr, "scope set: %s\n", app.ScopeID)
 	return map[string]interface{}{"success": true}, "complete", nil
 }
 

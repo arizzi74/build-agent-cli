@@ -141,8 +141,10 @@ func replayConversationHistoryFromTranscript(status statusBarState) bool {
 }
 
 type terminalHistoryMessage struct {
-	Role    string
-	Content string
+	Role        string
+	Content     string
+	ToolName    string
+	ToolSuccess bool
 }
 
 func formatConversationHistoryScrollback(title string, history []interface{}, color bool, width int) string {
@@ -164,10 +166,14 @@ func formatConversationHistoryScrollback(title string, history []interface{}, co
 	}
 	for i, msg := range messages {
 		if i > 0 {
-			if color {
-				writeBlankLines(&out, 2)
-			} else {
-				writeBlankLine(&out)
+			// The Web UI packs sequential tool cards tightly.  Preserve that
+			// compactness here while keeping normal message groups readable.
+			if !(msg.Role == "tool" && messages[i-1].Role == "tool") {
+				if color {
+					writeBlankLines(&out, 2)
+				} else {
+					writeBlankLine(&out)
+				}
 			}
 		}
 		switch msg.Role {
@@ -190,6 +196,8 @@ func formatConversationHistoryScrollback(title string, history []interface{}, co
 				writeBlankLine(&out)
 			}
 			out.WriteString(formatAssistantResponseTerminal(msg.Content, color, width))
+		case "tool":
+			writeLine(&out, formatToolResultTerminal(msg.ToolName, msg.ToolSuccess, color))
 		}
 	}
 	writeBlankLine(&out)
@@ -206,6 +214,11 @@ func collectTerminalHistoryMessages(history []interface{}) []terminalHistoryMess
 		}
 		role := terminalHistoryRole(firstString(msg, "role", "author", "sender", "type"))
 		text := strings.TrimSpace(firstString(msg, "content", "text", "message"))
+		toolName := strings.TrimSpace(firstString(msg, "toolName", "tool_name", "display_name", "displayName", "toolActualName", "tool_actual_name", "name"))
+		toolSuccess := true
+		if success, ok := msg["success"].(bool); ok {
+			toolSuccess = success
+		}
 		attachments := attachmentSummariesFromValue(msg["attachments"])
 		if body := asMap(msg["body"]); body != nil {
 			if role == "" {
@@ -218,10 +231,10 @@ func collectTerminalHistoryMessages(history []interface{}) []terminalHistoryMess
 				attachments = attachmentSummariesFromValue(body["attachments"])
 			}
 		}
-		if role == "" || (text == "" && len(attachments) == 0) {
+		if role == "" || (text == "" && len(attachments) == 0 && role != "tool") {
 			continue
 		}
-		out = append(out, terminalHistoryMessage{Role: role, Content: attachmentDisplayContent(text, attachments)})
+		out = append(out, terminalHistoryMessage{Role: role, Content: attachmentDisplayContent(text, attachments), ToolName: toolName, ToolSuccess: toolSuccess})
 	}
 	return out
 }
@@ -235,7 +248,9 @@ func terminalHistoryRole(role string) string {
 		return "assistant"
 	case "error":
 		return "assistant"
-	case "assistant-thinking", "thinking", "assistant-tool", "tool", "remote_tool", "loading":
+	case "assistant-tool":
+		return "tool"
+	case "assistant-thinking", "thinking", "tool", "remote_tool", "loading":
 		return ""
 	default:
 		if strings.Contains(role, "tool") || strings.Contains(role, "thinking") || strings.Contains(role, "loading") {

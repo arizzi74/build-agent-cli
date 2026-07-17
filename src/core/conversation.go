@@ -1540,6 +1540,7 @@ func parseWebMessages(body []byte) []interface{} {
 			}
 		}
 		contentValue := firstMessageContentValue(m)
+		tool := messageContentToolValue(contentValue)
 		attachments := richAttachmentsFromMessageContentValue(contentValue)
 		if len(attachments) == 0 {
 			attachments = richAttachmentsFromValue(m["attachments"])
@@ -1547,6 +1548,7 @@ func parseWebMessages(body []byte) []interface{} {
 		if contentValue == nil {
 			if bodyMap := asMap(m["body"]); bodyMap != nil {
 				contentValue = firstMessageContentValue(bodyMap)
+				tool = messageContentToolValue(contentValue)
 				attachments = richAttachmentsFromMessageContentValue(contentValue)
 				if len(attachments) == 0 {
 					attachments = richAttachmentsFromValue(bodyMap["attachments"])
@@ -1575,10 +1577,10 @@ func parseWebMessages(body []byte) []interface{} {
 		if role == "" && rawRole != "" {
 			continue
 		}
-		if content == "" && len(attachments) == 0 {
+		if content == "" && len(attachments) == 0 && !(role == "assistant-tool" && tool != nil) {
 			continue
 		}
-		messages = append(messages, webMessage{Index: i, Sequence: intFromAny(m["sequence"]), Timestamp: firstString(m, "timestamp", "sys_created_on"), Role: role, Content: content, Attachments: attachments})
+		messages = append(messages, webMessage{Index: i, Sequence: intFromAny(m["sequence"]), Timestamp: firstString(m, "timestamp", "sys_created_on"), Role: role, Content: content, Attachments: attachments, Tool: tool})
 	}
 	sort.SliceStable(messages, func(i, j int) bool {
 		if messages[i].Sequence != 0 || messages[j].Sequence != 0 {
@@ -1600,6 +1602,17 @@ func parseWebMessages(body []byte) []interface{} {
 			continue
 		}
 		message := map[string]interface{}{"role": role, "content": msg.Content}
+		if role == "assistant-tool" && msg.Tool != nil {
+			// The Web client replays tool rows as collapsed cards.  Keep the
+			// card identity and status but intentionally omit result bodies: they
+			// can be enormous (for example file reads) and are collapsed in the
+			// browser by default as well.
+			message["toolName"] = msg.Tool.Name
+			message["toolActualName"] = msg.Tool.ActualName
+			if msg.Tool.HasSuccess {
+				message["success"] = msg.Tool.Success
+			}
+		}
 		if len(msg.Attachments) > 0 {
 			message["attachments"] = cloneRichAttachments(msg.Attachments)
 		}
@@ -1616,6 +1629,17 @@ type webMessage struct {
 	Role        string
 	Content     string
 	Attachments []RichAttachment
+	Tool        *webToolMessage
+}
+
+// webToolMessage is the safe, terminal-replayable subset of a persisted Web
+// assistant-tool row. Results are intentionally not retained locally because
+// the browser keeps them collapsed and they can contain full file contents.
+type webToolMessage struct {
+	Name       string
+	ActualName string
+	Success    bool
+	HasSuccess bool
 }
 
 func inferBareWebMessageRole(previousRole string) string {
@@ -1690,6 +1714,40 @@ func messageContentRoleTextValue(content interface{}) (string, string, bool) {
 	return role, text, hasRole
 }
 
+func messageContentToolValue(content interface{}) *webToolMessage {
+	var decoded map[string]interface{}
+	switch value := content.(type) {
+	case string:
+		value = strings.TrimSpace(value)
+		if value == "" || json.Unmarshal([]byte(value), &decoded) != nil {
+			return nil
+		}
+	default:
+		decoded = asMap(value)
+		if decoded == nil {
+			return nil
+		}
+	}
+	if strings.ToLower(strings.TrimSpace(firstString(decoded, "sender", "role", "author", "type"))) != "assistant-tool" {
+		return nil
+	}
+	tool := &webToolMessage{
+		Name:       strings.TrimSpace(firstString(decoded, "toolName", "tool_name", "display_name", "displayName", "name")),
+		ActualName: strings.TrimSpace(firstString(decoded, "toolActualName", "tool_actual_name", "name", "toolName")),
+	}
+	if tool.Name == "" {
+		tool.Name = tool.ActualName
+	}
+	if tool.ActualName == "" {
+		tool.ActualName = tool.Name
+	}
+	if success, ok := decoded["success"].(bool); ok {
+		tool.Success = success
+		tool.HasSuccess = true
+	}
+	return tool
+}
+
 func normalizeMessageRole(role string) string {
 	role = strings.ToLower(strings.TrimSpace(role))
 	switch role {
@@ -1697,7 +1755,9 @@ func normalizeMessageRole(role string) string {
 		return "user"
 	case "assistant":
 		return "assistant"
-	case "assistant-thinking", "thinking", "assistant-tool", "tool", "remote_tool", "loading":
+	case "assistant-tool":
+		return "assistant-tool"
+	case "assistant-thinking", "thinking", "tool", "remote_tool", "loading":
 		return ""
 	case "user", "system":
 		return role
