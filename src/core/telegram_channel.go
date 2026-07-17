@@ -236,6 +236,53 @@ func (s *telegramService) authorization(userID string) (telegramConfig, bool, er
 	return cfg, telegramUserAuthorized(cfg, state, userID), nil
 }
 
+// terminalRelayChatIDs returns only private-chat IDs that are currently
+// authorized to control this pinned process. Telegram private-chat IDs equal
+// their numeric user IDs, so the same allowlist/pairing authority can safely
+// receive a mirrored local turn without persisting another identity mapping.
+func (s *telegramService) terminalRelayChatIDs() []string {
+	if s == nil {
+		return nil
+	}
+	if _, pinned := s.pinnedClient(); !pinned {
+		return nil
+	}
+	var cfg telegramConfig
+	var state telegramState
+	if err := withTelegramLock(func() error {
+		var err error
+		cfg, _, err = loadTelegramConfig()
+		if err != nil {
+			return err
+		}
+		state, err = readTelegramState()
+		return err
+	}); err != nil {
+		s.warn("Telegram local-turn relay unavailable: " + err.Error())
+		return nil
+	}
+	if !cfg.Enabled || cfg.DMPolicy == telegramPolicyDisabled || state.BotID != s.botID || state.TokenFingerprint != s.fingerprint {
+		return nil
+	}
+	seen := make(map[string]bool)
+	chatIDs := make([]string, 0, len(cfg.AllowFrom)+len(state.Approved))
+	add := func(id string) {
+		if validTelegramNumericID(id) && !seen[id] {
+			seen[id] = true
+			chatIDs = append(chatIDs, id)
+		}
+	}
+	for _, id := range cfg.AllowFrom {
+		add(id)
+	}
+	if cfg.DMPolicy == telegramPolicyPairing {
+		for _, id := range state.Approved {
+			add(id)
+		}
+	}
+	return chatIDs
+}
+
 func (s *telegramService) poll(offset int64) {
 	defer s.wg.Done()
 	backoff := time.Second
@@ -763,12 +810,11 @@ func telegramTurnFinalAlreadyRendered(client *Client, response string, priorTurn
 }
 
 func mirrorTelegramPresentationToTerminal(client *Client, event turnPresentationEvent) {
-	if client == nil || !interactiveTerminalUIEnabled() {
+	if client == nil || !interactiveTerminalUIEnabled() || !telegramPresentationIsUserVisible(event.Kind) {
 		return
 	}
 	switch event.Kind {
-	case turnPresentationToolStarted, turnPresentationSubAgentStart, turnPresentationSubAgentEnd,
-		turnPresentationRetry, turnPresentationFallback, turnPresentationUsage:
+	case turnPresentationToolStarted:
 		mirrorTelegramSystemToTerminal(client, telegramPresentationText(event))
 	case turnPresentationToolCompleted:
 		if client.opts.CodeAssistWS {

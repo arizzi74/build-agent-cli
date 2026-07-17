@@ -329,15 +329,33 @@ func Run() {
 		active := clientRef.Get()
 		status = active.statusBarState()
 		active.printLiveUserTurn(line)
+		terminalRelay := newTelegramTerminalTurnRelay(telegram)
+		if terminalRelay != nil {
+			terminalRelay.addPrompt(line)
+		}
+		restoreTurnFrontend := func() {}
+		if terminalRelay != nil {
+			restoreTurnFrontend = active.installTurnFrontend(terminalRelay.presentation, nil)
+		}
 		capture := startProcessingInputCapture("ba> ", &status, func() bool {
 			if current := clientRef.Get(); current != nil {
 				return current.cancelActiveTurn()
 			}
 			return false
 		})
-		_, err = runPromptForResponseLocked(ctx, active, line, opts.TurnTimeout)
+		response, turnErr := runPromptForResponseLocked(ctx, active, line, opts.TurnTimeout)
 		capture.Stop()
+		restoreTurnFrontend()
 		bacliActionMu.Unlock()
+		if terminalRelay != nil {
+			if relayErr := terminalRelay.finish(); relayErr != nil && ctx.Err() == nil {
+				active.printRuntimeError("warning: Telegram local-turn progress send failed: " + relayErr.Error())
+			}
+			if turnErr == nil {
+				terminalRelay.sendFinal(response)
+			}
+		}
+		err = turnErr
 		if errors.Is(err, context.Canceled) {
 			clearTerminalFooterTempMessage()
 			if !terminalRecordSystemTextAndAppend("Action", "Cancelled", status) {

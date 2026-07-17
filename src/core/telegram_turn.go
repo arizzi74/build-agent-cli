@@ -181,6 +181,76 @@ type telegramTurnRelay struct {
 	typing  *telegramTypingIndicator
 }
 
+// telegramTerminalTurnRelay fans a local TUI turn out to each authorized
+// private Telegram chat. It has no inbound interaction owner and deliberately
+// uses the same filtered presentation policy as a Telegram-originated turn.
+type telegramTerminalTurnRelay struct {
+	relays []*telegramTurnRelay
+}
+
+func newTelegramTerminalTurnRelay(service *telegramService) *telegramTerminalTurnRelay {
+	if service == nil {
+		return nil
+	}
+	chatIDs := service.terminalRelayChatIDs()
+	if len(chatIDs) == 0 {
+		return nil
+	}
+	relay := &telegramTerminalTurnRelay{relays: make([]*telegramTurnRelay, 0, len(chatIDs))}
+	for _, chatID := range chatIDs {
+		relay.relays = append(relay.relays, newTelegramTurnRelay(service, chatID))
+	}
+	return relay
+}
+
+func (r *telegramTerminalTurnRelay) addPrompt(prompt string) {
+	if r == nil {
+		return
+	}
+	prompt = telegramSafeRemoteText(prompt, 0)
+	if prompt == "" {
+		return
+	}
+	for _, relay := range r.relays {
+		relay.addPreformatted("› " + prompt)
+	}
+}
+
+func (r *telegramTerminalTurnRelay) presentation(event turnPresentationEvent) {
+	if r == nil {
+		return
+	}
+	for _, relay := range r.relays {
+		relay.presentation(event)
+	}
+}
+
+func (r *telegramTerminalTurnRelay) finish() error {
+	if r == nil {
+		return nil
+	}
+	var firstErr error
+	for _, relay := range r.relays {
+		if err := relay.finish(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (r *telegramTerminalTurnRelay) sendFinal(text string) {
+	if r == nil {
+		return
+	}
+	text = telegramSafeRemoteText(text, 0)
+	if text == "" {
+		return
+	}
+	for _, relay := range r.relays {
+		relay.service.sendAsync(relay.chatID, text)
+	}
+}
+
 func newTelegramTurnRelay(service *telegramService, chatID string) *telegramTurnRelay {
 	ctx, cancel := context.WithCancel(service.serviceContext())
 	relay := &telegramTurnRelay{service: service, chatID: chatID, ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1), done: make(chan struct{})}
