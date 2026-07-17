@@ -26,16 +26,18 @@ Linux is statically linked in the normal ELF sense. Go's `CGO_ENABLED=0` macOS a
 
 ## Release build
 
+Numbered releases use `YYYY.MM.DD.N` based on the UTC date. Start `N` at `1` on each new UTC date and increment it for every additional release on that date.
+
 Run from the repository root:
 
 ```bash
-VERSION=2026.07.16.27 ./scripts/build-release.sh
+VERSION=2026.07.17.1 ./scripts/build-release.sh
 ```
 
 If `VERSION` is omitted, the script uses `YYYY.MM.DD.<short-git-sha>`. Override the publication root only when staging:
 
 ```bash
-VERSION=2026.07.16.27 BASE_URL=https://staging.example/bacli ./scripts/build-release.sh
+VERSION=2026.07.17.1 BASE_URL=https://staging.example/bacli ./scripts/build-release.sh
 ```
 
 The script creates:
@@ -117,7 +119,7 @@ go test -race -count=1 ./...
 go test -count=1 ./...
 go vet ./...
 git diff --check
-VERSION=2026.07.16.27 ./scripts/build-release.sh
+VERSION=2026.07.17.1 ./scripts/build-release.sh
 ```
 
 Inspect artifacts:
