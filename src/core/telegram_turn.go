@@ -186,7 +186,8 @@ type telegramTurnRelay struct {
 // private Telegram chat. It has no inbound interaction owner and deliberately
 // uses the same filtered presentation policy as a Telegram-originated turn.
 type telegramTerminalTurnRelay struct {
-	relays []*telegramTurnRelay
+	relays  []*telegramTurnRelay
+	typings []*telegramTypingIndicator
 }
 
 func newTelegramTerminalTurnRelay(service *telegramService) *telegramTerminalTurnRelay {
@@ -197,9 +198,22 @@ func newTelegramTerminalTurnRelay(service *telegramService) *telegramTerminalTur
 	if len(chatIDs) == 0 {
 		return nil
 	}
-	relay := &telegramTerminalTurnRelay{relays: make([]*telegramTurnRelay, 0, len(chatIDs))}
+	relay := &telegramTerminalTurnRelay{
+		relays:  make([]*telegramTurnRelay, 0, len(chatIDs)),
+		typings: make([]*telegramTypingIndicator, 0, len(chatIDs)),
+	}
 	for _, chatID := range chatIDs {
-		relay.relays = append(relay.relays, newTelegramTurnRelay(service, chatID))
+		indicator := startTelegramTypingIndicator(service.serviceContext(), service.api, chatID, telegramTypingRefresh, telegramTypingSendTimeout, service.warn)
+		turnRelay := newTelegramTurnRelay(service, chatID)
+		turnRelay.setTypingIndicator(indicator)
+		relay.relays = append(relay.relays, turnRelay)
+		relay.typings = append(relay.typings, indicator)
+	}
+	// Match Telegram-originated turns: establish the native chat action before
+	// the mirrored prompt/progress queue can overtake it. Each request is already
+	// running concurrently, and a failed action is bounded and non-fatal.
+	for _, indicator := range relay.typings {
+		indicator.WaitReady(service.serviceContext())
 	}
 	return relay
 }
@@ -230,6 +244,9 @@ func (r *telegramTerminalTurnRelay) finish() error {
 	if r == nil {
 		return nil
 	}
+	// Keep the heartbeat alive while outstanding prompt/progress messages drain,
+	// then stop it on every terminal outcome before the final response is sent.
+	defer r.stopTyping()
 	var firstErr error
 	for _, relay := range r.relays {
 		if err := relay.finish(); err != nil && firstErr == nil {
@@ -237,6 +254,15 @@ func (r *telegramTerminalTurnRelay) finish() error {
 		}
 	}
 	return firstErr
+}
+
+func (r *telegramTerminalTurnRelay) stopTyping() {
+	if r == nil {
+		return
+	}
+	for _, indicator := range r.typings {
+		indicator.Stop()
+	}
 }
 
 func (r *telegramTerminalTurnRelay) sendFinal(text string) {
