@@ -43,6 +43,18 @@ type turnInteractionRequest struct {
 type turnPresentationSink func(turnPresentationEvent)
 type turnInteractionProvider func(context.Context, turnInteractionRequest) (string, error)
 
+// snapshotTurnFrontend lets a short-lived replacement candidate inherit the
+// front end that initiated an instance switch. The caller installs the values
+// on the candidate and must restore them when the transition finishes.
+func (c *Client) snapshotTurnFrontend() (turnPresentationSink, turnInteractionProvider) {
+	if c == nil {
+		return nil, nil
+	}
+	c.turnFrontendMu.RLock()
+	defer c.turnFrontendMu.RUnlock()
+	return c.turnPresentationSink, c.turnInteractionProvider
+}
+
 // installTurnFrontend binds one transient owner to the Client. Stateful client
 // actions are serialized by bacliActionMu, but transport callbacks are on other
 // goroutines, so registration and delivery still need their own lock. The

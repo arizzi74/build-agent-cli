@@ -21,6 +21,7 @@ type ProfileInfo struct {
 	WSURL       string
 	HasToken    bool
 	HasSession  bool
+	HasLogin    bool
 }
 
 type AppScope struct {
@@ -81,6 +82,9 @@ func handleInstanceFlags(opts Options) (bool, error) {
 			}
 			if instance.HasSession {
 				creds = append(creds, "web-session")
+			}
+			if instance.HasLogin {
+				creds = append(creds, "stored-login")
 			}
 			credText := "no-credentials"
 			if len(creds) > 0 {
@@ -198,12 +202,14 @@ func listProfiles() ([]ProfileInfo, error) {
 		}
 		_, tokenErr := os.Stat(fileTokenPath(name))
 		_, sessionErr := os.Stat(sessionFile(name))
+		_, loginErr := os.Stat(credentialSecretsFile(name))
 		profiles = append(profiles, ProfileInfo{
 			Name:        name,
 			InstanceURL: cfg.InstanceURL,
 			WSURL:       cfg.WSURL,
 			HasToken:    tokenErr == nil,
 			HasSession:  sessionErr == nil,
+			HasLogin:    loginErr == nil,
 		})
 	}
 	sort.Slice(profiles, func(i, j int) bool { return profiles[i].Name < profiles[j].Name })

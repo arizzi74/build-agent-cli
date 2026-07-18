@@ -22,7 +22,7 @@ func telegramPublishedCommands() []telegramBotCommandDefinition {
 		{Name: "cancel", Canonical: "/cancel", Description: "Cancel your active Build Agent turn"},
 	}
 	for _, command := range slashCommandRegistry {
-		if command.Hidden {
+		if command.Hidden || command.TelegramDisabled {
 			continue
 		}
 		name := telegramBotCommandName(command.Canonical)
@@ -42,8 +42,6 @@ func telegramPublishedCommands() []telegramBotCommandDefinition {
 func telegramPublishedCommandDescription(command SlashCommandDefinition) string {
 	description := singleLineLabel(command.Description)
 	switch command.Canonical {
-	case "/exit":
-		description = "Host-local quit command; cannot stop bacli remotely"
 	case "/telegram":
 		description = "Manage Telegram; setup wizard is host-local"
 	}
@@ -120,7 +118,7 @@ func telegramCommandSourceFromContext(ctx context.Context) (telegramCommandSourc
 func telegramRemoteSlashLine(command, argument string) (string, bool) {
 	command = telegramCanonicalCommand(command)
 	definition, ok := findSlashCommand(command)
-	if !ok {
+	if !ok || definition.TelegramDisabled {
 		return "", false
 	}
 	argument = strings.TrimSpace(argument)
@@ -129,7 +127,7 @@ func telegramRemoteSlashLine(command, argument string) (string, bool) {
 		// implicit sync. A tapped Telegram menu entry must always have a useful,
 		// deterministic non-modal meaning.
 		switch definition.Canonical {
-		case "/conversation", "/workspace", "/app", "/instance", "/project":
+		case "/conversation", "/workspace", "/app", "/project":
 			argument = "current"
 		case "/sync":
 			argument = "status"
@@ -154,7 +152,7 @@ func telegramRemoteHelp(c *Client) string {
 	out.WriteString("/cancel cancels your active turn. Replies to an interview or approval are accepted directly while it is waiting.\n\n")
 	out.WriteString("BACLI commands:\n")
 	for _, command := range slashCommandRegistry {
-		if command.Hidden {
+		if command.Hidden || command.TelegramDisabled {
 			continue
 		}
 		name := command.Canonical
@@ -168,7 +166,7 @@ func telegramRemoteHelp(c *Client) string {
 		fmt.Fprintf(&out, "%s - %s\n", name, description)
 	}
 	out.WriteString("/whoami - show your numeric Telegram user ID\n")
-	out.WriteString("\nCommands that normally open a terminal picker use a safe current/status default when tapped; supply an explicit subcommand such as list, use, add, pull, or push for the full command behavior. The bot is an authenticated control plane for this bacli process, so mutating commands have the same effects as running them locally.")
+	out.WriteString("\n/instance opens a numbered instance chooser. Other commands that normally open a terminal picker use a safe current/status default when tapped; supply an explicit subcommand such as list, use, add, pull, or push for the full command behavior. The bot is an authenticated control plane for this bacli process, so mutating commands have the same effects as running them locally.")
 	return strings.TrimSpace(out.String())
 }
 

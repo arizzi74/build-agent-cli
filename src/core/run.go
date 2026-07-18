@@ -176,6 +176,7 @@ func Run() {
 	}()
 
 	var switchInstance func(context.Context, string) error
+	var setupInstance func(context.Context) error
 	switchInstance = func(switchCtx context.Context, selector string) error {
 		old := clientRef.Get()
 		if old == nil {
@@ -194,9 +195,22 @@ func Run() {
 			old.restoreStartupConversationTranscript(status)
 			_ = showTerminalFooterTempMessage(status, startupReadyFooterMessage(), 5*time.Second)
 		}
+		restoreCandidateFrontend := func() {}
 		prepare := func(authCtx context.Context, candidate *Client) error {
 			if remoteSwitch {
-				return candidate.PrepareConnectionAuthenticationNonInteractive(authCtx)
+				sink, provider := old.snapshotTurnFrontend()
+				if sink != nil || provider != nil {
+					restoreCandidateFrontend = candidate.installTurnFrontend(sink, provider)
+				}
+				savedErr := candidate.PrepareConnectionAuthenticationNonInteractive(authCtx)
+				if savedErr == nil {
+					return nil
+				}
+				if !connectionErrorRequiresCredentials(savedErr) || provider == nil {
+					return savedErr
+				}
+				candidate.connectionAuthPrepared = false
+				return candidate.PrepareConnectionAuthentication(authCtx)
 			}
 			if wasAppScreen && appScreenEntered {
 				restoreTerminalFooter()
@@ -215,6 +229,23 @@ func Run() {
 			connectCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer cancel()
 			if remoteSwitch {
+				err := candidate.Connect(connectCtx)
+				if err == nil || candidate.gatewayAuth != authModeBasic || !connectionErrorRequiresCredentials(err) {
+					return err
+				}
+				if _, provider := candidate.snapshotTurnFrontend(); provider == nil {
+					return err
+				}
+				// Basic credentials cannot be validated until the websocket handshake.
+				// If a persisted login is rejected, ask the initiating Telegram user
+				// for a replacement and offer the normal persistence choice.
+				candidate.resetConnectionTransport()
+				candidate.connectionAuthPrepared = false
+				candidate.forceCredentialPrompt = true
+				defer func() { candidate.forceCredentialPrompt = false }()
+				if authErr := candidate.PrepareConnectionAuthentication(ctx); authErr != nil {
+					return authErr
+				}
 				return candidate.Connect(connectCtx)
 			}
 			stopConnectingStatus := func() {}
@@ -233,6 +264,7 @@ func Run() {
 		}
 
 		candidate, profile, switched, err := transitionConfiguredInstance(switchCtx, old, selector, prepare, connect, saveActiveInstanceProfile)
+		restoreCandidateFrontend()
 		if err != nil {
 			restoreOldScreen()
 			return err
@@ -243,6 +275,7 @@ func Run() {
 		}
 
 		candidate.instanceSwitch = switchInstance
+		candidate.instanceSetup = setupInstance
 		clientRef.Set(candidate)
 		candidate.drawPersistentStatus()
 		if wasAppScreen {
@@ -253,7 +286,33 @@ func Run() {
 		slashCommandPrintf("switched instance: %s (profile %s)\n", candidate.cfg.InstanceURL, profile)
 		return nil
 	}
+	setupInstance = func(setupCtx context.Context) error {
+		old := clientRef.Get()
+		if old == nil {
+			return errors.New("active client is unavailable")
+		}
+		_, remoteSetup := telegramCommandSourceFromContext(setupCtx)
+		wasAppScreen := appScreenEntered
+		if !remoteSetup && wasAppScreen {
+			restoreTerminalFooter()
+			leaveTerminalAppScreen()
+			appScreenEntered = false
+		}
+		err := old.setupNewConfiguredInstance(setupCtx)
+		if !remoteSetup && wasAppScreen && enterTerminalAppScreen() {
+			appScreenEntered = true
+			active := clientRef.Get()
+			if active == nil {
+				active = old
+			}
+			status := active.statusBarState()
+			active.replaceTerminalConversationTranscript(status)
+			_ = showTerminalFooterTempMessage(status, startupReadyFooterMessage(), 5*time.Second)
+		}
+		return err
+	}
 	clientRef.Get().instanceSwitch = switchInstance
+	clientRef.Get().instanceSetup = setupInstance
 
 	telegram, telegramErr := maybeStartTelegramService(ctx, opts.Profile, clientRef, opts.TurnTimeout, telegramEnvironmentToken)
 	if telegramErr != nil {
@@ -326,6 +385,9 @@ func Run() {
 				}
 			}
 			if handled {
+				if current := clientRef.Get(); current != nil {
+					current.drawPersistentStatus()
+				}
 				continue
 			}
 		}

@@ -924,7 +924,7 @@ func (s *telegramService) executeSlash(in telegramQueuedCommand, line string) st
 		response = "The command is published for BACLI parity but cannot stop this host process remotely."
 	} else {
 		command, _ := telegramCommandParts(line)
-		if command == "/instance" {
+		if command == "/instance" || command == "/setup" {
 			s.adoptClientAfterRemoteSwitch(client)
 		}
 		if text := telegramSafeRemoteText(output.String(), 0); text != "" {

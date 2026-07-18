@@ -313,7 +313,7 @@ func (c *Client) trySavedWebSession(ctx context.Context) (bool, error) {
 	c.applyWebSession(session)
 	if err := c.validateWebSession(ctx); err != nil {
 		if errors.Is(err, errInvalidWebSession) {
-			action, promptErr := promptCredentialRecovery(c.opts.Profile, c.cfg.InstanceURL, "saved web session", err)
+			action, promptErr := c.chooseCredentialRecovery(ctx, "Saved web session", err)
 			if promptErr != nil {
 				return false, promptErr
 			}
@@ -326,7 +326,7 @@ func (c *Client) trySavedWebSession(ctx context.Context) (bool, error) {
 			case credentialRecoveryCancel:
 				return false, fmt.Errorf("authentication canceled for instance %q", c.opts.Profile)
 			default:
-				fmt.Fprintf(os.Stderr, "saved web session is expired or rejected; deleting %s\n", sessionFile(c.opts.Profile))
+				c.reportAuthenticationNotice("The expired or rejected saved web session will be replaced.", "saved web session is expired or rejected; deleting "+sessionFile(c.opts.Profile), false)
 				if deleteErr := deleteWebSession(c.opts.Profile); deleteErr != nil {
 					return false, deleteErr
 				}

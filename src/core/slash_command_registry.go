@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -55,10 +56,13 @@ type SlashCommandDefinition struct {
 	Runtime                  SlashCommandRuntime
 	CapturePolicy            SlashCommandCapturePolicy
 	AvailableWhileProcessing bool
-	Hidden                   bool
-	Suggestions              []string
-	IsModal                  func(args []string) bool
-	Handler                  func(context.Context, *Client, []string) (bool, error)
+	// TelegramDisabled keeps host-lifecycle commands local even though the TUI
+	// and Telegram otherwise share this authoritative registry.
+	TelegramDisabled bool
+	Hidden           bool
+	Suggestions      []string
+	IsModal          func(args []string) bool
+	Handler          func(context.Context, *Client, []string) (bool, error)
 }
 
 func (d SlashCommandDefinition) names() []string {
@@ -220,6 +224,18 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		},
 	},
 	{
+		Canonical: "/setup", Description: "configure, authenticate, and switch to a new ServiceNow instance", Category: "Context", Order: 46,
+		Arguments: SlashCommandNoArguments, Behavior: SlashCommandModal, Runtime: SlashCommandRuntimeAny,
+		CapturePolicy: SlashCommandDoNotCaptureModal, Suggestions: []string{"/setup"},
+		IsModal: func(args []string) bool { return len(args) == 0 },
+		Handler: func(ctx context.Context, c *Client, args []string) (bool, error) {
+			if len(args) != 0 {
+				return true, errors.New("usage: /setup")
+			}
+			return true, c.SetupInstance(ctx)
+		},
+	},
+	{
 		Canonical: "/workspace", Aliases: []string{"/ws"}, Description: "choose an existing Web UI/local workspace", Category: "Context", Order: 50,
 		Arguments: SlashCommandOptionalSubcommand, Behavior: SlashCommandModal, Runtime: SlashCommandRuntimeAny,
 		CapturePolicy: SlashCommandDoNotCaptureModal, Suggestions: []string{"/workspace"},
@@ -273,7 +289,7 @@ var slashCommandRegistry = []SlashCommandDefinition{
 	{
 		Canonical: "/exit", Aliases: []string{"/quit"}, Description: "quit", Category: "General", Order: 70,
 		Arguments: SlashCommandNoArguments, Behavior: SlashCommandImmediate, Runtime: SlashCommandRuntimeAny,
-		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/exit", "/quit"},
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, TelegramDisabled: true, Suggestions: []string{"/exit", "/quit"},
 		Handler: func(_ context.Context, _ *Client, _ []string) (bool, error) { return false, nil },
 	},
 }

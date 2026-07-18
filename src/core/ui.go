@@ -1878,6 +1878,9 @@ func promptInstanceSelection(instances []ProfileInfo, currentProfile string) (st
 		if instance.HasSession {
 			cred = append(cred, "web-session")
 		}
+		if instance.HasLogin {
+			cred = append(cred, "stored-login")
+		}
 		credText := "no credentials"
 		if len(cred) > 0 {
 			credText = strings.Join(cred, ", ")

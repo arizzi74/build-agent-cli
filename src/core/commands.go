@@ -52,6 +52,9 @@ func handleSlashCommandForActiveClient(ctx context.Context, clients *activeClien
 		return nil, false, errors.New("active client is unavailable")
 	}
 	handled, err := handleSlashCommandForTerminalLocked(ctx, client, line, client.statusBarState())
+	if current := clients.Get(); current != nil {
+		client = current
+	}
 	return client, handled, err
 }
 

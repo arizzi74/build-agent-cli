@@ -105,6 +105,19 @@ func (c *Client) persistCredentialChoice(ctx context.Context, username, password
 	return nil
 }
 
+func (c *Client) chooseCredentialRecovery(ctx context.Context, credentialLabel string, cause error) (string, error) {
+	prompt := fmt.Sprintf("%s for %s (%s) failed or expired. Reauthenticate, remove this instance, or cancel?", credentialLabel, c.cfg.InstanceURL, c.opts.Profile)
+	if answer, handled, err := c.requestTurnInteraction(ctx, turnInteractionRequest{
+		Kind: "credential_recovery", Prompt: prompt, Options: []string{"Reauthenticate", "Remove instance", "Cancel"},
+	}); handled {
+		if err != nil {
+			return "", err
+		}
+		return parseCredentialRecoveryAnswer(answer)
+	}
+	return promptCredentialRecovery(c.opts.Profile, c.cfg.InstanceURL, credentialLabel, cause)
+}
+
 func (c *Client) reportAuthenticationNotice(remote, local string, warning bool) {
 	if c != nil && c.hasTurnInteractionProvider() {
 		kind := turnPresentationSummary

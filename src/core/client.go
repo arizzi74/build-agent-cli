@@ -174,6 +174,9 @@ type Client struct {
 	// instanceSwitch is owned by main because a switch replaces this Client
 	// rather than mutating its closed transport/session lifecycle in place.
 	instanceSwitch func(context.Context, string) error
+	// instanceSetup is process-owned for the same reason: successful setup
+	// installs a new active Client instead of retargeting this one.
+	instanceSetup func(context.Context) error
 }
 
 // nirvanaToolCall is the client-side counterpart of the Web UI's pending tool
@@ -4379,11 +4382,12 @@ func (c *Client) printLiveUserTurn(content string) {
 }
 
 func (c *Client) drawPersistentStatus() {
-	if !interactiveTerminalUIEnabled() {
-		return
-	}
 	c.statusMu.Lock()
-	drawTerminalFooterStatus(c.statusBarState())
+	status := c.statusBarState()
+	rememberTerminalFooterStatus(status)
+	if interactiveTerminalUIEnabled() {
+		drawTerminalFooterStatus(status)
+	}
 	c.statusMu.Unlock()
 }
 

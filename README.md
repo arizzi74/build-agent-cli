@@ -76,8 +76,9 @@ Use \`bacli --help\` for the generated flag help and \`/help\` in the interactiv
 | Command | Brief description |
 | --- | --- |
 | \`/help\`, \`/?\` | Show commands available in the current transport. |
-| \`/exit\`, \`/quit\` | Leave the interactive client. |
-| \`/instance\`, \`/instances\` | Open the instance picker; use \`current\`, \`list\`, or \`use <profile-or-instance>\` for direct control. |
+| \`/exit\`, \`/quit\` | Leave the interactive client (local TUI only; never exposed through Telegram). |
+| \`/instance\`, \`/instances\` | Choose a configured instance in the TUI or Telegram; use \`current\`, \`list\`, or \`use <profile-or-instance>\` for direct control. |
+| \`/setup\` | Configure a new instance, authenticate it, optionally retain entered login credentials, and switch to it. |
 | \`/conversation\`, \`/conv\` | Open the conversation picker; supports \`current\`, \`list\`, \`new\`, and \`use <selector>\`. |
 | \`/workspace\`, \`/ws\` | Open the workspace picker; supports \`current\`, \`list\`, \`new <name>\`, \`use <name>\`, \`reset\`, and \`delete <name>\`. |
 | \`/app\`, \`/application\` | Open the app picker; supports \`current\`, \`list\`, \`use <scope> [name]\`, and \`clear\`. |

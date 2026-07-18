@@ -487,6 +487,13 @@ var lastTerminalFooterStatus struct {
 	state statusBarState
 }
 
+func rememberTerminalFooterStatus(status statusBarState) {
+	lastTerminalFooterStatus.Lock()
+	lastTerminalFooterStatus.set = true
+	lastTerminalFooterStatus.state = status
+	lastTerminalFooterStatus.Unlock()
+}
+
 var terminalFooterTempStatus struct {
 	sync.Mutex
 	message string
@@ -545,10 +552,7 @@ func activateTerminalFooter(status statusBarState) (terminalFooterMetrics, bool)
 	fmt.Fprint(os.Stderr, "\x1b[u")
 	lastTerminalFooterMetrics.set = true
 	lastTerminalFooterMetrics.metrics = metrics
-	lastTerminalFooterStatus.Lock()
-	lastTerminalFooterStatus.set = true
-	lastTerminalFooterStatus.state = status
-	lastTerminalFooterStatus.Unlock()
+	rememberTerminalFooterStatus(status)
 	clearTerminalAppScrollback()
 	return metrics, true
 }
