@@ -350,6 +350,28 @@ func Run() {
 		response, turnErr := runPromptForResponseLocked(ctx, active, line, opts.TurnTimeout)
 		capture.Stop()
 		restoreTurnFrontend()
+		connectionRecovered := false
+		if turnErr != nil && turnConnectionNeedsRecovery(turnErr) {
+			wasAppScreen := appScreenEntered
+			if wasAppScreen {
+				restoreTerminalFooter()
+				leaveTerminalAppScreen()
+				appScreenEntered = false
+			}
+			recovered, recoveryErr := active.recoverConnectionAfterTurnError(ctx, turnErr)
+			if wasAppScreen && enterTerminalAppScreen() {
+				appScreenEntered = true
+				status = active.statusBarState()
+				active.replaceTerminalConversationTranscript(status)
+			}
+			if recovered {
+				connectionRecovered = true
+				response = connectionRestoredMessage
+				turnErr = nil
+			} else if recoveryErr != nil {
+				turnErr = fmt.Errorf("%v; connection recovery: %w", turnErr, recoveryErr)
+			}
+		}
 		bacliActionMu.Unlock()
 		if terminalRelay != nil {
 			if relayErr := terminalRelay.finish(); relayErr != nil && ctx.Err() == nil {
@@ -360,7 +382,11 @@ func Run() {
 			}
 		}
 		err = turnErr
-		if errors.Is(err, context.Canceled) {
+		if connectionRecovered {
+			if !terminalRecordSystemTextAndAppend("Connection", connectionRestoredMessage, status) {
+				fmt.Fprintln(os.Stderr, connectionRestoredMessage)
+			}
+		} else if errors.Is(err, context.Canceled) {
 			clearTerminalFooterTempMessage()
 			if !terminalRecordSystemTextAndAppend("Action", "Cancelled", status) {
 				fmt.Fprintln(os.Stderr, "Action cancelled")

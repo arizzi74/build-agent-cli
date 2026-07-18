@@ -18,7 +18,7 @@ func handleSessionFlags(opts Options) (bool, error) {
 		if err := deleteProfileAuthentication(opts.Profile); err != nil {
 			return true, err
 		}
-		fmt.Fprintf(os.Stderr, "deleted web session and OAuth token for profile %q; instance configuration was preserved\n", opts.Profile)
+		fmt.Fprintf(os.Stderr, "deleted web session, OAuth token, and stored login credentials for profile %q; instance configuration was preserved\n", opts.Profile)
 		return true, nil
 	}
 	if opts.SessionStatus {
@@ -41,13 +41,20 @@ func handleSessionFlags(opts Options) (bool, error) {
 			fmt.Printf("user token: no\n")
 		}
 		fmt.Printf("path: %s\n", sessionFile(opts.Profile))
+		if _, stored, err := loadStoredInstanceCredentials(opts.Profile, session.InstanceURL); err != nil {
+			fmt.Printf("stored login: invalid (%v)\n", err)
+		} else if stored {
+			fmt.Printf("stored login: yes (%s)\n", credentialSecretsFile(opts.Profile))
+		} else {
+			fmt.Printf("stored login: no\n")
+		}
 		return true, nil
 	}
 	return false, nil
 }
 
 func deleteProfileAuthentication(profile string) error {
-	for _, path := range []string{sessionFile(profile), fileTokenPath(profile)} {
+	for _, path := range []string{sessionFile(profile), fileTokenPath(profile), credentialSecretsFile(profile)} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("delete saved authentication %s: %w", filepath.Base(path), err)
 		}

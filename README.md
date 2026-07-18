@@ -58,8 +58,8 @@ Use \`bacli --help\` for the generated flag help and \`/help\` in the interactiv
 | \`--auth <form\\|cookie\\|basic>\` | Choose web-session authentication; \`basic\` is for \`--web-gateway\`. |
 | \`--user <username>\` | Prefill the web-gateway Basic/form username; the password is prompted. |
 | \`--no-open\` | Print the OAuth URL without opening a browser. |
-| \`--logout\` | Remove saved session and OAuth credentials for the selected profile. |
-| \`--session-status\` | Show safe saved-session status and exit. |
+| \`--logout\` | Remove saved session, OAuth token, and opt-in stored login for the selected profile. |
+| \`--session-status\` | Show safe saved-session and stored-login status without revealing secrets. |
 | \`--auto-approve\` | Accept supported approval/client prompts automatically. |
 | \`--application-id-list <ids>\` | Supply comma-separated app IDs for conversation listing. |
 | \`--debug-file <file>\`, \`-debug <file>\`, \`--debug <file>\` | Write terminal output and a redacted debug trace to a file. |

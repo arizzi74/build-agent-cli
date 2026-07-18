@@ -88,7 +88,7 @@ func (c *Client) getNirvanaAccessToken(ctx context.Context, silent bool) (TokenR
 	if mode == authModeBasic {
 		return TokenResponse{}, errors.New("--auth basic is only supported with --web-gateway; Nirvana requires a reusable ServiceNow web session (--auth form or --auth cookie)")
 	}
-	action, err := c.chooseNirvanaCredentialRecovery(recoveryErr)
+	action, err := c.chooseNirvanaCredentialRecovery(ctx, recoveryErr)
 	if err != nil {
 		return TokenResponse{}, err
 	}
@@ -143,11 +143,11 @@ func (c *Client) getNirvanaInteractiveAccessToken(ctx context.Context, silent bo
 		c.connectionAuthPrepared = true
 	}
 	if err := c.checkSessionTimeout(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "warning: could not inspect web session timeout; continuing OAuth")
+		c.reportAuthenticationNotice("Could not inspect the web session timeout; continuing OAuth.", "warning: could not inspect web session timeout; continuing OAuth", true)
 	}
 	tok, err := c.runNirvanaSessionOAuth(ctx, true)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "warning: web-session OAuth could not complete; using manual authorization flow")
+		c.reportAuthenticationNotice("Web-session OAuth could not complete; using the manual authorization flow.", "warning: web-session OAuth could not complete; using manual authorization flow", true)
 		tok, err = runOAuthPKCEFlow(ctx, oauthConfig(c.cfg), c.opts.NoOpen)
 	}
 	if err != nil {
@@ -177,12 +177,19 @@ func (c *Client) configureNirvanaInteractiveAuth(ctx context.Context) error {
 	return c.configureGatewayAuth(ctx)
 }
 
-func (c *Client) chooseNirvanaCredentialRecovery(cause error) (string, error) {
+func (c *Client) chooseNirvanaCredentialRecovery(ctx context.Context, cause error) (string, error) {
 	if c.oauthRecoveryChoice != nil {
 		return c.oauthRecoveryChoice(c.opts.Profile, c.cfg.InstanceURL, "OAuth and saved web session", cause)
 	}
+	prompt := fmt.Sprintf("OAuth and saved web session for %s (%s) failed or expired. Reauthenticate, remove this instance, or cancel?", c.cfg.InstanceURL, c.opts.Profile)
+	if answer, handled, err := c.requestTurnInteraction(ctx, turnInteractionRequest{Kind: "credential_recovery", Prompt: prompt, Options: []string{"Reauthenticate", "Remove instance", "Cancel"}}); handled {
+		if err != nil {
+			return "", err
+		}
+		return parseCredentialRecoveryAnswer(answer)
+	}
 	if !credentialRecoveryInteractive() {
-		return "", errors.New("Nirvana credential recovery requires an interactive terminal; no saved credentials were changed")
+		return "", errors.New("Nirvana credential recovery requires an interactive TUI or the authorized Telegram turn owner; no saved credentials were changed")
 	}
 	return promptCredentialRecovery(c.opts.Profile, c.cfg.InstanceURL, "OAuth and saved web session", cause)
 }
@@ -212,7 +219,7 @@ func (c *Client) trySavedSessionOAuth(ctx context.Context, silent bool) (TokenRe
 func (c *Client) saveNirvanaAccessToken(tok TokenResponse) (TokenResponse, error) {
 	tok.IssuedAt, tok.InstanceURL = time.Now().UnixMilli(), c.cfg.InstanceURL
 	if err := saveCachedToken(c.opts.Profile, tok); err != nil {
-		fmt.Fprintln(os.Stderr, "warning: could not cache OAuth token")
+		c.reportAuthenticationNotice("Could not cache the refreshed OAuth token.", "warning: could not cache OAuth token", true)
 	}
 	c.oauthAccessToken = tok.AccessToken
 	return tok, nil
@@ -326,7 +333,16 @@ func (c *Client) runSessionOAuthPKCEWithInteraction(ctx context.Context, interac
 		if !interactive || c.opts.AutoApprove {
 			return TokenResponse{}, errors.New("OAuth consent requires interactive approval")
 		}
-		approved, err := authConfirm("Allow this ServiceNow session to authorize Build Agent CLI?")
+		approvalPrompt := "Allow this ServiceNow session to authorize Build Agent CLI?"
+		approved := false
+		if answer, handled, interactionErr := c.requestTurnInteraction(ctx, turnInteractionRequest{Kind: "approval", Prompt: approvalPrompt, Options: []string{"Approve", "Reject"}}); handled {
+			if interactionErr != nil {
+				return TokenResponse{}, interactionErr
+			}
+			approved, err = parseTurnApprovalAnswer(answer)
+		} else {
+			approved, err = authConfirm(approvalPrompt)
+		}
 		if err != nil {
 			return TokenResponse{}, err
 		}

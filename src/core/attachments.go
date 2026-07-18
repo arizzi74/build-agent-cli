@@ -92,6 +92,10 @@ func (c *Client) addPendingAttachmentFile(path string) (attachmentSummary, error
 }
 
 func (c *Client) addPendingAttachmentFileOwned(path, owner string) (attachmentSummary, error) {
+	return c.addPendingAttachmentStagedFileOwned(path, filepath.Base(strings.TrimSpace(path)), "", owner)
+}
+
+func (c *Client) addPendingAttachmentStagedFileOwned(path, name, mediaType, owner string) (attachmentSummary, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return attachmentSummary{}, errors.New("attachment path is required")
@@ -121,7 +125,10 @@ func (c *Client) addPendingAttachmentFileOwned(path, owner string) (attachmentSu
 	if len(data) > attachmentMaxFileBytes {
 		return attachmentSummary{}, fmt.Errorf("attachment exceeds the %s per-file limit", formatAttachmentBytes(attachmentMaxFileBytes))
 	}
-	return c.addPendingAttachmentBytesOwned(filepath.Base(path), mime.TypeByExtension(strings.ToLower(filepath.Ext(path))), data, owner)
+	if strings.TrimSpace(mediaType) == "" {
+		mediaType = mime.TypeByExtension(strings.ToLower(filepath.Ext(name)))
+	}
+	return c.addPendingAttachmentBytesOwned(name, mediaType, data, owner)
 }
 
 func (c *Client) addPendingAttachmentBytes(name, mediaType string, data []byte) (attachmentSummary, error) {

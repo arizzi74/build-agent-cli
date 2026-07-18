@@ -18,6 +18,14 @@ type telegramQueuedCommand struct {
 	userID        string
 	text          string
 	inputMirrored bool
+	attachment    *telegramInboundAttachment
+}
+
+type telegramInboundAttachment struct {
+	fileID    string
+	name      string
+	mediaType string
+	size      int64
 }
 
 type telegramService struct {
@@ -30,12 +38,13 @@ type telegramService struct {
 	client      *Client
 	timeout     time.Duration
 
-	ctx      context.Context
-	cancel   context.CancelFunc
-	commands chan telegramQueuedCommand
-	fatalErr chan error
-	wg       sync.WaitGroup
-	lockFile *os.File
+	ctx             context.Context
+	cancel          context.CancelFunc
+	commands        chan telegramQueuedCommand
+	fatalErr        chan error
+	wg              sync.WaitGroup
+	lockFile        *os.File
+	attachmentSpool string
 
 	clientMu           sync.RWMutex
 	outboundMu         sync.Mutex
@@ -116,15 +125,48 @@ func maybeStartTelegramService(parent context.Context, profile string, clients *
 	}
 
 	ctx, stop := context.WithCancel(parent)
+	attachmentSpool, err := createTelegramAttachmentSpool()
+	if err != nil {
+		stop()
+		return nil, err
+	}
 	service := &telegramService{
 		profile: profile, cfg: cfg, api: api, botID: botID, fingerprint: fingerprint, clients: clients, client: pinnedClient, timeout: timeout,
-		ctx: ctx, cancel: stop, commands: make(chan telegramQueuedCommand, 64), fatalErr: make(chan error, 1), lockFile: lockFile,
+		ctx: ctx, cancel: stop, commands: make(chan telegramQueuedCommand, 64), fatalErr: make(chan error, 1), lockFile: lockFile, attachmentSpool: attachmentSpool,
 	}
 	service.wg.Add(2)
 	go service.poll(state.LastUpdateID + 1)
 	go service.runCommands()
 	closeLock = false
 	return service, nil
+}
+
+func createTelegramAttachmentSpool() (string, error) {
+	base := filepath.Join(telegramDir(), "attachments")
+	if err := rejectSymlinkPath(base); err != nil {
+		return "", errors.New("unsafe Telegram attachment storage path")
+	}
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return "", errors.New("could not create private Telegram attachment storage")
+	}
+	if err := os.Chmod(base, 0o700); err != nil {
+		return "", errors.New("could not secure Telegram attachment storage")
+	}
+	dir := filepath.Join(base, "session-"+uuidV4Compact())
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		return "", errors.New("could not create private Telegram attachment session")
+	}
+	return dir, nil
+}
+
+func cleanupTelegramAttachmentSpool(dir string) {
+	base := filepath.Clean(filepath.Join(telegramDir(), "attachments"))
+	dir = filepath.Clean(dir)
+	if dir == "" || filepath.Dir(dir) != base || !strings.HasPrefix(filepath.Base(dir), "session-") {
+		return
+	}
+	_ = os.RemoveAll(dir)
+	_ = os.Remove(base) // Remove the parent only when no other service session uses it.
 }
 
 func acquireTelegramPollerLock(fingerprint string) (*os.File, error) {
@@ -182,6 +224,8 @@ func (s *telegramService) Close() {
 	}
 	s.cancel()
 	s.wg.Wait()
+	cleanupTelegramAttachmentSpool(s.attachmentSpool)
+	s.attachmentSpool = ""
 	if s.lockFile != nil {
 		unlockProfileFile(s.lockFile)
 		_ = s.lockFile.Close()
@@ -399,6 +443,10 @@ func (s *telegramService) acceptUpdate(update telegramUpdate) {
 		return
 	}
 	text := strings.TrimSpace(message.Text)
+	attachment := telegramInboundAttachmentFromMessage(message)
+	if attachment != nil {
+		text = strings.TrimSpace(message.Caption)
+	}
 	command, _ := telegramCommandParts(text)
 	if command == "/whoami" {
 		response := "Your numeric Telegram user ID is " + userID + "."
@@ -433,18 +481,23 @@ func (s *telegramService) acceptUpdate(update telegramUpdate) {
 		return
 	}
 	inputMirrored := false
-	if s.telegramInteractionConsumesInput(chatID, userID, text) {
+	interactionConsumes, interactionSecret := s.telegramInteractionInputState(chatID, userID, text)
+	if attachment != nil && interactionConsumes {
+		s.sendAsyncMirrored(chatID, "A file cannot answer the active input request. Reply with text, or use /cancel.")
+		return
+	}
+	if interactionConsumes && !interactionSecret {
 		mirrorTelegramInputToTerminal(s.currentTerminalClient(), text)
 		inputMirrored = true
 	}
-	if s.deliverInteractionReply(chatID, userID, text) {
+	if s.deliverInteractionReply(chatID, userID, text, message.MessageID) {
 		return
 	}
-	if text == "" {
-		s.sendAsyncMirrored(chatID, "Send a text message to start a Build Agent turn, or use /help.")
+	if text == "" && attachment == nil {
+		s.sendAsyncMirrored(chatID, "Send a text message or an image/document to start a Build Agent turn, or use /help.")
 		return
 	}
-	if !s.enqueue(telegramQueuedCommand{chatID: chatID, userID: userID, text: text, inputMirrored: inputMirrored}) && s.ctx.Err() == nil {
+	if !s.enqueue(telegramQueuedCommand{chatID: chatID, userID: userID, text: text, inputMirrored: inputMirrored, attachment: attachment}) && s.ctx.Err() == nil {
 		if !inputMirrored {
 			mirrorTelegramInputToTerminal(s.currentTerminalClient(), text)
 		}
@@ -452,30 +505,58 @@ func (s *telegramService) acceptUpdate(update telegramUpdate) {
 	}
 }
 
-func (s *telegramService) telegramInteractionConsumesInput(chatID, userID, text string) bool {
+func telegramInboundAttachmentFromMessage(message *telegramMessage) *telegramInboundAttachment {
+	if message == nil {
+		return nil
+	}
+	if message.Document != nil && strings.TrimSpace(message.Document.FileID) != "" {
+		return &telegramInboundAttachment{
+			fileID: strings.TrimSpace(message.Document.FileID), name: safeAttachmentName(message.Document.FileName),
+			mediaType: strings.TrimSpace(message.Document.MimeType), size: message.Document.FileSize,
+		}
+	}
+	if len(message.Photo) == 0 {
+		return nil
+	}
+	selected := message.Photo[0]
+	for _, candidate := range message.Photo[1:] {
+		selectedArea := int64(selected.Width) * int64(selected.Height)
+		candidateArea := int64(candidate.Width) * int64(candidate.Height)
+		if candidateArea > selectedArea || (candidateArea == selectedArea && candidate.FileSize > selected.FileSize) {
+			selected = candidate
+		}
+	}
+	if strings.TrimSpace(selected.FileID) == "" {
+		return nil
+	}
+	name := "telegram-photo-" + strings.TrimSpace(selected.FileUniqueID) + ".jpg"
+	return &telegramInboundAttachment{fileID: strings.TrimSpace(selected.FileID), name: safeAttachmentName(name), mediaType: "image/jpeg", size: selected.FileSize}
+}
+
+func (s *telegramService) telegramInteractionInputState(chatID, userID, text string) (bool, bool) {
 	if s == nil {
-		return false
+		return false, false
 	}
 	s.turnControlMu.Lock()
 	pending := s.pendingInteraction
 	if pending == nil || pending.chatID != chatID || pending.userID != userID {
 		s.turnControlMu.Unlock()
-		return false
+		return false, false
 	}
-	ready := pending.ready
+	ready, secret := pending.ready, pending.secret
 	s.turnControlMu.Unlock()
 	if !ready {
-		return true
+		return true, secret
 	}
 	command, _ := telegramCommandParts(strings.TrimSpace(text))
 	if command == "" {
-		return false
+		return false, secret
 	}
 	switch command {
 	case "/answer", "/turn_approve", "/turn_reject":
-		return true
+		return true, secret
 	default:
-		return !strings.HasPrefix(command, "/")
+		return !strings.HasPrefix(command, "/"), secret
 	}
 }
 
@@ -679,6 +760,9 @@ func (s *telegramService) runCommands() {
 }
 
 func (s *telegramService) dispatchCommand(in telegramQueuedCommand) string {
+	if in.attachment != nil {
+		return s.dispatchAttachment(in)
+	}
 	if !strings.HasPrefix(strings.TrimSpace(in.text), "/") {
 		return s.runTelegramPrompt(in, in.text)
 	}
@@ -710,6 +794,94 @@ func (s *telegramService) dispatchCommand(in telegramQueuedCommand) string {
 		return "Unknown command. Use /help to see every published BACLI command."
 	}
 	return s.executeSlash(in, line)
+}
+
+func (s *telegramService) dispatchAttachment(in telegramQueuedCommand) string {
+	attachment := in.attachment
+	if attachment == nil {
+		return "Telegram attachment is unavailable."
+	}
+	if attachment.size < 0 {
+		return "Attachment rejected: Telegram returned an invalid size."
+	}
+	if attachment.size > telegramMaxInboundFileBytes {
+		return fmt.Sprintf("Attachment rejected: it exceeds the %s per-file limit.", formatAttachmentBytes(telegramMaxInboundFileBytes))
+	}
+	client, pinned := s.pinnedClient()
+	if !pinned {
+		return "The bacli instance changed. Restart bacli to bind Telegram to the new client securely."
+	}
+	display := "Attachment: " + attachment.name
+	if strings.TrimSpace(in.text) != "" {
+		display += "\n" + strings.TrimSpace(in.text)
+	}
+	if !in.inputMirrored {
+		mirrorTelegramInputToTerminal(client, display)
+		in.inputMirrored = true
+	}
+
+	ctx, cancel := context.WithTimeout(s.serviceContext(), 2*time.Minute)
+	defer cancel()
+	file, err := s.api.getFile(ctx, attachment.fileID)
+	if err != nil {
+		return "Attachment download failed: " + telegramSafeRemoteText(err.Error(), 500)
+	}
+	if file.FileSize > 0 && attachment.size > 0 && file.FileSize != attachment.size {
+		return "Attachment download failed: Telegram file metadata changed before download."
+	}
+	path, err := s.spoolTelegramFile(ctx, file, attachment.name)
+	if err != nil {
+		return "Attachment download failed: " + telegramSafeRemoteText(err.Error(), 500)
+	}
+	defer os.Remove(path)
+
+	bacliActionMu.Lock()
+	client, pinned = s.pinnedClient()
+	if !pinned {
+		bacliActionMu.Unlock()
+		return "The bacli instance changed. Restart bacli to bind Telegram to the new client securely."
+	}
+	summary, err := client.addPendingAttachmentStagedFileOwned(path, attachment.name, attachment.mediaType, telegramPendingAttachmentOwner(in.chatID, in.userID))
+	bacliActionMu.Unlock()
+	if err != nil {
+		return "Attachment could not be queued: " + telegramSafeRemoteText(err.Error(), 500)
+	}
+	if strings.TrimSpace(in.text) == "" {
+		return fmt.Sprintf("Queued %s (%s, %s). Send a message to use it in the next turn; /attach list, /attach remove, and /attach clear manage the queue.", summary.Name, summary.Type, formatAttachmentBytes(summary.Size))
+	}
+	return s.runTelegramPrompt(in, in.text)
+}
+
+func (s *telegramService) spoolTelegramFile(ctx context.Context, file telegramFile, name string) (string, error) {
+	if s == nil || s.api == nil || strings.TrimSpace(s.attachmentSpool) == "" {
+		return "", errors.New("private attachment storage is unavailable")
+	}
+	name = safeAttachmentName(name)
+	path := filepath.Join(s.attachmentSpool, uuidV4Compact()+"-"+name)
+	if filepath.Dir(filepath.Clean(path)) != filepath.Clean(s.attachmentSpool) {
+		return "", errors.New("unsafe attachment filename")
+	}
+	if err := rejectSymlinkPath(path); err != nil {
+		return "", errors.New("unsafe private attachment storage path")
+	}
+	handle, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", errors.New("could not create private attachment file")
+	}
+	written, downloadErr := s.api.downloadFile(ctx, file.FilePath, handle)
+	closeErr := handle.Close()
+	if downloadErr != nil || closeErr != nil {
+		_ = os.Remove(path)
+		if downloadErr != nil {
+			return "", downloadErr
+		}
+		return "", errors.New("could not close private attachment file")
+	}
+	if file.FileSize > 0 && written != file.FileSize {
+		_ = os.Remove(path)
+		return "", errors.New("Telegram attachment size did not match its metadata")
+	}
+	return path, nil
 }
 
 func (s *telegramService) executeSlash(in telegramQueuedCommand, line string) string {

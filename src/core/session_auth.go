@@ -117,7 +117,7 @@ func (c *Client) configureGatewayAuth(ctx context.Context) error {
 	}
 	switch mode {
 	case authModeBasic:
-		return c.configureBasicAuth()
+		return c.configureBasicAuth(ctx)
 	case authModeForm:
 		return c.configureFormAuth(ctx)
 	case authModeCookie:
@@ -133,7 +133,19 @@ func (c *Client) configureGatewayAuthNonInteractive(ctx context.Context) error {
 		return err
 	}
 	if mode == authModeBasic {
-		return errors.New("basic authentication requires a host-terminal password prompt")
+		credentials, stored, err := loadStoredInstanceCredentials(c.opts.Profile, c.cfg.InstanceURL)
+		if err != nil {
+			return err
+		}
+		if !stored {
+			return errors.New("basic authentication requires a host-terminal password prompt or explicitly stored credentials")
+		}
+		if err := c.initGatewayHTTPClient(); err != nil {
+			return err
+		}
+		c.gatewayAuth = mode
+		c.basicUser, c.basicPass = credentials.Username, credentials.Password
+		return nil
 	}
 	session, ok := loadMatchingWebSession(c.opts.Profile, c.cfg.InstanceURL)
 	if !ok {
@@ -150,27 +162,33 @@ func (c *Client) configureGatewayAuthNonInteractive(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) configureBasicAuth() error {
-	if c.basicUser == "" {
-		if c.opts.BasicUser != "" {
-			c.basicUser = c.opts.BasicUser
-		} else {
-			user, err := promptLine("ServiceNow username: ")
-			if err != nil {
-				return err
-			}
-			c.basicUser = strings.TrimSpace(user)
-		}
-	}
-	if c.basicUser == "" {
-		return errors.New("ServiceNow username is required for basic auth")
-	}
-	if c.basicPass == "" {
-		pass, err := promptPassword("ServiceNow password: ")
+func (c *Client) configureBasicAuth(ctx context.Context) error {
+	if c.basicUser == "" || c.basicPass == "" {
+		credentials, stored, err := loadStoredInstanceCredentials(c.opts.Profile, c.cfg.InstanceURL)
 		if err != nil {
 			return err
 		}
-		c.basicPass = pass
+		storedRejected := stored && c.forceCredentialPrompt
+		if stored && !c.forceCredentialPrompt {
+			c.basicUser, c.basicPass = credentials.Username, credentials.Password
+			return nil
+		}
+		suggested := c.opts.BasicUser
+		if suggested == "" {
+			suggested = credentials.Username
+		}
+		reason := "Basic authentication requires credentials"
+		if storedRejected {
+			reason = "Stored basic credentials were rejected"
+		}
+		username, password, err := c.promptServiceNowCredentials(ctx, suggested, reason)
+		if err != nil {
+			return err
+		}
+		c.basicUser, c.basicPass = username, password
+		if err := c.persistCredentialChoice(ctx, username, password, storedRejected); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -182,33 +200,62 @@ func (c *Client) configureFormAuth(ctx context.Context) error {
 	if err := c.initGatewayHTTPClient(); err != nil {
 		return err
 	}
-	if c.opts.BasicUser != "" {
-		c.basicUser = c.opts.BasicUser
-	} else {
-		user, err := promptLine("ServiceNow username: ")
+	credentials, stored, err := loadStoredInstanceCredentials(c.opts.Profile, c.cfg.InstanceURL)
+	if err != nil {
+		return err
+	}
+	username, password := credentials.Username, credentials.Password
+	usedEnteredCredentials := false
+	storedRejected := false
+	var session WebSession
+	if stored {
+		session, err = c.loginWithServiceNowForm(ctx, username, password)
+		if err == nil {
+			err = c.applyAndValidateWebSession(ctx, session)
+		}
+		if err != nil {
+			storedRejected = true
+			if !c.credentialInputAvailable() {
+				return fmt.Errorf("stored ServiceNow login was rejected and interactive replacement is unavailable: %w", err)
+			}
+			if err := c.initGatewayHTTPClient(); err != nil {
+				return err
+			}
+		}
+	}
+	if !stored || storedRejected {
+		suggested := c.opts.BasicUser
+		if suggested == "" {
+			suggested = username
+		}
+		username, password, err = c.promptServiceNowCredentials(ctx, suggested, func() string {
+			if storedRejected {
+				return "Stored credentials were rejected"
+			}
+			return "Form authentication requires credentials"
+		}())
 		if err != nil {
 			return err
 		}
-		c.basicUser = strings.TrimSpace(user)
+		usedEnteredCredentials = true
+		session, err = c.loginWithServiceNowForm(ctx, username, password)
+		if err != nil {
+			return err
+		}
+		if err := c.applyAndValidateWebSession(ctx, session); err != nil {
+			return fmt.Errorf("form login did not produce a reusable Build Agent web session: %w", err)
+		}
 	}
-	if c.basicUser == "" {
-		return errors.New("ServiceNow username is required for form auth")
-	}
-	pass, err := promptPassword("ServiceNow password: ")
-	if err != nil {
-		return err
-	}
-	session, err := c.loginWithServiceNowForm(ctx, c.basicUser, pass)
-	if err != nil {
-		return err
-	}
-	if err := c.applyAndValidateWebSession(ctx, session); err != nil {
-		return fmt.Errorf("form login did not produce a reusable Build Agent web session: %w", err)
-	}
+	c.basicUser = username
 	if err := saveWebSession(c.opts.Profile, session); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "saved web session: %s\n", sessionFile(c.opts.Profile))
+	if usedEnteredCredentials {
+		if err := c.persistCredentialChoice(ctx, username, password, storedRejected); err != nil {
+			return err
+		}
+	}
+	c.reportAuthenticationNotice("Saved a reusable ServiceNow web session for this profile.", "saved web session: "+sessionFile(c.opts.Profile), false)
 	return nil
 }
 
@@ -219,7 +266,7 @@ func (c *Client) configureCookieAuth(ctx context.Context) error {
 	if err := c.initGatewayHTTPClient(); err != nil {
 		return err
 	}
-	cookieHeader, err := promptPassword("Cookie header from authenticated browser request: ")
+	cookieHeader, err := c.promptCredentialValue(ctx, "credential_cookie", "Cookie header from authenticated browser request", true)
 	if err != nil {
 		return err
 	}
@@ -227,9 +274,19 @@ func (c *Client) configureCookieAuth(ctx context.Context) error {
 	if cookieHeader == "" {
 		return errors.New("cookie header is required")
 	}
-	userToken, err := promptPassword("X-UserToken / window.g_ck (optional, press Enter to skip): ")
-	if err != nil {
-		return err
+	userToken := ""
+	if answer, handled, interactionErr := c.requestTurnInteraction(ctx, turnInteractionRequest{Kind: "credential_token", Prompt: "X-UserToken / window.g_ck (optional; reply - to skip)", Secret: true}); handled {
+		if interactionErr != nil {
+			return interactionErr
+		}
+		if strings.TrimSpace(answer) != "-" {
+			userToken = strings.TrimSpace(answer)
+		}
+	} else {
+		userToken, err = promptPassword("X-UserToken / window.g_ck (optional, press Enter to skip): ")
+		if err != nil {
+			return err
+		}
 	}
 	session := WebSession{
 		InstanceURL:  c.cfg.InstanceURL,
@@ -244,7 +301,7 @@ func (c *Client) configureCookieAuth(ctx context.Context) error {
 	if err := saveWebSession(c.opts.Profile, session); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "saved web session: %s\n", sessionFile(c.opts.Profile))
+	c.reportAuthenticationNotice("Saved a reusable ServiceNow web session for this profile.", "saved web session: "+sessionFile(c.opts.Profile), false)
 	return nil
 }
 

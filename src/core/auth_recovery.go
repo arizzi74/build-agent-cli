@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -40,6 +41,20 @@ func promptCredentialRecovery(profile, instanceURL, what string, cause error) (s
 			return credentialRecoveryCancel, nil
 		}
 		fmt.Fprintln(os.Stderr, "please answer r, d, or c")
+	}
+}
+
+func parseCredentialRecoveryAnswer(answer string) (string, error) {
+	answer = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(answer, "/")))
+	switch answer {
+	case "", "1", "r", "reauth", "reauthenticate", "login":
+		return credentialRecoveryReauth, nil
+	case "2", "d", "delete", "remove", "remove instance", "rm":
+		return credentialRecoveryRemove, nil
+	case "3", "c", "cancel", "q", "quit":
+		return credentialRecoveryCancel, nil
+	default:
+		return "", errors.New("reply Reauthenticate, Remove instance, or Cancel")
 	}
 }
 

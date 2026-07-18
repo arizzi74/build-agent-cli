@@ -30,6 +30,7 @@ type telegramPendingInteraction struct {
 	chatID  string
 	userID  string
 	kind    string
+	secret  bool
 	ready   bool
 	replies chan string
 }
@@ -605,7 +606,7 @@ func (s *telegramService) cancelOwnedTurn(chatID, userID string) (cancelled bool
 	return false, false
 }
 
-func (s *telegramService) deliverInteractionReply(chatID, userID, text string) bool {
+func (s *telegramService) deliverInteractionReply(chatID, userID, text string, messageID int64) bool {
 	s.turnControlMu.Lock()
 	pending := s.pendingInteraction
 	if pending == nil || pending.chatID != chatID || pending.userID != userID {
@@ -613,10 +614,14 @@ func (s *telegramService) deliverInteractionReply(chatID, userID, text string) b
 		return false
 	}
 	if !pending.ready {
+		secret := pending.secret
 		s.turnControlMu.Unlock()
 		// The explicit ready acknowledgement is the authorization boundary.
 		// Ignore early guesses/replies so they cannot race ahead of complete
 		// delivery (and cannot appear after the ready message out of order).
+		if secret {
+			s.deleteSecretReply(chatID, messageID)
+		}
 		return true
 	}
 	text = strings.TrimSpace(text)
@@ -629,7 +634,11 @@ func (s *telegramService) deliverInteractionReply(chatID, userID, text string) b
 		fields := strings.Fields(argument)
 		if len(fields) < 2 || !strings.EqualFold(fields[0], pending.id) {
 			expected := pending.id
+			secret := pending.secret
 			s.turnControlMu.Unlock()
+			if secret {
+				s.deleteSecretReply(chatID, messageID)
+			}
 			s.sendAsyncMirrored(chatID, "That interaction reply does not match the active request. Use /answer "+expected+" <answer>.")
 			return true
 		}
@@ -645,8 +654,14 @@ func (s *telegramService) deliverInteractionReply(chatID, userID, text string) b
 		}
 	}
 	if strings.TrimSpace(text) == "" {
+		secret := pending.secret
 		s.turnControlMu.Unlock()
-		s.sendAsyncMirrored(chatID, "The interaction reply cannot be empty.")
+		if secret {
+			s.deleteSecretReply(chatID, messageID)
+			s.sendAsync(chatID, "The secret reply cannot be empty.")
+		} else {
+			s.sendAsyncMirrored(chatID, "The interaction reply cannot be empty.")
+		}
 		return true
 	}
 	if pending.kind == "approval" {
@@ -656,6 +671,7 @@ func (s *telegramService) deliverInteractionReply(chatID, userID, text string) b
 			return true
 		}
 	}
+	secret := pending.secret
 	select {
 	case pending.replies <- text:
 	default:
@@ -664,11 +680,25 @@ func (s *telegramService) deliverInteractionReply(chatID, userID, text string) b
 		s.pendingInteraction = nil
 	}
 	s.turnControlMu.Unlock()
+	if secret {
+		s.deleteSecretReply(chatID, messageID)
+	}
 	return true
 }
 
+func (s *telegramService) deleteSecretReply(chatID string, messageID int64) {
+	if s == nil || s.api == nil || messageID <= 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.serviceContext(), 10*time.Second)
+	defer cancel()
+	// Telegram bots are not end-to-end encrypted. Deletion merely minimizes
+	// retention after receipt and is intentionally best effort.
+	_ = s.api.deleteMessage(ctx, chatID, messageID)
+}
+
 func (s *telegramService) requestInteraction(ctx context.Context, chatID, userID string, relay *telegramTurnRelay, request turnInteractionRequest) (string, error) {
-	pending := &telegramPendingInteraction{id: strings.ToUpper(uuidV4Compact()[:6]), chatID: chatID, userID: userID, kind: request.Kind, replies: make(chan string, 1)}
+	pending := &telegramPendingInteraction{id: strings.ToUpper(uuidV4Compact()[:6]), chatID: chatID, userID: userID, kind: request.Kind, secret: request.Secret, replies: make(chan string, 1)}
 	s.turnControlMu.Lock()
 	if s.pendingInteraction != nil {
 		s.turnControlMu.Unlock()
@@ -693,6 +723,8 @@ func (s *telegramService) requestInteraction(ctx context.Context, chatID, userID
 	readyMessage := fmt.Sprintf("Input required [%s] is ready. Reply now", pending.id)
 	if request.Kind == "approval" {
 		readyMessage += " with Approve or Reject."
+	} else if request.Secret {
+		readyMessage += fmt.Sprintf(" directly, or use /answer %s <secret> when it starts with /. The bot will delete the reply after receipt when Telegram permits it.", pending.id)
 	} else {
 		readyMessage += fmt.Sprintf(" directly, or use /answer %s <answer> when the answer starts with /.", pending.id)
 	}
@@ -754,6 +786,8 @@ func formatTelegramInteraction(id string, request turnInteractionRequest) string
 	}
 	if request.Kind == "approval" {
 		out.WriteString("\nReply Approve or Reject (or /turn_approve / /turn_reject). Use /cancel to cancel the turn.")
+	} else if request.Secret {
+		fmt.Fprintf(&out, "\nSecurity: Telegram bots are not end-to-end encrypted. Your reply will not be mirrored in the TUI and will be deleted after receipt when Telegram permits it. For stronger privacy, cancel and enter it in the local TUI. If it starts with /, use /answer %s <secret>.", id)
 	} else {
 		fmt.Fprintf(&out, "\nReply with your answer. If it starts with /, use /answer %s <answer>. Use /cancel to cancel the turn.", id)
 	}
@@ -797,6 +831,11 @@ func (s *telegramService) runTelegramPrompt(in telegramQueuedCommand, prompt str
 		return s.requestInteraction(ctx, in.chatID, in.userID, relay, request)
 	})
 	response, err := runPromptForResponseLocked(promptCtx, client, prompt, s.timeout)
+	recovered := false
+	var recoveryErr error
+	if err != nil && turnConnectionNeedsRecovery(err) {
+		recovered, recoveryErr = client.recoverConnectionAfterTurnError(promptCtx, err)
+	}
 	s.clearActiveTurn(in.chatID, in.userID)
 	restore()
 	// The terminal and Telegram command paths may proceed once client state is
@@ -809,6 +848,12 @@ func (s *telegramService) runTelegramPrompt(in telegramQueuedCommand, prompt str
 	typing.RefreshAndWait(typingFinalCtx)
 	typingFinalCancel()
 	if err != nil {
+		if recovered {
+			return connectionRestoredMessage
+		}
+		if recoveryErr != nil {
+			return "Build Agent connection recovery failed: " + telegramSafeRemoteText(recoveryErr.Error(), 1000)
+		}
 		if errors.Is(err, context.Canceled) {
 			return "Build Agent turn cancelled."
 		}

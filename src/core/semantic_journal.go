@@ -411,6 +411,13 @@ func recoverWorkspaceFromJournal(profile, name string, snapshot WorkspaceState, 
 				return semanticJournalRecovery{}, &semanticJournalBoundaryError{Sequence: entry.Sequence, ConversationID: entry.ConversationID, AfterTerminal: true}
 			}
 			active[key] = NewSemanticTurnState()
+		} else if active[key].Status == SemanticTurnAccepted && event.Type == EventTurnAccepted {
+			// Older builds could append a new accepted boundary after a WebSocket
+			// write failed before the server acknowledged the previous turn. No
+			// started/tool/assistant event can exist for that abandoned boundary,
+			// so the later accepted event is an unambiguous safe reset. This also
+			// repairs affected workspaces on startup without discarding history.
+			active[key] = NewSemanticTurnState()
 		}
 		state, err := Apply(active[key], event)
 		if err != nil {

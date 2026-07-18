@@ -10,6 +10,8 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -22,10 +24,12 @@ const (
 	telegramMaxDirectTextMessages = 10
 	telegramDocumentPartBytes     = 8 << 20
 	telegramDirectMessageInterval = time.Second
+	telegramMaxInboundFileBytes   = 25 << 20
 )
 
 type telegramAPI struct {
 	baseURL          string
+	fileBaseURL      string
 	token            string
 	client           *http.Client
 	messageInterval  time.Duration
@@ -70,11 +74,36 @@ type telegramChat struct {
 }
 
 type telegramMessage struct {
-	MessageID int64         `json:"message_id"`
-	From      *telegramUser `json:"from"`
-	Chat      telegramChat  `json:"chat"`
-	Date      int64         `json:"date"`
-	Text      string        `json:"text"`
+	MessageID int64               `json:"message_id"`
+	From      *telegramUser       `json:"from"`
+	Chat      telegramChat        `json:"chat"`
+	Date      int64               `json:"date"`
+	Text      string              `json:"text"`
+	Caption   string              `json:"caption"`
+	Photo     []telegramPhotoSize `json:"photo"`
+	Document  *telegramDocument   `json:"document"`
+}
+
+type telegramPhotoSize struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	FileSize     int64  `json:"file_size"`
+}
+
+type telegramDocument struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id"`
+	FileName     string `json:"file_name"`
+	MimeType     string `json:"mime_type"`
+	FileSize     int64  `json:"file_size"`
+}
+
+type telegramFile struct {
+	FileID   string `json:"file_id"`
+	FileSize int64  `json:"file_size"`
+	FilePath string `json:"file_path"`
 }
 
 type telegramUpdate struct {
@@ -85,6 +114,7 @@ type telegramUpdate struct {
 func newTelegramAPI(token string) *telegramAPI {
 	return &telegramAPI{
 		baseURL:         "https://api.telegram.org/bot" + token + "/",
+		fileBaseURL:     "https://api.telegram.org/file/bot" + token + "/",
 		token:           token,
 		messageInterval: telegramDirectMessageInterval,
 		client: &http.Client{
@@ -94,6 +124,83 @@ func newTelegramAPI(token string) *telegramAPI {
 			},
 		},
 	}
+}
+
+func (api *telegramAPI) getFile(ctx context.Context, fileID string) (telegramFile, error) {
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" || len(fileID) > 512 || strings.ContainsAny(fileID, "\x00\r\n") {
+		return telegramFile{}, errors.New("invalid Telegram file ID")
+	}
+	var file telegramFile
+	if err := api.call(ctx, "getFile", map[string]string{"file_id": fileID}, &file); err != nil {
+		return telegramFile{}, err
+	}
+	if _, err := safeTelegramFilePath(file.FilePath); err != nil {
+		return telegramFile{}, err
+	}
+	if file.FileSize < 0 {
+		return telegramFile{}, errors.New("Telegram returned an invalid attachment size")
+	}
+	if file.FileSize > telegramMaxInboundFileBytes {
+		return telegramFile{}, fmt.Errorf("Telegram attachment exceeds the %s per-file limit", formatAttachmentBytes(telegramMaxInboundFileBytes))
+	}
+	return file, nil
+}
+
+func safeTelegramFilePath(filePath string) (string, error) {
+	filePath = strings.TrimSpace(strings.ReplaceAll(filePath, "\\", "/"))
+	cleaned := path.Clean(filePath)
+	if filePath == "" || cleaned == "." || strings.HasPrefix(cleaned, "/") || cleaned == ".." || strings.HasPrefix(cleaned, "../") || cleaned != filePath {
+		return "", errors.New("Telegram returned an unsafe file path")
+	}
+	segments := strings.Split(cleaned, "/")
+	for i, segment := range segments {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", errors.New("Telegram returned an unsafe file path")
+		}
+		segments[i] = url.PathEscape(segment)
+	}
+	return strings.Join(segments, "/"), nil
+}
+
+func (api *telegramAPI) downloadFile(ctx context.Context, filePath string, destination io.Writer) (int64, error) {
+	if api == nil || api.client == nil || destination == nil {
+		return 0, errors.New("Telegram file download is unavailable")
+	}
+	safePath, err := safeTelegramFilePath(filePath)
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, api.fileBaseURL+safePath, nil)
+	if err != nil {
+		return 0, errors.New("Telegram file request could not be created")
+	}
+	response, err := api.client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		return 0, errors.New("Telegram file download failed")
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return 0, fmt.Errorf("Telegram file download failed (%d)", response.StatusCode)
+	}
+	if response.ContentLength > telegramMaxInboundFileBytes {
+		return 0, fmt.Errorf("Telegram attachment exceeds the %s per-file limit", formatAttachmentBytes(telegramMaxInboundFileBytes))
+	}
+	limited := io.LimitReader(response.Body, telegramMaxInboundFileBytes+1)
+	written, err := io.Copy(destination, limited)
+	if err != nil {
+		return written, errors.New("Telegram attachment could not be saved")
+	}
+	if written > telegramMaxInboundFileBytes {
+		return written, fmt.Errorf("Telegram attachment exceeds the %s per-file limit", formatAttachmentBytes(telegramMaxInboundFileBytes))
+	}
+	if written == 0 {
+		return 0, errors.New("Telegram attachment is empty")
+	}
+	return written, nil
 }
 
 func (api *telegramAPI) call(ctx context.Context, method string, payload interface{}, result interface{}) error {
@@ -315,6 +422,16 @@ func (api *telegramAPI) sendChatAction(ctx context.Context, chatID, action strin
 	return api.call(ctx, "sendChatAction", map[string]interface{}{
 		"chat_id": chatID,
 		"action":  action,
+	}, nil)
+}
+
+func (api *telegramAPI) deleteMessage(ctx context.Context, chatID string, messageID int64) error {
+	chatID = strings.TrimSpace(chatID)
+	if !validTelegramNumericID(chatID) || messageID <= 0 {
+		return errors.New("invalid Telegram message identity")
+	}
+	return api.call(ctx, "deleteMessage", map[string]interface{}{
+		"chat_id": chatID, "message_id": messageID,
 	}, nil)
 }
 

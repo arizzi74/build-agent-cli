@@ -28,23 +28,27 @@ type Client struct {
 
 	conn    *websocket.Conn
 	writeMu sync.Mutex
+	// transportWG lets reconnect wait until the reader for the old socket has
+	// exited before replacing per-connection channels.
+	transportWG sync.WaitGroup
 
-	httpClient          *http.Client
-	gatewayAuth         string
-	basicUser           string
-	basicPass           string
-	sessionCookieHeader string
-	userToken           string
-	oauthAccessToken    string
-	ambURL              string
-	ambChannel          string
-	ambClient           string
-	ambMsgID            int
-	ambUseForm          bool
-	ambSubscribed       bool
-	ambUnavailable      bool
-	ambCancel           context.CancelFunc
-	nirvanaPingCancel   context.CancelFunc
+	httpClient            *http.Client
+	gatewayAuth           string
+	basicUser             string
+	basicPass             string
+	forceCredentialPrompt bool
+	sessionCookieHeader   string
+	userToken             string
+	oauthAccessToken      string
+	ambURL                string
+	ambChannel            string
+	ambClient             string
+	ambMsgID              int
+	ambUseForm            bool
+	ambSubscribed         bool
+	ambUnavailable        bool
+	ambCancel             context.CancelFunc
+	nirvanaPingCancel     context.CancelFunc
 
 	conversationID      string
 	conversationTitle   string
@@ -464,12 +468,21 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 
 	dialer := websocket.Dialer{HandshakeTimeout: 30 * time.Second}
-	conn, _, err := dialWebSocketCancelable(ctx, dialer, c.cfg.WSURL, c.nirvanaDialHeaders())
+	conn, response, err := dialWebSocketCancelable(ctx, dialer, c.cfg.WSURL, c.nirvanaDialHeaders())
 	if err != nil {
+		if response != nil {
+			_ = response.Body.Close()
+			return fmt.Errorf("websocket dial failed (%d): %w", response.StatusCode, err)
+		}
 		return fmt.Errorf("websocket dial failed: %w", err)
 	}
 	c.conn = conn
-	go c.readLoop()
+	connected, closed := c.connected, c.closed
+	c.transportWG.Add(1)
+	go func() {
+		defer c.transportWG.Done()
+		c.readLoopConnection(conn, connected, closed)
+	}()
 
 	invokeOptions, params, err := c.buildInvokePayload(ctx, false)
 	if err != nil {
@@ -497,7 +510,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 
 	select {
-	case err := <-c.connected:
+	case err := <-connected:
 		if err == nil {
 			c.startNirvanaPingLoop()
 		}
@@ -624,16 +637,20 @@ func (c *Client) Close() error {
 		c.ambCancel()
 		c.ambCancel = nil
 	}
-	if c.conn == nil {
+	conn := c.conn
+	if conn == nil {
+		c.transportWG.Wait()
 		return nil
 	}
-	_ = c.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bye"), time.Now().Add(time.Second))
-	err := c.conn.Close()
+	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bye"), time.Now().Add(time.Second))
+	err := conn.Close()
+	c.transportWG.Wait()
 	select {
 	case <-c.closed:
 	default:
 		close(c.closed)
 	}
+	c.conn = nil
 	return err
 }
 
@@ -754,6 +771,7 @@ func (c *Client) SendMessage(ctx context.Context, content string) error {
 	c.turnRuntimeSnapshot = &snapshot
 	c.beginSemanticTurnSnapshot(snapshot)
 	if err := c.writeJSON(payload); err != nil {
+		c.closeSemanticTurnForTransportFailure("message_write_failed")
 		c.ErrorBuildAgentTelemetry(ctx, c.turnTelemetry)
 		c.turnTelemetry = nil
 		c.processing = false
@@ -1016,7 +1034,12 @@ func (c *Client) connectCodeAssistGateway(ctx context.Context) error {
 		return fmt.Errorf("web UI websocket dial failed: %w%s", err, websocketResponseSuffix(resp))
 	}
 	c.conn = conn
-	go c.readGatewayWebSocketLoop()
+	closed := c.closed
+	c.transportWG.Add(1)
+	go func() {
+		defer c.transportWG.Done()
+		c.readGatewayWebSocketLoopConnection(conn, closed)
+	}()
 	if !c.suppressInteractiveStartupScrollback() {
 		fmt.Fprintf(os.Stderr, "connected to %s via web UI websocket\n", c.cfg.InstanceURL)
 		fmt.Fprintf(os.Stderr, "agent config: model=%s skill=%s\n", c.webAgentConfig.Model, c.webAgentConfig.SkillID)
@@ -2041,7 +2064,11 @@ func (c *Client) startAMBLoop() {
 	if c.ambCancel == nil {
 		loopCtx, cancel := context.WithCancel(context.Background())
 		c.ambCancel = cancel
-		go c.ambLoop(loopCtx)
+		c.transportWG.Add(1)
+		go func() {
+			defer c.transportWG.Done()
+			c.ambLoop(loopCtx)
+		}()
 	}
 }
 
@@ -2946,19 +2973,20 @@ func (c *Client) writeJSON(v interface{}) error {
 	return c.conn.WriteJSON(v)
 }
 
-func (c *Client) readGatewayWebSocketLoop() {
+func (c *Client) readGatewayWebSocketLoopConnection(conn *websocket.Conn, closed chan struct{}) {
 	defer func() {
 		clearTerminalFooterSubagents()
 		select {
-		case <-c.closed:
+		case <-closed:
 		default:
-			close(c.closed)
+			close(closed)
 		}
 	}()
 	for {
-		_, data, err := c.conn.ReadMessage()
+		_, data, err := conn.ReadMessage()
 		if err != nil {
 			if c.processing && c.turnDone != nil {
+				c.closeSemanticTurnForTransportFailure("connection_read_failed")
 				c.processing = false
 				select {
 				case c.turnDone <- err:
@@ -3454,23 +3482,25 @@ func codeAssistError(event map[string]interface{}, fallback string) error {
 	return errors.New(fallback)
 }
 
-func (c *Client) readLoop() {
+func (c *Client) readLoopConnection(conn *websocket.Conn, connected chan error, closed chan struct{}) {
 	defer func() {
 		clearTerminalFooterSubagents()
 		select {
-		case <-c.closed:
+		case <-closed:
 		default:
-			close(c.closed)
+			close(closed)
 		}
 	}()
 	for {
-		_, data, err := c.conn.ReadMessage()
+		_, data, err := conn.ReadMessage()
 		if err != nil {
 			select {
-			case c.connected <- err:
+			case connected <- err:
 			default:
 			}
 			if c.processing && c.turnDone != nil {
+				c.closeSemanticTurnForTransportFailure("connection_read_failed")
+				c.processing = false
 				select {
 				case c.turnDone <- err:
 				default:

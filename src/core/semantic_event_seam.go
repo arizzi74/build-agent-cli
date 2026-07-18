@@ -112,6 +112,23 @@ func (c *Client) activeSemanticTurn() bool {
 	defer c.semanticMu.Unlock()
 	return c.semanticState.Status == SemanticTurnAccepted || c.semanticState.Status == SemanticTurnStarted
 }
+
+// closeSemanticTurnForTransportFailure records a terminal lifecycle boundary
+// when the local transport fails. A write may fail before the server emits a
+// turn_started event, in which case cancellation is the only valid pre-start
+// terminal state. Once started, the same transport loss is a failed turn.
+func (c *Client) closeSemanticTurnForTransportFailure(code string) {
+	c.semanticMu.Lock()
+	status := c.semanticState.Status
+	c.semanticMu.Unlock()
+	switch status {
+	case SemanticTurnAccepted:
+		c.emitSemanticEvent(EventTurnCancelled, "", TurnCancelledPayload{Reason: safeTelemetryLabel(code)})
+	case SemanticTurnStarted:
+		c.emitSemanticEvent(EventTurnFailed, "", TurnFailedPayload{Code: safeTelemetryLabel(code)})
+	}
+}
+
 func (c *Client) emitRetryAttempted(operation string, attempt int, category string) {
 	if c.activeSemanticTurn() {
 		c.publishTurnPresentation(turnPresentationEvent{Kind: turnPresentationRetry, Text: fmt.Sprintf("Retrying %s (attempt %d, %s)", safeTelemetryLabel(operation), attempt, safeTelemetryLabel(category))})

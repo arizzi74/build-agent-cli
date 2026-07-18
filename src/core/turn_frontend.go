@@ -37,6 +37,7 @@ type turnInteractionRequest struct {
 	Prompt  string
 	Options []string
 	Rows    [][2]string
+	Secret  bool
 }
 
 type turnPresentationSink func(turnPresentationEvent)
