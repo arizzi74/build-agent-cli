@@ -57,7 +57,9 @@ func (c *Client) PromptWorkspaceSelection(ctx context.Context) error {
 	if c.processing {
 		return errors.New("cannot switch workspace while a turn is processing")
 	}
-	choices, err := c.ListWorkspaceChoices(ctx)
+	listCtx, cancel := conversationCommandContext(ctx)
+	choices, err := c.ListWorkspaceChoices(listCtx)
+	cancel()
 	if err != nil {
 		return err
 	}
@@ -65,6 +67,9 @@ func (c *Client) PromptWorkspaceSelection(ctx context.Context) error {
 }
 
 func (c *Client) SelectWorkspace(ctx context.Context, choices []WorkspaceChoice) error {
+	if _, remote := telegramCommandSourceFromContext(ctx); remote {
+		return c.selectTelegramWorkspace(ctx, choices)
+	}
 	for {
 		answer, err := promptWorkspaceSelection(choices)
 		if err != nil {
@@ -85,6 +90,57 @@ func (c *Client) SelectWorkspace(ctx context.Context, choices []WorkspaceChoice)
 		}
 		return c.PromptWebConversation(ctx, "workspace")
 	}
+}
+
+func (c *Client) selectTelegramWorkspace(ctx context.Context, choices []WorkspaceChoice) error {
+	options := make([]string, 0, len(choices)+1)
+	for _, choice := range choices {
+		label := choice.Label
+		if choice.Current {
+			label += "  🕘 Current"
+		}
+		options = append(options, label)
+	}
+	options = append(options, "Cancel")
+	answer, handled, err := c.requestTurnInteraction(ctx, turnInteractionRequest{
+		Kind: "workspace_selection", Prompt: "Choose the workspace to use. After switching, choose its conversation.", Options: options,
+	})
+	if err != nil {
+		return err
+	}
+	if !handled {
+		return errors.New("Telegram workspace selection is unavailable")
+	}
+	choice, cancelled, err := parseTelegramWorkspaceSelection(answer, choices)
+	if err != nil {
+		return err
+	}
+	if cancelled {
+		slashCommandPrintln("workspace unchanged")
+		return nil
+	}
+	if err := c.UseWorkspaceChoice(ctx, choice); err != nil {
+		return err
+	}
+	return c.PromptWebConversation(ctx, "workspace")
+}
+
+func parseTelegramWorkspaceSelection(answer string, choices []WorkspaceChoice) (WorkspaceChoice, bool, error) {
+	answer = strings.TrimSpace(answer)
+	if answer == "" {
+		return WorkspaceChoice{}, false, errors.New("workspace selection cannot be empty")
+	}
+	if number, err := strconv.Atoi(answer); err == nil && number == len(choices)+1 {
+		return WorkspaceChoice{}, true, nil
+	}
+	if strings.EqualFold(answer, "cancel") || strings.EqualFold(answer, "q") || answer == "__cancel__" {
+		return WorkspaceChoice{}, true, nil
+	}
+	choice, ok := workspaceChoiceBySelection(choices, answer)
+	if !ok {
+		return WorkspaceChoice{}, false, fmt.Errorf("workspace %q is not a unique list number, name, or URI prefix", answer)
+	}
+	return choice, false, nil
 }
 
 func (c *Client) UseWorkspaceChoice(ctx context.Context, choice WorkspaceChoice) error {

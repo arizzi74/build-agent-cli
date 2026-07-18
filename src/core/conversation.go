@@ -1211,7 +1211,9 @@ func (c *Client) PromptWebConversation(ctx context.Context, source string) error
 	if c.processing {
 		return errors.New("cannot switch conversation while a turn is processing")
 	}
-	conversations, err := c.ListWebConversations(ctx)
+	listCtx, cancel := conversationCommandContext(ctx)
+	conversations, err := c.ListWebConversations(listCtx)
+	cancel()
 	if err != nil {
 		if source == "startup" {
 			fmt.Fprintf(os.Stderr, "warning: could not load Build Agent conversations; continuing with a new conversation id (%v)\n", err)
@@ -1223,6 +1225,9 @@ func (c *Client) PromptWebConversation(ctx context.Context, source string) error
 }
 
 func (c *Client) SelectWebConversation(ctx context.Context, conversations []WebConversation, allowNew bool) error {
+	if _, remote := telegramCommandSourceFromContext(ctx); remote {
+		return c.selectTelegramWebConversation(ctx, conversations, allowNew)
+	}
 	for {
 		answer, err := promptConversationSelection(conversations, c.conversationID, allowNew)
 		if err != nil {
@@ -1247,6 +1252,73 @@ func (c *Client) SelectWebConversation(ctx context.Context, conversations []WebC
 		}
 		return c.UseWebConversation(ctx, conv)
 	}
+}
+
+func (c *Client) selectTelegramWebConversation(ctx context.Context, conversations []WebConversation, allowNew bool) error {
+	options := make([]string, 0, len(conversations)+2)
+	for _, conversation := range conversations {
+		options = append(options, conversationLabelWithCurrent(conversation, conversationIDMatches(conversation.ID, c.conversationID)))
+	}
+	if allowNew {
+		options = append(options, "New conversation")
+	}
+	options = append(options, "Cancel")
+	answer, handled, err := c.requestTurnInteraction(ctx, turnInteractionRequest{
+		Kind: "conversation_selection", Prompt: "Choose the Build Agent conversation to open.", Options: options,
+	})
+	if err != nil {
+		return err
+	}
+	if !handled {
+		return errors.New("Telegram conversation selection is unavailable")
+	}
+	conversation, action, err := parseTelegramConversationSelection(answer, conversations, allowNew)
+	if err != nil {
+		return err
+	}
+	switch action {
+	case "new":
+		return c.StartNewWebConversation(ctx)
+	case "cancel":
+		slashCommandPrintln("conversation unchanged")
+		return nil
+	default:
+		return c.UseWebConversation(ctx, conversation)
+	}
+}
+
+func parseTelegramConversationSelection(answer string, conversations []WebConversation, allowNew bool) (WebConversation, string, error) {
+	answer = strings.TrimSpace(answer)
+	if answer == "" {
+		return WebConversation{}, "", errors.New("conversation selection cannot be empty")
+	}
+	if number, err := strconv.Atoi(answer); err == nil {
+		if number >= 1 && number <= len(conversations) {
+			return conversations[number-1], "use", nil
+		}
+		next := len(conversations) + 1
+		if allowNew && number == next {
+			return WebConversation{}, "new", nil
+		}
+		if allowNew {
+			next++
+		}
+		if number == next {
+			return WebConversation{}, "cancel", nil
+		}
+		return WebConversation{}, "", fmt.Errorf("conversation selection %d is out of range", number)
+	}
+	if allowNew && (strings.EqualFold(answer, "new") || strings.EqualFold(answer, "n") || answer == "__new__") {
+		return WebConversation{}, "new", nil
+	}
+	if strings.EqualFold(answer, "cancel") || strings.EqualFold(answer, "q") || answer == "__cancel__" {
+		return WebConversation{}, "cancel", nil
+	}
+	conversation, ok := conversationBySelection(conversations, answer)
+	if !ok {
+		return WebConversation{}, "", fmt.Errorf("conversation %q is not a unique list number or id prefix", answer)
+	}
+	return conversation, "use", nil
 }
 
 func (c *Client) SelectConversationByArg(ctx context.Context, selection string, allowNew bool) error {

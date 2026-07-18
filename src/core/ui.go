@@ -149,6 +149,22 @@ func promptCommandLine(prompt string, status *statusBarState) (string, error) {
 }
 
 func promptCommandLineForClient(prompt string, status *statusBarState, client *Client) (string, error) {
+	return promptCommandLineForClientProvider(prompt, status, func() *Client { return client })
+}
+
+func promptCommandLineForActiveClient(prompt string, clients *activeClientRef) (string, error) {
+	if clients == nil {
+		return "", errors.New("active client is unavailable")
+	}
+	client := clients.Get()
+	if client == nil {
+		return "", errors.New("active client is unavailable")
+	}
+	status := client.statusBarState()
+	return promptCommandLineForClientProvider(prompt, &status, clients.Get)
+}
+
+func promptCommandLineForClientProvider(prompt string, status *statusBarState, clientProvider func() *Client) (string, error) {
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(terminalStderrFD()) {
 		line, err := promptLine(prompt)
 		if err == nil {
@@ -224,8 +240,14 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 	var ctrlDMu sync.Mutex
 	var ctrlDTimer *time.Timer
 	promptDone := make(chan struct{})
+	currentClient := func() *Client {
+		if clientProvider == nil {
+			return nil
+		}
+		return clientProvider()
+	}
 	promptLabel := func() string {
-		if client != nil {
+		if client := currentClient(); client != nil {
 			if count := client.pendingAttachmentCount(); count > 0 {
 				return fmt.Sprintf("ba[attach:%d]> ", count)
 			}
@@ -253,7 +275,7 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 			selected = 0
 			return
 		}
-		menu = filterSlashSuggestionsForClient(editor.Text(), client)
+		menu = filterSlashSuggestionsForClient(editor.Text(), currentClient())
 		if selected >= len(menu) {
 			selected = len(menu) - 1
 		}
@@ -507,7 +529,7 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 				editor.Reset("", 0)
 				refreshMenuLocked()
 				redrawNeeded = true
-			} else if client != nil && client.cancelActiveTurn() {
+			} else if client := currentClient(); client != nil && client.cancelActiveTurn() {
 				warning = "Cancellation requested"
 				redrawNeeded = true
 			}
@@ -549,6 +571,7 @@ func promptCommandLineForClient(prompt string, status *statusBarState, client *C
 			}
 
 		case terminalInputCtrlV:
+			client := currentClient()
 			if client == nil {
 				warning = "Clipboard image capture is unavailable"
 				break
@@ -699,6 +722,20 @@ func newFixedPromptLayout(status *statusBarState) *fixedPromptLayout {
 	return l
 }
 
+func (l *fixedPromptLayout) currentStatus() statusBarState {
+	lastTerminalFooterStatus.Lock()
+	if lastTerminalFooterStatus.set {
+		status := lastTerminalFooterStatus.state
+		lastTerminalFooterStatus.Unlock()
+		return status
+	}
+	lastTerminalFooterStatus.Unlock()
+	if l == nil || l.status == nil {
+		return statusBarState{}
+	}
+	return *l.status
+}
+
 func (l *fixedPromptLayout) refresh() {
 	if l == nil || l.status == nil {
 		return
@@ -763,14 +800,14 @@ func (l *fixedPromptLayout) redrawUnlocked(prompt, line string, cursor int, menu
 		var metrics terminalFooterMetrics
 		var ok bool
 		if resized {
-			metrics, ok = terminalReplayManagedViewportWithScrollbackUnlocked(*l.status)
+			metrics, ok = terminalReplayManagedViewportWithScrollbackUnlocked(l.currentStatus())
 		} else {
-			metrics, ok = terminalReplayManagedViewportUnlocked(*l.status)
+			metrics, ok = terminalReplayManagedViewportUnlocked(l.currentStatus())
 		}
 		if ok {
 			l.applyMetrics(metrics)
 		}
-	} else if metrics, ok := activateTerminalFooter(*l.status); ok {
+	} else if metrics, ok := activateTerminalFooter(l.currentStatus()); ok {
 		l.applyMetrics(metrics)
 	}
 	if !replay && oldHeight > 0 && (oldHeight != l.height || oldTempRow != l.tempRow) {
@@ -826,9 +863,9 @@ func (l *fixedPromptLayout) drawPromptWithSeparator(prompt, line string, cursor 
 	var metrics terminalFooterMetrics
 	var ok bool
 	if rowsChanged {
-		metrics, ok = terminalReplayManagedViewportUnlocked(*l.status)
+		metrics, ok = terminalReplayManagedViewportUnlocked(l.currentStatus())
 	} else {
-		metrics, ok = activateTerminalFooter(*l.status)
+		metrics, ok = activateTerminalFooter(l.currentStatus())
 	}
 	if ok {
 		l.applyMetrics(metrics)
@@ -858,14 +895,14 @@ func (l *fixedPromptLayout) drawStatus() {
 	if l.status == nil {
 		return
 	}
-	drawTerminalFooterStatusAt(terminalFooterMetrics{Width: l.width, Height: l.height, ScrollBottom: l.scrollBottom, TurnTop: l.turnTop, TurnRow: l.turnTop + 1, TurnBottom: l.turnTop + 2, PromptTop: l.promptTop, PromptRow: l.promptRow, PromptBottom: l.promptBottom, PromptRows: l.promptRows, StatusRow: l.statusRow, TempRow: l.tempRow}, *l.status)
+	drawTerminalFooterStatusAt(terminalFooterMetrics{Width: l.width, Height: l.height, ScrollBottom: l.scrollBottom, TurnTop: l.turnTop, TurnRow: l.turnTop + 1, TurnBottom: l.turnTop + 2, PromptTop: l.promptTop, PromptRow: l.promptRow, PromptBottom: l.promptBottom, PromptRows: l.promptRows, StatusRow: l.statusRow, TempRow: l.tempRow}, l.currentStatus())
 }
 
 func (l *fixedPromptLayout) drawTempMessage(message string) {
 	if l == nil || !l.enabled {
 		return
 	}
-	if l.status != nil && showTerminalFooterTempMessage(*l.status, message, 2*time.Second) {
+	if l.status != nil && showTerminalFooterTempMessage(l.currentStatus(), message, 2*time.Second) {
 		return
 	}
 	l.refresh()
@@ -916,7 +953,7 @@ func (l *fixedPromptLayout) submit(prompt, _ string) {
 		l.altScreen = false
 	}
 	if l.drawnMenuRows > 0 {
-		if metrics, ok := terminalReplayManagedViewportUnlocked(*l.status); ok {
+		if metrics, ok := terminalReplayManagedViewportUnlocked(l.currentStatus()); ok {
 			l.applyMetrics(metrics)
 		}
 	} else {
@@ -944,7 +981,7 @@ func (l *fixedPromptLayout) abort(marker string) {
 		l.altScreen = false
 	}
 	if l.drawnMenuRows > 0 {
-		if metrics, ok := terminalReplayManagedViewportUnlocked(*l.status); ok {
+		if metrics, ok := terminalReplayManagedViewportUnlocked(l.currentStatus()); ok {
 			l.applyMetrics(metrics)
 		}
 	} else {
@@ -972,7 +1009,7 @@ func (l *fixedPromptLayout) clear() {
 		l.altScreen = false
 	}
 	if l.drawnMenuRows > 0 {
-		if metrics, ok := terminalReplayManagedViewportUnlocked(*l.status); ok {
+		if metrics, ok := terminalReplayManagedViewportUnlocked(l.currentStatus()); ok {
 			l.applyMetrics(metrics)
 		}
 	} else {

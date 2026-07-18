@@ -1026,9 +1026,9 @@ func telegramSlashRefreshesTerminalTranscript(line string) bool {
 	}
 	switch telegramCanonicalCommand(command) {
 	case "/conversation":
-		return sub == "new" || sub == "create" || sub == "use" || sub == "open" || sub == "switch"
+		return sub == "" || sub == "select" || sub == "choose" || sub == "new" || sub == "create" || sub == "use" || sub == "open" || sub == "switch"
 	case "/workspace":
-		return sub == "use" || sub == "switch"
+		return sub == "" || sub == "select" || sub == "choose" || sub == "use" || sub == "switch"
 	default:
 		return false
 	}
@@ -1042,9 +1042,9 @@ func telegramSlashMutatesContext(command, argument string) bool {
 	}
 	switch command {
 	case "/conversation":
-		return sub == "new" || sub == "create" || sub == "use" || sub == "open" || sub == "switch"
+		return sub == "" || sub == "select" || sub == "choose" || sub == "new" || sub == "create" || sub == "use" || sub == "open" || sub == "switch"
 	case "/workspace":
-		return sub == "use" || sub == "switch"
+		return sub == "" || sub == "select" || sub == "choose" || sub == "use" || sub == "switch"
 	case "/app":
 		return sub == "use" || sub == "set" || sub == "clear" || sub == "unset"
 	case "/approve", "/reject":

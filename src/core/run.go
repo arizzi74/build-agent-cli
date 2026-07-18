@@ -363,7 +363,7 @@ func Run() {
 	for {
 		promptClient := clientRef.Get()
 		status := promptClient.statusBarState()
-		line, err := promptCommandLineForClient("ba> ", &status, promptClient)
+		line, err := promptCommandLineForActiveClient("ba> ", clientRef)
 		if err != nil {
 			fmt.Fprintln(os.Stderr)
 			return

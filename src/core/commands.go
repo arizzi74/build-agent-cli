@@ -180,20 +180,11 @@ func handleConversationCommand(parent context.Context, c *Client, args []string)
 	if c.opts.CodeAssistWS {
 		return errors.New("/conversation is not available in experimental Code Assist websocket mode")
 	}
+	if len(args) == 0 || strings.EqualFold(args[0], "select") || strings.EqualFold(args[0], "choose") {
+		return c.PromptWebConversation(parent, "command")
+	}
 	ctx, cancel := conversationCommandContext(parent)
 	defer cancel()
-
-	if len(args) == 0 || strings.EqualFold(args[0], "select") || strings.EqualFold(args[0], "choose") {
-		if _, remote := telegramCommandSourceFromContext(parent); remote {
-			conversations, err := c.ListWebConversations(ctx)
-			if err != nil {
-				return err
-			}
-			printConversationListTo(slashCommandOutputWriter, conversations, c.conversationID)
-			return nil
-		}
-		return c.PromptWebConversation(ctx, "command")
-	}
 
 	switch strings.ToLower(args[0]) {
 	case "help":
@@ -228,28 +219,20 @@ func handleConversationCommand(parent context.Context, c *Client, args []string)
 
 func handleWorkspaceCommand(parent context.Context, c *Client, args []string) error {
 	if len(args) == 0 {
-		if _, remote := telegramCommandSourceFromContext(parent); remote {
-			args = []string{"current"}
-		} else {
-			ctx, cancel := conversationCommandContext(parent)
-			defer cancel()
-			return c.PromptWorkspaceSelection(ctx)
-		}
+		return c.PromptWorkspaceSelection(parent)
 	}
 	if strings.EqualFold(args[0], "help") {
 		slashCommandPrintln("usage: /workspace")
 		slashCommandPrintln("opens the workspace picker; choose an existing Web UI/local workspace")
 		return nil
 	}
+	if strings.EqualFold(args[0], "select") || strings.EqualFold(args[0], "choose") {
+		return c.PromptWorkspaceSelection(parent)
+	}
 	ctx, cancel := conversationCommandContext(parent)
 	defer cancel()
 
 	switch strings.ToLower(args[0]) {
-	case "select", "choose":
-		if _, remote := telegramCommandSourceFromContext(parent); remote {
-			return handleWorkspaceCommand(parent, c, []string{"list"})
-		}
-		return c.PromptWorkspaceSelection(ctx)
 	case "current", "show":
 		ws := c.WorkspaceState()
 		slashCommandPrintf("workspace: %s\n", ws.Name)

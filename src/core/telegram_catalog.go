@@ -123,11 +123,11 @@ func telegramRemoteSlashLine(command, argument string) (string, bool) {
 	}
 	argument = strings.TrimSpace(argument)
 	if argument == "" {
-		// Terminal defaults for these commands open a picker or perform an
-		// implicit sync. A tapped Telegram menu entry must always have a useful,
-		// deterministic non-modal meaning.
+		// Instance, workspace, and conversation have transport-neutral interactive
+		// choosers. Other terminal defaults still need a deterministic non-modal
+		// meaning when their Telegram menu entry is tapped.
 		switch definition.Canonical {
-		case "/conversation", "/workspace", "/app", "/project":
+		case "/app", "/project":
 			argument = "current"
 		case "/sync":
 			argument = "status"
@@ -166,7 +166,7 @@ func telegramRemoteHelp(c *Client) string {
 		fmt.Fprintf(&out, "%s - %s\n", name, description)
 	}
 	out.WriteString("/whoami - show your numeric Telegram user ID\n")
-	out.WriteString("\n/instance opens a numbered instance chooser. Other commands that normally open a terminal picker use a safe current/status default when tapped; supply an explicit subcommand such as list, use, add, pull, or push for the full command behavior. The bot is an authenticated control plane for this bacli process, so mutating commands have the same effects as running them locally.")
+	out.WriteString("\n/instance, /workspace, and /conversation open numbered Telegram choosers. Selecting a workspace continues into its scoped conversation chooser, matching the TUI. Other commands that normally open a terminal picker use a safe current/status default when tapped; supply an explicit subcommand such as list, use, add, pull, or push for the full command behavior. The bot is an authenticated control plane for this bacli process, so mutating commands have the same effects as running them locally.")
 	return strings.TrimSpace(out.String())
 }
 
