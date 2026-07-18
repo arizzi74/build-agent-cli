@@ -46,6 +46,15 @@ type semanticJournalBoundaryError struct {
 	AfterTerminal  bool
 }
 
+type semanticJournalCheckpointAheadError struct {
+	Checkpoint   uint64
+	LastSequence uint64
+}
+
+func (e *semanticJournalCheckpointAheadError) Error() string {
+	return fmt.Sprintf("workspace snapshot checkpoint %d is ahead of semantic journal sequence %d", e.Checkpoint, e.LastSequence)
+}
+
 func (e *semanticJournalBoundaryError) Error() string {
 	if e.AfterTerminal {
 		return fmt.Sprintf("semantic journal sequence %d follows a terminal turn without a new safe lifecycle boundary", e.Sequence)
@@ -381,7 +390,9 @@ func recoverWorkspaceFromJournal(profile, name string, snapshot WorkspaceState, 
 		return semanticJournalRecovery{}, fmt.Errorf("workspace snapshot checkpoint %d predates retained semantic journal sequence %d", snapshot.SemanticJournalSequence, firstSequence)
 	}
 	if snapshot.SemanticJournalSequence > entries[len(entries)-1].Sequence {
-		return semanticJournalRecovery{}, fmt.Errorf("workspace snapshot checkpoint %d is ahead of semantic journal sequence %d", snapshot.SemanticJournalSequence, entries[len(entries)-1].Sequence)
+		return semanticJournalRecovery{}, &semanticJournalCheckpointAheadError{
+			Checkpoint: snapshot.SemanticJournalSequence, LastSequence: entries[len(entries)-1].Sequence,
+		}
 	}
 	active := map[string]SemanticTurnState{}
 	seen := map[string]struct{}{}
@@ -443,10 +454,33 @@ func recoverWorkspaceFromJournal(profile, name string, snapshot WorkspaceState, 
 }
 
 // autoRecoverStaleSemanticJournal handles only a provably stale local chain:
-// a valid snapshot names one conversation, while every uncheckpointed journal
-// entry belongs to a different non-empty conversation. Ambiguous or same-
-// conversation lifecycle damage remains a hard error rather than being hidden.
+// a valid snapshot names one conversation, while every uncheckpointed or reset
+// journal entry belongs to a different non-empty conversation. Ambiguous or
+// same-conversation lifecycle damage remains a hard error rather than hidden.
 func autoRecoverStaleSemanticJournal(profile, workspace string, snapshot WorkspaceState, snapshotOK bool, recoveryErr error) (semanticJournalRecovery, string, bool, error) {
+	var checkpointAhead *semanticJournalCheckpointAheadError
+	if snapshotOK && snapshot.ConversationID != "" && errors.As(recoveryErr, &checkpointAhead) {
+		entries, err := readSemanticJournalChain(profile, workspace)
+		if err != nil {
+			return semanticJournalRecovery{}, "", false, recoveryErr
+		}
+		// A snapshot whose checkpoint is beyond a new sequence-1 chain cannot
+		// replay that chain in the same sequence space. When every reset entry is
+		// scoped to a different non-empty conversation, the mismatch is provably
+		// stale local state: retain it in quarantine and keep the newer snapshot.
+		resetChain := len(entries) > 0 && entries[0].Sequence == 1 && entries[len(entries)-1].Sequence < snapshot.SemanticJournalSequence
+		for _, entry := range entries {
+			if entry.ConversationID == "" || entry.ConversationID == snapshot.ConversationID {
+				resetChain = false
+				break
+			}
+		}
+		if resetChain {
+			return quarantineStaleSemanticJournal(profile, workspace, snapshot, recoveryErr)
+		}
+		return semanticJournalRecovery{}, "", false, recoveryErr
+	}
+
 	var boundaryErr *semanticJournalBoundaryError
 	if !snapshotOK || snapshot.ConversationID == "" || !errors.As(recoveryErr, &boundaryErr) {
 		return semanticJournalRecovery{}, "", false, recoveryErr
@@ -468,6 +502,10 @@ func autoRecoverStaleSemanticJournal(profile, workspace string, snapshot Workspa
 	if !found || boundaryErr.ConversationID == "" || boundaryErr.ConversationID == snapshot.ConversationID {
 		return semanticJournalRecovery{}, "", false, recoveryErr
 	}
+	return quarantineStaleSemanticJournal(profile, workspace, snapshot, recoveryErr)
+}
+
+func quarantineStaleSemanticJournal(profile, workspace string, snapshot WorkspaceState, recoveryErr error) (semanticJournalRecovery, string, bool, error) {
 	quarantinePath, err := quarantineSemanticJournal(profile, workspace)
 	if err != nil {
 		return semanticJournalRecovery{}, "", false, fmt.Errorf("%w; automatic stale-journal quarantine failed: %v", recoveryErr, err)

@@ -1192,6 +1192,10 @@ func animatedConnectingStatus(frame int) string {
 	return animatedStatusText("Connecting...", frame)
 }
 
+func connectingBrandLine() string {
+	return ansiDim + "[ " + ansiReset + ansiWasabiGreen + "BUILD AGENT CLI" + ansiReset + ansiDim + " ]" + ansiReset
+}
+
 func animatedStatusText(label string, frame int) string {
 	text := []rune(label)
 	if len(text) == 0 {
@@ -1239,7 +1243,12 @@ var connectingLogoRows = []string{
 }
 
 func animatedConnectingLogo(frame int) string {
-	colors := []int{28, 34, 40, 46, 82, 118, 154, 190}
+	// Keep most of the mark stable and move one narrow highlight through it.
+	// Recoloring every glyph on every tick made the startup screen shimmer like
+	// a full repaint even on terminals that can synchronize updates.
+	baseColors := [...]int{34, 40, 40, 46}
+	highlightColors := [...]int{82, 118, 154, 190}
+	beam := statusAnimationPosition(frame, 43)
 	var out strings.Builder
 	for rowIndex, row := range connectingLogoRows {
 		for columnIndex, r := range []rune(row) {
@@ -1247,11 +1256,12 @@ func animatedConnectingLogo(frame int) string {
 				out.WriteRune(r)
 				continue
 			}
-			wave := (frame + columnIndex + rowIndex*2) % (len(colors)*2 - 2)
-			if wave >= len(colors) {
-				wave = len(colors)*2 - 2 - wave
+			color := baseColors[(rowIndex+columnIndex)%len(baseColors)]
+			distance := absInt(columnIndex + rowIndex - beam)
+			if distance < len(highlightColors) {
+				color = highlightColors[len(highlightColors)-1-distance]
 			}
-			fmt.Fprintf(&out, "\x1b[1;38;5;%dm%c%s", colors[wave], r, ansiReset)
+			fmt.Fprintf(&out, "\x1b[1;38;5;%dm%c%s", color, r, ansiReset)
 		}
 		if rowIndex < len(connectingLogoRows)-1 {
 			out.WriteByte('\n')
@@ -1264,9 +1274,9 @@ func connectingScreenFrame(details string, frame int) string {
 	details = strings.TrimRight(details, "\n")
 	status := animatedConnectingStatus(frame) + "  " + connectingCancelHint()
 	if details == "" {
-		return animatedConnectingLogo(frame) + "\n\n" + status
+		return animatedConnectingLogo(frame) + "\n" + connectingBrandLine() + "\n\n" + status
 	}
-	return animatedConnectingLogo(frame) + "\n\n" + details + "\n\n" + status
+	return animatedConnectingLogo(frame) + "\n" + connectingBrandLine() + "\n\n" + details + "\n\n" + status
 }
 
 func connectingCancelHint() string {
@@ -1316,8 +1326,10 @@ func connectingScreenRowsForViewport(details string, frame, width, height int) [
 	if height <= 0 {
 		return strings.Split(connectingScreenFrame(details, frame), "\n")
 	}
-	rows := append([]string(nil), strings.Split(animatedConnectingLogo(frame), "\n")...)
-	status := animatedConnectingStatus(frame) + "  " + connectingCancelHint()
+	logoRows := strings.Split(animatedConnectingLogo(frame), "\n")
+	rows := centerConnectingLogoRows(logoRows, width)
+	status := centerConnectingRow(animatedConnectingStatus(frame)+"  "+connectingCancelHint(), width)
+	brand := centerConnectingRow(connectingBrandLine(), width)
 	details = strings.TrimSpace(details)
 	detailRows := []string(nil)
 	if details != "" {
@@ -1325,23 +1337,92 @@ func connectingScreenRowsForViewport(details string, frame, width, height int) [
 			detailRows = append(detailRows, wrapReplayLine(line, maxInt(width, 1))...)
 		}
 	}
-	// Reserve one status row whenever possible and add visual spacing only when
-	// it fits. This produces at most height rows, so no connecting frame scrolls.
-	remaining := height - len(rows) - 1
-	if remaining < 0 {
+	// Keep the mark and status ahead of optional connection details. Compact
+	// terminals lose spacing/details first, never scroll the alternate screen.
+	if len(rows) >= height {
 		return rows[:maxInt(height, 0)]
+	}
+	if len(rows)+1 < height {
+		rows = append(rows, brand)
+	}
+	remaining := height - len(rows) - 1 // Reserve the final status row.
+	if len(detailRows) > 0 && remaining > len(detailRows) {
+		rows = append(rows, "")
+		remaining--
 	}
 	if len(detailRows) > remaining {
 		detailRows = detailRows[:remaining]
 	}
-	if len(detailRows) > 0 && len(rows)+len(detailRows)+2 <= height {
-		rows = append(rows, "")
-	}
+	detailRows = centerConnectingBlockRows(detailRows, width)
 	rows = append(rows, detailRows...)
 	if len(detailRows) > 0 && len(rows)+1 < height {
 		rows = append(rows, "")
+	} else if len(detailRows) == 0 && len(rows)+1 < height {
+		rows = append(rows, "")
 	}
-	return append(rows, status)
+	rows = append(rows, status)
+
+	// Vertically center the compact splash while keeping its row count bounded.
+	if padding := (height - len(rows)) / 2; padding > 0 {
+		centered := make([]string, 0, len(rows)+padding)
+		centered = append(centered, make([]string, padding)...)
+		rows = append(centered, rows...)
+	}
+	return rows
+}
+
+func centerConnectingRow(row string, width int) string {
+	row = strings.TrimRight(row, " ")
+	if width <= 0 {
+		return row
+	}
+	visibleWidth := terminalDisplayWidth(stripANSI(row))
+	if visibleWidth >= width {
+		return terminalFitCells(stripANSI(row), width)
+	}
+	return strings.Repeat(" ", (width-visibleWidth)/2) + row
+}
+
+func centerConnectingLogoRows(rows []string, width int) []string {
+	if len(rows) == 0 || width <= 0 {
+		return rows
+	}
+	// The ASCII mark is one fixed canvas: its leading and trailing spaces align
+	// every contour around the same center. Centering each trimmed row separately
+	// shifts the wide wing rows left and makes an otherwise symmetric mark look
+	// lopsided.
+	canvasWidth := 0
+	for _, row := range rows {
+		canvasWidth = maxInt(canvasWidth, terminalDisplayWidth(stripANSI(row)))
+	}
+	centered := make([]string, len(rows))
+	if canvasWidth >= width {
+		for index, row := range rows {
+			centered[index] = terminalFitCells(stripANSI(row), width)
+		}
+		return centered
+	}
+	indent := strings.Repeat(" ", (width-canvasWidth)/2)
+	for index, row := range rows {
+		centered[index] = indent + strings.TrimRight(row, " ")
+	}
+	return centered
+}
+
+func centerConnectingBlockRows(rows []string, width int) []string {
+	if len(rows) == 0 || width <= 0 {
+		return rows
+	}
+	blockWidth := 0
+	for _, row := range rows {
+		blockWidth = maxInt(blockWidth, terminalDisplayWidth(stripANSI(row)))
+	}
+	indent := maxInt((width-blockWidth)/2, 0)
+	centered := make([]string, len(rows))
+	for index, row := range rows {
+		centered[index] = strings.Repeat(" ", indent) + row
+	}
+	return centered
 }
 
 func connectingScreenTerminalFrameForViewport(details string, frame, width, height int) string {
@@ -1373,7 +1454,7 @@ func terminalFullScreenClearAndPurgeHistorySequence() string {
 // terminalConnectingExitClearSequence resets the connecting-mode terminal
 // state before the REPL creates its first semantic transcript row.
 func terminalConnectingExitClearSequence() string {
-	return "\x1b[?7l\x1b[r" + terminalFullScreenClearAndPurgeHistorySequence() + "\x1b[?7h"
+	return ansiSyncBegin + ansiCursorHide + "\x1b[?7l\x1b[r" + terminalFullScreenClearAndPurgeHistorySequence() + "\x1b[?7h" + ansiCursorShow + ansiSyncEnd
 }
 
 // connectingScreenRepaintSequence updates the connecting screen only by
@@ -1388,13 +1469,38 @@ func connectingScreenRepaintSequence(details string, frame, width, height int) s
 		height = 24
 	}
 	rows := connectingScreenRowsForViewport(details, frame, width, height)
+	return connectingScreenUpdateSequence(nil, rows, height, true)
+}
+
+// connectingScreenUpdateSequence emits one atomic, row-addressed transaction.
+// After the initial paint, unchanged rows (notably connection details) are not
+// touched, which avoids the visible flash caused by clearing the full viewport
+// on every animation tick.
+func connectingScreenUpdateSequence(previous, rows []string, height int, full bool) string {
+	if height <= 0 {
+		return ""
+	}
 	var out strings.Builder
-	out.WriteString("\x1b[?7l")
-	out.WriteString(terminalViewportClearSequence(height))
-	for index, row := range rows {
+	out.WriteString(ansiSyncBegin + ansiCursorHide + "\x1b[?7l")
+	rowCount := minInt(maxInt(len(previous), len(rows)), height)
+	if full {
+		rowCount = height
+	}
+	for index := 0; index < rowCount; index++ {
+		previousRow := ""
+		if index < len(previous) {
+			previousRow = previous[index]
+		}
+		row := ""
+		if index < len(rows) {
+			row = rows[index]
+		}
+		if !full && previousRow == row {
+			continue
+		}
 		fmt.Fprintf(&out, "\x1b[%d;1H%s%s%s", index+1, ansiEraseLine, row, ansiReset)
 	}
-	out.WriteString("\x1b[?7h")
+	out.WriteString("\x1b[?7h" + ansiReset + ansiSyncEnd)
 	return out.String()
 }
 
@@ -1402,14 +1508,20 @@ func startTerminalConnectingStatus(details string) func() {
 	if !terminalStatusANSIEnabled() {
 		return func() {}
 	}
+	var previousRows []string
+	previousWidth, previousHeight := 0, 0
 	render := func(frame int) {
 		width, height, err := term.GetSize(terminalStderrFD())
 		if err != nil || width <= 0 || height <= 0 {
 			width, height = 100, 24
 		}
-		// Complete the whole row-addressed frame if a writer returns a short
-		// write; input polling keeps the underlying PTY output blocking.
-		_ = writeTerminalString(os.Stderr, connectingScreenRepaintSequence(details, frame, width, height))
+		rows := connectingScreenRowsForViewport(details, frame, width, height)
+		full := previousRows == nil || width != previousWidth || height != previousHeight
+		// Complete the whole row-addressed transaction if a writer returns a
+		// short write; input polling keeps the underlying PTY output blocking.
+		_ = writeTerminalString(os.Stderr, connectingScreenUpdateSequence(previousRows, rows, height, full))
+		previousRows = append(previousRows[:0], rows...)
+		previousWidth, previousHeight = width, height
 	}
 	terminalRenderMu.Lock()
 	render(0) // Paint one complete frame before Connect can finish.
@@ -1420,7 +1532,7 @@ func startTerminalConnectingStatus(details string) func() {
 	var once sync.Once
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(110 * time.Millisecond)
+		ticker := time.NewTicker(170 * time.Millisecond)
 		defer ticker.Stop()
 		frame := 1
 		for {

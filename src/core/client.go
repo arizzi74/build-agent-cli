@@ -278,6 +278,10 @@ func (c *Client) applyWorkspace(ws WorkspaceState) {
 	c.usageInputTokens = ws.UsageInputTokens
 	c.usageOutputTokens = ws.UsageOutputTokens
 	c.usageThinkingTokens = ws.UsageThinkingTokens
+	// Journal sequence is scoped to the workspace. Leaving the prior workspace's
+	// checkpoint on the client causes the next save to pair that high checkpoint
+	// with a newly created sequence-1 journal in the selected workspace.
+	c.semanticJournalSequence = ws.SemanticJournalSequence
 	if workingSet, ok := nirvanaOutboundWorkingSet(ws.WorkingSet); ok {
 		c.workingSet = workingSet
 	} else {
