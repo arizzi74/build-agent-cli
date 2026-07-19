@@ -1,4 +1,4 @@
-# Build Agent Go CLI
+# Build Agent CLI
 
 **bacli** is a cross-platform terminal client for ServiceNow Build Agent. It combines AI-assisted conversations and tool execution with a local application-development workflow, keeping source projects and builds on your machine while synchronizing the relevant ServiceNow state.
 
@@ -28,6 +28,8 @@ bacli
 - **Workspaces and conversations:** switch Web UI workspaces, apps, and persisted Build Agent conversations.
 - **Multiple instances:** isolate credentials, projects, workspaces, apps, and conversations by profile.
 - **Telegram channel:** pair a private bot for headless or companion Build Agent interactions.
+
+By design, **bacli does not grant the model unrestricted access to local tools or shell commands**. Build Agent exposes only its configured, approved tool catalog; arbitrary shell execution is not advertised as an available tool, so the model cannot request it through the normal tool-calling flow and bacli will not execute it.
 
 For architecture, behavior, protocols, safety guarantees, and operational details, see [SPECS.md](SPECS.md).
 
