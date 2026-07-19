@@ -33,13 +33,13 @@ Numbered releases use `YYYY.MM.DD.N` based on the UTC date. Start `N` at `1` on 
 Run from the repository root:
 
 ```bash
-VERSION=2026.07.19.1 ./scripts/build-release.sh
+VERSION=2026.07.19.2 ./scripts/build-release.sh
 ```
 
 If `VERSION` is omitted, the script uses `YYYY.MM.DD.<short-git-sha>`. Override the publication root only when staging:
 
 ```bash
-VERSION=2026.07.19.1 BASE_URL=https://staging.example/bacli ./scripts/build-release.sh
+VERSION=2026.07.19.2 BASE_URL=https://staging.example/bacli ./scripts/build-release.sh
 ```
 
 The script creates:
@@ -87,7 +87,7 @@ https://nowdemo.it/bacli/bacli-windows-arm64.exe
 ## Installer behavior
 
 - Unix installer: detects Linux arm64, Linux amd64, macOS Intel, or macOS Apple Silicon; verifies SHA-256; installs as `~/.local/bin/bacli`; and adds an idempotent PATH line to `.zshrc`, `.bashrc`, or `.profile` when needed.
-- Windows installer: detects Windows amd64 or Windows ARM64; verifies SHA-256; installs as `%USERPROFILE%\.local\bin\bacli.exe`; and adds that directory to the user PATH when needed.
+- Windows installer: detects Windows amd64 or Windows ARM64, including Windows PowerShell 5.1/WOW64 hosts; verifies SHA-256; installs as `%USERPROFILE%\.local\bin\bacli.exe`; and safely creates or extends the user PATH when needed.
 
 Environment overrides for staging/testing:
 
@@ -121,7 +121,7 @@ go test -race -count=1 ./...
 go test -count=1 ./...
 go vet ./...
 git diff --check
-VERSION=2026.07.19.1 ./scripts/build-release.sh
+VERSION=2026.07.19.2 ./scripts/build-release.sh
 ```
 
 Inspect artifacts:

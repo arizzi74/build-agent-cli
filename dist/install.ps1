@@ -1,15 +1,31 @@
 $ErrorActionPreference = 'Stop'
 
-$BaseUrl = if ($env:BACLI_BASE_URL) { $env:BACLI_BASE_URL.TrimEnd('/') } else { 'https://nowdemo.it/bacli' }
-$InstallDir = if ($env:BACLI_INSTALL_DIR) { $env:BACLI_INSTALL_DIR } else { Join-Path $HOME '.local\bin' }
+$baseUrlOverride = [string]$env:BACLI_BASE_URL
+$BaseUrl = if ([string]::IsNullOrWhiteSpace($baseUrlOverride)) { 'https://nowdemo.it/bacli' } else { $baseUrlOverride.TrimEnd('/') }
+$installDirOverride = [string]$env:BACLI_INSTALL_DIR
+$userHome = [string]$HOME
+if ([string]::IsNullOrWhiteSpace($userHome)) {
+    $userHome = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+}
+if ([string]::IsNullOrWhiteSpace($userHome)) {
+    throw 'Could not determine the current Windows user profile directory'
+}
+$InstallDir = if ([string]::IsNullOrWhiteSpace($installDirOverride)) { Join-Path $userHome '.local\bin' } else { $installDirOverride }
 
 if (-not [Environment]::Is64BitOperatingSystem) {
     throw 'bacli requires 64-bit Windows'
 }
-$arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+# RuntimeInformation.OSArchitecture can be null in Windows PowerShell 5.1 on
+# older .NET Framework installations. These variables expose the native OS
+# architecture even when the current PowerShell process is running under WOW64.
+$arch = [string]$env:PROCESSOR_ARCHITEW6432
+if ([string]::IsNullOrWhiteSpace($arch)) {
+    $arch = [string]$env:PROCESSOR_ARCHITECTURE
+}
+$arch = $arch.ToUpperInvariant()
 switch ($arch) {
-    'X64' { $target = 'windows-amd64' }
-    'Arm64' { $target = 'windows-arm64' }
+    'AMD64' { $target = 'windows-amd64' }
+    'ARM64' { $target = 'windows-arm64' }
     default { throw "Unsupported Windows architecture: $arch" }
 }
 
@@ -18,7 +34,8 @@ $manifest = Invoke-RestMethod -Uri $manifestUri -UseBasicParsing
 if ($manifest.schemaVersion -ne 1) {
     throw 'Unsupported bacli release manifest'
 }
-$entry = $manifest.files.$target
+$entryProperty = $manifest.files.PSObject.Properties[$target]
+$entry = if ($entryProperty) { $entryProperty.Value } else { $null }
 if (-not $entry -or -not $entry.url -or -not $entry.sha256) {
     throw "Release manifest has no artifact for $target"
 }
@@ -28,8 +45,10 @@ New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("bacli-{0}.exe" -f [Guid]::NewGuid().ToString('N'))
 try {
     Invoke-WebRequest -Uri $artifactUri -OutFile $tmp -UseBasicParsing
-    $actual = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actual -ne ([string]$entry.sha256).ToLowerInvariant()) {
+    $downloadHash = Get-FileHash -Path $tmp -Algorithm SHA256
+    $actual = [string]$downloadHash.Hash
+    $expected = [string]$entry.sha256
+    if ([string]::IsNullOrWhiteSpace($actual) -or [string]::IsNullOrWhiteSpace($expected) -or $actual.ToLowerInvariant() -ne $expected.ToLowerInvariant()) {
         throw 'Checksum verification failed'
     }
     $destination = Join-Path $InstallDir 'bacli.exe'
@@ -38,12 +57,14 @@ try {
     Remove-Item -Path $tmp -Force -ErrorAction SilentlyContinue
 }
 
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-$normalized = @($userPath -split ';' | Where-Object { $_ })
-if (-not ($normalized | Where-Object { $_.TrimEnd('\') -ieq $InstallDir.TrimEnd('\') })) {
+$userPath = [string][Environment]::GetEnvironmentVariable('Path', 'User')
+$normalized = @($userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+$normalizedInstallDir = ([string]$InstallDir).TrimEnd('\')
+if (-not ($normalized | Where-Object { ([string]$_).Trim().TrimEnd('\') -ieq $normalizedInstallDir })) {
     $newPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $InstallDir } else { "$userPath;$InstallDir" }
     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-    $env:Path = "$env:Path;$InstallDir"
+    $processPath = [string]$env:Path
+    $env:Path = if ([string]::IsNullOrWhiteSpace($processPath)) { $InstallDir } else { "$processPath;$InstallDir" }
     Write-Host "Added $InstallDir to the user PATH. Open a new terminal before running bacli."
 }
 
