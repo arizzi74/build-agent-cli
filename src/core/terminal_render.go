@@ -323,15 +323,15 @@ func formatUserPromptBlock(input string, color bool, width int) string {
 		width = 100
 	}
 	var out strings.Builder
+	writeLine(&out, formatPromptBandRow("", "", width))
 	for i, line := range strings.Split(input, "\n") {
-		if i > 0 {
-			writeBlankLine(&out)
+		prefix := "   "
+		if i == 0 {
+			prefix = " › "
 		}
-		middle := " › " + strings.TrimRight(line, " \t")
-		writeLine(&out, formatPromptBandRow("", "", width))
-		writeLine(&out, formatPromptBandRow(middle, ansiGrayFG, width))
-		writeLine(&out, formatPromptBandRow("", "", width))
+		writeLine(&out, formatPromptBandRow(prefix+strings.TrimRight(line, " \t"), ansiGrayFG, width))
 	}
+	writeLine(&out, formatPromptBandRow("", "", width))
 	return out.String()
 }
 

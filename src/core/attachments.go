@@ -852,7 +852,7 @@ func attachmentDisplayContent(content string, items []attachmentSummary) string 
 	var out strings.Builder
 	if content != "" {
 		out.WriteString(content)
-		out.WriteString("\n\n")
+		out.WriteByte('\n')
 	}
 	for i, item := range items {
 		if i > 0 {
