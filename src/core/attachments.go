@@ -232,7 +232,52 @@ func normalizedAttachmentMediaType(provided, name string, data []byte) string {
 	if provided == "" {
 		return "application/octet-stream"
 	}
+	if isMarkdownAttachmentName(name) && isMarkdownAttachmentMediaType(provided) {
+		return "text/markdown"
+	}
 	return provided
+}
+
+func isMarkdownAttachmentName(name string) bool {
+	switch strings.ToLower(filepath.Ext(strings.TrimSpace(name))) {
+	case ".md", ".markdown":
+		return true
+	default:
+		return false
+	}
+}
+
+func isMarkdownAttachmentMediaType(mediaType string) bool {
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	switch mediaType {
+	case "text/plain", "application/octet-stream":
+		return true
+	}
+	parts := strings.SplitN(mediaType, "/", 2)
+	return len(parts) == 2 && (parts[0] == "text" || parts[0] == "application") && strings.Contains(parts[1], "markdown")
+}
+
+func attachmentUploadMediaTypesCompatible(name, sentType, responseType string) bool {
+	sent, _, sentErr := mime.ParseMediaType(strings.TrimSpace(sentType))
+	response, _, responseErr := mime.ParseMediaType(strings.TrimSpace(responseType))
+	if sentErr != nil || responseErr != nil {
+		return false
+	}
+	sent = strings.ToLower(sent)
+	response = strings.ToLower(response)
+	if sent == response {
+		return true
+	}
+	if isMarkdownAttachmentName(name) && isMarkdownAttachmentMediaType(sent) && isMarkdownAttachmentMediaType(response) {
+		return true
+	}
+	// ServiceNow can store an otherwise known non-image file as the generic
+	// binary type. Treat that server normalization as compatible, while keeping
+	// image and two-specific-type mismatches strict.
+	if sent == "application/octet-stream" && !strings.HasPrefix(response, "image/") {
+		return true
+	}
+	return response == "application/octet-stream" && !strings.HasPrefix(sent, "image/")
 }
 
 func safeAttachmentName(name string) string {
@@ -816,9 +861,8 @@ func (c *Client) uploadConversationAttachment(ctx context.Context, conversationI
 		}
 	}
 	if responseType := strings.TrimSpace(decoded.Result.ContentType); responseType != "" {
-		parsed, _, parseErr := mime.ParseMediaType(responseType)
-		if parseErr != nil || !strings.EqualFold(parsed, item.Type) {
-			return decoded, errors.New("attachment upload returned a different content type")
+		if !attachmentUploadMediaTypesCompatible(item.Name, item.Type, responseType) {
+			return decoded, fmt.Errorf("attachment upload returned content type %q for %q", responseType, item.Type)
 		}
 	}
 	return decoded, nil

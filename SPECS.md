@@ -362,6 +362,8 @@ The interactive prompt keeps in-memory command history for the current process. 
 
 Default Nirvana mode supports the image flow observed in the Glider Web UI HAR: bacli uploads each staged file to the active Build Agent conversation, persists Web-compatible attachment metadata on the user message, and sends image bytes to Nirvana as bounded data URLs. Inline bytes are never retained in local workspace history, debug output, semantic journals, exports, or support bundles.
 
+Attachment media types are normalized from the supplied metadata, filename, and bounded file signature. Markdown files use `text/markdown`; upload verification accepts the narrow set of equivalent Markdown types and ServiceNow's generic binary normalization, while image/document or two-specific-type mismatches remain errors.
+
 Use `/attach add <path>` on every platform. `/attach list`, `/attach remove <number|id|filename>`, and `/attach clear` manage the next turn's queue. On a bacli process running natively on macOS, Ctrl-V or `/attach paste` reads a PNG, JPEG, or TIFF image from the local clipboard; TIFF is converted with built-in macOS tools. A bacli process running on Linux over SSH cannot read the Mac host clipboard, so use a path visible to that process. The local safety limits are 10 files, 25 MiB per file, and 50 MiB total. Attachments require the default Nirvana transport.
 
 The supplied HAR proves the PNG upload/persistence/WebSocket contract. Other file types use the same conservative metadata and upload path, but instance-side acceptance and ServiceNow limits can vary. Bacli does not call an undocumented remote-delete API: removing an item after it was already uploaded abandons it locally and warns that the remote orphan may remain.
