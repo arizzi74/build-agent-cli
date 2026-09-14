@@ -101,6 +101,7 @@ var knownModels = map[string]struct {
 	"claude-sonnet-4-6":    {"bedrock", ModelInfo{"claude-sonnet-4-6", 64000, 1, 2000, "ec920c03ff6d6210509bffffffffffb8"}},
 	"claude-opus-4-5":      {"bedrock", ModelInfo{"claude-opus-4-5", 64000, 1, 2000, "ec920c03ff6d6210509bffffffffffb8"}},
 	"claude-opus-4-6":      {"bedrock", ModelInfo{"claude-opus-4-6", 64000, 1, 2000, "ec920c03ff6d6210509bffffffffffb8"}},
+	"claude-opus-4-8":      {"bedrock", ModelInfo{"claude-opus-4-8", 65535, 1, 32000, ""}},
 	"claude_large":         {"bedrock", ModelInfo{"claude_large", 64000, 1, 2000, "ec920c03ff6d6210509bffffffffffb8"}},
 	"claude-haiku-4-5":     {"bedrock", ModelInfo{"claude-haiku-4-5", 4096, 0.1, 0, "12e2ba33c09f4b258e40e8f8e9e9c464"}},
 	"claude_small":         {"bedrock", ModelInfo{"claude_small", 4096, 0.1, 0, "12e2ba33c09f4b258e40e8f8e9e9c464"}},

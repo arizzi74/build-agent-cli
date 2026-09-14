@@ -257,6 +257,16 @@ func (c *Client) sessionRequest(ctx context.Context, method, rawURL string, body
 	return c.sessionRequestContentType(ctx, method, rawURL, body, "")
 }
 func (c *Client) sessionRequestContentType(ctx context.Context, method, rawURL string, body io.Reader, contentType string) (*http.Response, error) {
+	return c.sessionRequestWithHeaders(ctx, method, rawURL, body, contentType, "")
+}
+
+// Session-authenticated REST reads need explicit JSON negotiation. Browser
+// login and OAuth consent requests retain their normal HTML Accept header.
+func (c *Client) sessionJSONRequest(ctx context.Context, method, rawURL string, body io.Reader) (*http.Response, error) {
+	return c.sessionRequestWithHeaders(ctx, method, rawURL, body, "", "application/json")
+}
+
+func (c *Client) sessionRequestWithHeaders(ctx context.Context, method, rawURL string, body io.Reader, contentType, accept string) (*http.Response, error) {
 	if !sameOriginInstance(c.cfg.InstanceURL, rawURL) {
 		return nil, errors.New("refusing cross-origin session request")
 	}
@@ -270,6 +280,9 @@ func (c *Client) sessionRequestContentType(ctx context.Context, method, rawURL s
 		return nil, err
 	}
 	setBrowserishHeaders(req, c.cfg.InstanceURL)
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
 	if c.sessionCookieHeader != "" {
 		req.Header.Set("Cookie", c.sessionCookieHeader)
 	}
@@ -527,18 +540,20 @@ func (c *Client) checkSessionTimeout(ctx context.Context) error {
 
 func (c *Client) readSessionTimeoutProperty(ctx context.Context) ([]map[string]interface{}, error) {
 	path := webStartupPropertyEndpoint("name=", []string{"glide.ui.session_timeout"})
-	res, err := c.sessionRequest(ctx, http.MethodGet, strings.TrimRight(c.cfg.InstanceURL, "/")+path, nil)
+	res, err := c.sessionJSONRequest(ctx, http.MethodGet, strings.TrimRight(c.cfg.InstanceURL, "/")+path, nil)
 	if err == nil {
 		body, readErr := readLimited(res)
 		_ = res.Body.Close()
 		if readErr == nil && res.StatusCode >= 200 && res.StatusCode < 300 {
 			if result, parseErr := startupResult(body); parseErr == nil {
-				return startupPropertyRecords(result)
+				if rows, recordsErr := startupPropertyRecords(result); recordsErr == nil {
+					return rows, nil
+				}
 			}
 		}
 	}
 	tableURL := strings.TrimRight(c.cfg.InstanceURL, "/") + "/api/now/table/sys_properties?sysparm_query=name%3Dglide.ui.session_timeout&sysparm_fields=sys_id,name,value"
-	res, tableErr := c.sessionRequest(ctx, http.MethodGet, tableURL, nil)
+	res, tableErr := c.sessionJSONRequest(ctx, http.MethodGet, tableURL, nil)
 	if tableErr != nil {
 		return nil, tableErr
 	}

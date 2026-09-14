@@ -84,6 +84,7 @@ type Client struct {
 	workspaceFolders                []WebWorkspaceFolder
 	streamTypes                     map[string]string
 	webAgentConfig                  WebAgentConfig
+	modelFromRegistry               bool
 	webStartupConfig                WebStartupConfig
 	webStreamID                     string
 	webStreamType                   string
@@ -193,6 +194,8 @@ type nirvanaToolCall struct {
 
 type WebAgentConfig struct {
 	Model           string
+	Provider        string
+	SmallConfig     map[string]interface{}
 	ProviderURL     string
 	SkillID         string
 	GlideAttributes map[string]interface{}
@@ -209,7 +212,7 @@ type MCPServer struct {
 var excludedWDFMCPServerGitPattern = regexp.MustCompile(`(?i)\bgit\b`)
 
 func NewClient(cfg CLIConfig, opts Options) (*Client, error) {
-	runtimeCfg, err := selectRuntimeModel(opts.Provider, opts.Model)
+	runtimeCfg, err := selectInitialRuntimeModel(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -469,6 +472,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.webStartupConfig = c.loadWebStartupConfig(ctx)
 	if !c.opts.Nirvana {
 		return c.connectGateway(ctx)
+	}
+	if err := c.configureNirvanaModel(ctx); err != nil {
+		return err
 	}
 	if err := c.prepareNirvanaConversationSelection(ctx); err != nil {
 		return err
@@ -1237,7 +1243,7 @@ func (c *Client) sendCodeAssistGatewayMessage(_ context.Context, content string)
 }
 
 func (c *Client) fetchWebAgentConfig(ctx context.Context) (WebAgentConfig, error) {
-	fallback := WebAgentConfig{Model: c.runtime.LargeModel, ProviderURL: c.cfg.LLMProxyURL, SkillID: c.cfg.CapabilityID}
+	fallback := WebAgentConfig{Model: c.runtime.LargeModel, Provider: c.runtime.Provider, ProviderURL: c.cfg.LLMProxyURL, SkillID: c.cfg.CapabilityID}
 	base := strings.TrimRight(c.cfg.InstanceURL, "/")
 	endpoints := []string{
 		base + "/api/sn_ba_core/agent_config_api/config",
@@ -1311,6 +1317,12 @@ func parseWebAgentConfig(body []byte, fallback WebAgentConfig) WebAgentConfig {
 	}
 
 	if modelConfig := asMap(result["modelConfig"]); modelConfig != nil {
+		if provider := firstString(modelConfig, "provider"); provider != "" {
+			cfg.Provider = provider
+		}
+		if small := asMap(modelConfig["smallConfig"]); small != nil {
+			cfg.SmallConfig = cloneMap(small)
+		}
 		if large := asMap(modelConfig["largeConfig"]); large != nil {
 			if model := stringify(large["model"]); model != "" {
 				cfg.Model = model
@@ -3925,6 +3937,11 @@ func (c *Client) buildInvokePayload(ctx context.Context, silentAuth bool) (map[s
 			},
 		},
 		"useMockLlm": false,
+	}
+	if c.modelFromRegistry || c.runtime.LargeDefinitionID == "" {
+		// The current Web UI routes registry models by ID and capability.
+		// Its provider sysId is not a legacy model-definition sys_id.
+		invokeOptions["genAIConfig"] = map[string]interface{}{"capabilityId": capabilityID}
 	}
 	params := map[string]interface{}{
 		"arguments": map[string]interface{}{

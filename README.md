@@ -51,7 +51,7 @@ Use **bacli --help** for the generated flag help and **/help** in the interactiv
 | **--project-root &lt;path&gt;** | Set the profile's canonical local app-project root. |
 | **--conversation &lt;latest\|id\|prefix\|new&gt;** | Select or create a conversation before prompts or the REPL. |
 | **--prompt &lt;text&gt;** | Send a prompt after connecting; repeat for scripted multi-turn use. |
-| **--provider &lt;name&gt;**, **--model &lt;name&gt;** | Override the configured model provider or large model. |
+| **--provider &lt;name&gt;**, **--model &lt;name&gt;** | Override the instance's default provider or model; for example, **--model claude-opus-4-8** when available. |
 | **--turn-timeout &lt;duration&gt;** | Set the per-turn timeout (default: 60 minutes). |
 | **--nirvana** | Use the default Glider Build Agent streaming WebSocket transport. |
 | **--web-gateway** | Use the legacy Build Agent gateway/AMB compatibility transport. |

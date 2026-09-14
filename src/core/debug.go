@@ -5,12 +5,17 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 )
 
 const redactedDebugValue = "[REDACTED]"
 const redactedDebugAttachmentValue = "[REDACTED ATTACHMENT]"
+
+// Also recognize text attachment bodies embedded in JSON strings or partial
+// debug frames, where normal map-key redaction cannot inspect the contents.
+var inlineAttachmentTextKeyPattern = regexp.MustCompile(`(?i)\\?"textcontent\\?"\s*:`)
 
 type lockedWriter struct {
 	mu sync.Mutex
@@ -130,18 +135,18 @@ func redactDebugJSON(v interface{}) []byte {
 func redactDebugJSONBytes(raw []byte) []byte {
 	var v interface{}
 	if err := json.Unmarshal(raw, &v); err != nil {
-		if containsInlineAttachmentData(string(raw)) {
+		if containsDebugAttachmentData(string(raw)) {
 			return []byte(redactedDebugAttachmentValue)
 		}
 		return raw
 	}
-	if text, ok := v.(string); ok && containsInlineAttachmentData(text) {
+	if text, ok := v.(string); ok && containsDebugAttachmentData(text) {
 		v = redactedDebugAttachmentValue
 	}
 	redactDebugValue(v, "")
 	redacted, err := json.Marshal(v)
 	if err != nil {
-		if containsInlineAttachmentData(string(raw)) {
+		if containsDebugAttachmentData(string(raw)) {
 			return []byte(redactedDebugAttachmentValue)
 		}
 		return raw
@@ -161,7 +166,7 @@ func redactDebugValue(v interface{}, key string) {
 				typed[k] = redactedDebugAttachmentValue
 				continue
 			}
-			if text, ok := child.(string); ok && containsInlineAttachmentData(text) {
+			if text, ok := child.(string); ok && containsDebugAttachmentData(text) {
 				typed[k] = redactedDebugAttachmentValue
 				continue
 			}
@@ -169,7 +174,7 @@ func redactDebugValue(v interface{}, key string) {
 		}
 	case []interface{}:
 		for i, child := range typed {
-			if text, ok := child.(string); ok && containsInlineAttachmentData(text) {
+			if text, ok := child.(string); ok && containsDebugAttachmentData(text) {
 				typed[i] = redactedDebugAttachmentValue
 				continue
 			}
@@ -180,7 +185,7 @@ func redactDebugValue(v interface{}, key string) {
 
 func isAttachmentDebugKey(key string) bool {
 	switch strings.ToLower(strings.TrimSpace(key)) {
-	case "attachment", "attachments", "images", "image_data", "file_data", "clipboard_data":
+	case "attachment", "attachments", "images", "image_data", "file_data", "clipboard_data", "textcontent":
 		return true
 	default:
 		return false
@@ -195,6 +200,10 @@ func isInlineAttachmentData(value string) bool {
 func containsInlineAttachmentData(value string) bool {
 	lower := strings.ToLower(strings.TrimSpace(value))
 	return isInlineAttachmentData(lower) || (strings.Contains(lower, "data:") && strings.Contains(lower, ";base64,"))
+}
+
+func containsDebugAttachmentData(value string) bool {
+	return containsInlineAttachmentData(value) || inlineAttachmentTextKeyPattern.MatchString(value)
 }
 
 func isSensitiveDebugKey(key string) bool {

@@ -39,6 +39,7 @@ The CLI must keep credentials and local state private, make remote mutations exp
 | --- | --- | --- |
 | Startup, flags, state | `run.go`, `startup_config.go`, `config.go`, `state.go` | Process lifecycle, profiles, local configuration, safe persistence. |
 | HTTP, auth, retry | `client.go`, `oauth.go`, `session_*.go`, `retry.go` | ServiceNow requests, OAuth/session/basic authentication, bounded retry policy. |
+| Model selection | `models.go`, `model_registry.go`, `model_selection.go` | Instance model discovery, provider/default selection, explicit overrides, legacy fallback settings. |
 | Conversations and workspaces | `conversation.go`, `workspace_web.go`, `runtime_snapshot.go` | Web-UI-compatible workspace discovery, conversation selection/history, immutable turn context. |
 | Applications and local projects | `app_*.go`, `project_*.go`, `build_*.go` | App selection/scaffolding, project registry, Node build prerequisites and build/install actions. |
 | Glide VFS synchronization | `glider_fs.go`, `local_sync.go`, `metadata_sync.go` | Canonical checkout identity, remote file access, pull/push/status planning, collision and conflict protection. |
@@ -58,7 +59,17 @@ The client never puts a hostname in an app folder name. Every canonical checkout
 
 The preferred transport is the Glider Build Agent Nirvana WebSocket path, which mirrors the observed Web UI protocol and streams agent events. A legacy Build Agent gateway/AMB path is retained behind `--web-gateway` for compatible instances. Authentication supports the configured OAuth PKCE/session path and explicit legacy Basic or cookie modes where applicable.
 
+The session-timeout property inspection explicitly requests `application/json` on both the Build Agent query route and the Table API fallback; browser login and OAuth consent keep their HTML-oriented headers. Inspection does not authorize changing the timeout. Startup product discovery checks Now Assist for App Engine with `productId=com.sn.now.appengine` and `scopeName=sn_now_appengine`, accepts the Web UI's `isAvailable` response field and legacy aliases, and remains best-effort.
+
 Requests use a centralized bounded retry policy only for idempotent safe reads and only for transient network errors, 408, 429, and 5xx responses. Mutating operations, tool execution, conversation/message creation, telemetry writes, and submitted turns are never retried automatically. Cancellation and deadlines are checked before retry delays and all logs redact credentials and content.
+
+## Model discovery and selection
+
+On each Nirvana connection, including instance switches, bacli loads the instance provider configuration and the runner's `/v1/models` registry before opening the agent connection. The registry URL is derived from the configured Nirvana WebSocket URL; discovery and redirects are restricted to the same instance origin. For the selected provider, the version marked `default: true` wins, otherwise the first usable version is selected. The legacy provider configuration's large-model name does not override a newer registry default.
+
+`--model <id>` selects an advertised version explicitly (for example `--model claude-opus-4-8`). Without `--provider`, bacli infers the provider from the selected version; explicit conflicting providers, unknown models, and ambiguous IDs are rejected. New registry IDs are validated after authentication rather than rejected by the built-in model catalog. The selected ID, output-token limit, temperature, and thinking-token budget populate the outbound request, status bar, and immutable turn snapshot. The instance's small-model configuration is retained when it belongs to the selected provider. Registry-backed requests use capability routing without obsolete static model-definition IDs.
+
+If registry discovery is unavailable, bacli warns and retains its legacy configured-model behavior for older instances. Explicit models absent from the built-in fallback catalog require successful discovery and never silently fall back. The legacy gateway transport keeps its existing model selection behavior.
 
 ## Conversations, workspaces, and turns
 
@@ -314,7 +325,7 @@ go run ./src/cmd/bacli --profile scratch --profile-delete dev
 ## Useful flags
 
 - `--provider bedrock|openai|anthropic|vertex|nowllm`
-- `--model claude-opus-4-6|gemini_large|gpt_large|llm_generic_large_v2|...`
+- `--model <instance-registry-model-id>` (for example `claude-opus-4-8`)
 - `--nirvana` explicitly uses the Glider Build Agent Nirvana websocket transport for web UI streaming/MCP parity; this is the default.
 - `--web-gateway` uses the older web Build Agent gateway/AMB transport for compatibility testing.
 - `--code-assist-ws` is an experimental diagnostic path for `/sncapps/code/assist/ba/web-socket`; keep it off for normal Build Agent/MCP use
@@ -360,7 +371,7 @@ The interactive prompt keeps in-memory command history for the current process. 
 
 ### Images and attachments
 
-Default Nirvana mode supports the image flow observed in the Glider Web UI HAR: bacli uploads each staged file to the active Build Agent conversation, persists Web-compatible attachment metadata on the user message, and sends image bytes to Nirvana as bounded data URLs. Inline bytes are never retained in local workspace history, debug output, semantic journals, exports, or support bundles.
+Default Nirvana mode follows the Glider Web UI attachment flow: bacli uploads each staged file to the active Build Agent conversation and persists Web-compatible attachment metadata on the user message. Text MIME types (`text/*`, `application/json`, and `application/xml`) are sent to Nirvana with `category: "text"` and raw UTF-8 `textContent`. Images and other binary attachments retain bounded data URLs. Inline attachment text and bytes are never retained as attachment bodies in local workspace history, debug output, semantic journals, exports, or support bundles; durable attachment metadata keeps the filename, MIME type, category, size, and ServiceNow attachment reference. Ordinary conversation text and code containing a `textContent` property remain ordinary messages.
 
 Attachment media types are normalized from the supplied metadata, filename, and bounded file signature. Markdown files use `text/markdown`; upload verification accepts the narrow set of equivalent Markdown types and ServiceNow's generic binary normalization, while image/document or two-specific-type mismatches remain errors.
 

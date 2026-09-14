@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -50,7 +51,7 @@ type attachmentSummary struct {
 
 // RichAttachment is the attachment metadata shape persisted by the Build Agent
 // Web UI. The actual bytes are deliberately absent: ServiceNow stores them in
-// sys_attachment, while the Nirvana turn carries a separate inline data URL.
+// sys_attachment, while the Nirvana turn carries separate inline text or a data URL.
 type RichAttachment struct {
 	URL             string `json:"url"`
 	Name            string `json:"name"`
@@ -67,10 +68,11 @@ type nirvanaImageAttachment struct {
 }
 
 type nirvanaAttachment struct {
-	URL      string `json:"url"`
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	Category string `json:"category"`
+	URL         string `json:"url,omitempty"`
+	Name        string `json:"name"`
+	Type        string `json:"type"`
+	Category    string `json:"category"`
+	TextContent string `json:"textContent,omitempty"`
 }
 
 type attachmentUploadResponse struct {
@@ -147,16 +149,12 @@ func (c *Client) addPendingAttachmentBytesOwned(name, mediaType string, data []b
 	}
 	name = safeAttachmentName(name)
 	mediaType = normalizedAttachmentMediaType(mediaType, name, data)
-	category := "file"
-	if strings.HasPrefix(mediaType, "image/") {
-		category = "image"
-	}
 	item := pendingAttachment{
 		ID:       "att-" + uuidV4Compact(),
 		Name:     name,
 		Size:     int64(len(data)),
 		Type:     mediaType,
-		Category: category,
+		Category: attachmentCategory(mediaType),
 		Data:     append([]byte(nil), data...),
 	}
 	c.attachmentsMu.Lock()
@@ -236,6 +234,19 @@ func normalizedAttachmentMediaType(provided, name string, data []byte) string {
 		return "text/markdown"
 	}
 	return provided
+}
+
+// Match the Web UI's text attachment classification. Binary attachments keep
+// their data URL; text is sent as raw textContent so Nirvana can read it.
+func attachmentCategory(mediaType string) string {
+	switch {
+	case strings.HasPrefix(mediaType, "image/"):
+		return "image"
+	case strings.HasPrefix(mediaType, "text/"), mediaType == "application/json", mediaType == "application/xml":
+		return "text"
+	default:
+		return "file"
+	}
 }
 
 func isMarkdownAttachmentName(name string) bool {
@@ -463,11 +474,16 @@ func attachmentPayloads(items []pendingAttachment) ([]nirvanaImageAttachment, []
 	attachments := make([]nirvanaAttachment, 0, len(items))
 	rich := make([]RichAttachment, 0, len(items))
 	for _, item := range items {
-		dataURL := "data:" + item.Type + ";base64," + base64.StdEncoding.EncodeToString(item.Data)
-		if item.Category == "image" {
-			images = append(images, nirvanaImageAttachment{URL: dataURL, Name: item.Name, Type: item.Type})
+		attachment := nirvanaAttachment{Name: item.Name, Type: item.Type, Category: item.Category}
+		if item.Category == "text" {
+			attachment.TextContent = string(item.Data)
+		} else {
+			attachment.URL = "data:" + item.Type + ";base64," + base64.StdEncoding.EncodeToString(item.Data)
+			if item.Category == "image" {
+				images = append(images, nirvanaImageAttachment{URL: attachment.URL, Name: item.Name, Type: item.Type})
+			}
 		}
-		attachments = append(attachments, nirvanaAttachment{URL: dataURL, Name: item.Name, Type: item.Type, Category: item.Category})
+		attachments = append(attachments, attachment)
 		rich = append(rich, RichAttachment{URL: "", Name: item.Name, Size: item.Size, Type: item.Type, Category: item.Category, SysAttachmentID: item.SysAttachmentID})
 	}
 	return images, attachments, rich
@@ -561,10 +577,7 @@ func normalizedRichAttachment(item RichAttachment) RichAttachment {
 	}
 	item.Category = strings.ToLower(singleLineLabel(item.Category))
 	if item.Category == "" {
-		item.Category = "file"
-		if strings.HasPrefix(item.Type, "image/") {
-			item.Category = "image"
-		}
+		item.Category = attachmentCategory(item.Type)
 	}
 	item.SysAttachmentID = strings.TrimSpace(item.SysAttachmentID)
 	return item
@@ -618,10 +631,10 @@ func sanitizeAttachmentHistoryValue(value interface{}) interface{} {
 		for key, child := range typed {
 			lower := strings.ToLower(strings.TrimSpace(key))
 			if lower == "attachments" || lower == "images" {
-				if attachments := richAttachmentsFromValue(child); len(attachments) > 0 {
-					out[key] = cloneRichAttachments(attachments)
-					continue
-				}
+				// Even malformed attachment metadata must not retain inline
+				// bodies. Only the recognized metadata fields survive.
+				out[key] = cloneRichAttachments(richAttachmentsFromValue(child))
+				continue
 			}
 			if lower == "url" {
 				if rawURL, ok := child.(string); ok && containsInlineAttachmentData(rawURL) {
@@ -633,22 +646,68 @@ func sanitizeAttachmentHistoryValue(value interface{}) interface{} {
 		}
 		return out
 	case string:
-		if !containsInlineAttachmentData(typed) {
-			return typed
-		}
 		trimmed := strings.TrimSpace(typed)
 		if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
 			var decoded interface{}
 			if json.Unmarshal([]byte(trimmed), &decoded) == nil {
-				if encoded, err := json.Marshal(sanitizeAttachmentHistoryValue(decoded)); err == nil {
+				// A user's JSON example may contain fields named attachments,
+				// images, or textContent. Only rewrite it when it actually
+				// contains an inline attachment body.
+				if !containsInlineAttachmentData(typed) && !hasInlineTextAttachment(decoded) {
+					return typed
+				}
+				original, _ := json.Marshal(decoded)
+				if encoded, err := json.Marshal(sanitizeAttachmentHistoryValue(decoded)); err == nil && !bytes.Equal(encoded, original) {
 					return string(encoded)
 				}
 			}
 		}
-		return "[attachment data omitted]"
+		if containsInlineAttachmentData(typed) {
+			return "[attachment data omitted]"
+		}
+		return typed
 	default:
 		return value
 	}
+}
+
+func hasInlineTextAttachment(value interface{}) bool {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		for key, child := range typed {
+			if strings.EqualFold(key, "attachments") || strings.EqualFold(key, "images") {
+				if items, ok := child.([]interface{}); ok {
+					for _, item := range items {
+						if m := asMap(item); m != nil {
+							for k, v := range m {
+								if text, ok := v.(string); ok && strings.EqualFold(k, "textContent") && text != "" {
+									return true
+								}
+							}
+						}
+					}
+				}
+			}
+			if hasInlineTextAttachment(child) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, child := range typed {
+			if hasInlineTextAttachment(child) {
+				return true
+			}
+		}
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+			var decoded interface{}
+			if json.Unmarshal([]byte(trimmed), &decoded) == nil {
+				return hasInlineTextAttachment(decoded)
+			}
+		}
+	}
+	return false
 }
 
 func preservePendingAttachmentsInHistory(history []interface{}, content string, attachments []RichAttachment) []interface{} {

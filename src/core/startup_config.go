@@ -117,7 +117,7 @@ func webStartupEndpoints() []webStartupEndpoint {
 		})},
 		{key: "property_cache_ttl", path: webStartupPropertyEndpoint("name=", []string{"sn_build_agent.properties_cache_ttl_minutes"})},
 		{key: "property_timeout", path: webStartupPropertyEndpoint("name=", []string{"sn_build_agent.tool.execution.timeouts"})},
-		{key: "product_available", path: "/api/sn_build_agent/build_agent_api/isProductAvailable"},
+		{key: "product_available", path: "/api/sn_build_agent/build_agent_api/isProductAvailable?productId=com.sn.now.appengine&scopeName=sn_now_appengine"},
 		{key: "skills_summary", path: "/api/sn_build_agent/skills_api/summary"},
 		{key: "semantic_search", path: "/api/sn_ba_glide_tools/build_agent_glide_tools_search/getSemanticSearchStatus"},
 		{key: "update_available", path: "/api/sn_glider/applications/ide/" + webStartupIDEAppID + "/version/update-available"},
@@ -146,7 +146,7 @@ func (cfg *WebStartupConfig) absorbStartupResponse(instanceURL, key string, body
 	case "property_use_mock_llm", "property_nirvana_websocket_url", "property_bundle", "property_cache_ttl", "property_timeout":
 		return cfg.absorbProperties(result)
 	case "product_available":
-		cfg.ProductAvailable, cfg.ProductKnown = startupBool(firstNonNilStartup(result["isProductAvailable"], result["available"], result["value"], result["result"]))
+		cfg.ProductAvailable, cfg.ProductKnown = startupBool(firstNonNilStartup(result["isAvailable"], result["isProductAvailable"], result["available"], result["value"], result["result"]))
 	case "skills_summary":
 		cfg.SkillsSummary = cloneStartupMap(result)
 	case "semantic_search":
