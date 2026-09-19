@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import urllib.parse
 from unittest import mock
 
 
@@ -75,6 +76,7 @@ class PublisherTests(unittest.TestCase):
 
     def draft(self, assets=()):
         return {'id': 17, 'tag_name': 'v' + VERSION, 'target_commitish': COMMIT,
+                'upload_url': 'https://uploads.github.com/' + self.ns['API'] + '/releases/17/assets{?name,label}',
                 'draft': True, 'prerelease': False, 'assets': [self.asset(name) for name in assets]}
 
     def run_command(self, *args):
@@ -82,18 +84,22 @@ class PublisherTests(unittest.TestCase):
             return COMMIT
         if args[:2] == ('git', 'status'):
             return ' M src/main.go' if self.dirty else ''
-        if args[:3] == ('gh', 'release', 'upload'):
-            self.operations.append(('upload', args))
-            for path in args[4:-2]:
-                self.release['assets'].append(self.asset(pathlib.Path(path).name))
-            if self.bad_upload:
-                self.release['assets'][0]['digest'] = 'sha256:' + '0' * 64
-            return ''
         self.fail('Unexpected command: ' + str(args))
 
-    def api(self, endpoint, method='GET', payload=None, missing_ok=False):
-        self.operations.append((method, endpoint, payload))
+    def api(self, endpoint, method='GET', payload=None, missing_ok=False, input_file=None, content_type=None):
+        self.operations.append((method, endpoint, payload, input_file))
         base = self.ns['API']
+        if endpoint.startswith('https://uploads.github.com/' + base + '/releases/17/assets?'):
+            self.assertEqual(method, 'POST')
+            self.assertTrue(self.release['draft'])
+            name = urllib.parse.parse_qs(urllib.parse.urlsplit(endpoint).query)['name'][0]
+            self.assertEqual(input_file, self.dist / name)
+            self.assertIsNone(payload)
+            asset = self.asset(name)
+            if self.bad_upload:
+                asset['digest'] = 'sha256:' + '0' * 64
+            self.release['assets'].append(asset)
+            return asset
         if endpoint == base:
             return {'private': False, 'permissions': {'push': True}}
         if endpoint == base + '/commits/' + COMMIT:
@@ -129,17 +135,19 @@ class PublisherTests(unittest.TestCase):
     def test_publish_uploads_all_assets_before_switching_latest(self):
         self.main()
         actions = [item[0] for item in self.operations]
-        self.assertLess(actions.index('POST'), actions.index('upload'))
-        self.assertLess(actions.index('upload'), actions.index('PATCH'))
+        uploads = [index for index, item in enumerate(self.operations) if item[1].startswith('https://uploads.github.com/')]
+        self.assertEqual(len(uploads), 10)
+        self.assertLess(actions.index('POST'), min(uploads))
+        self.assertLess(max(uploads), actions.index('PATCH'))
         self.assertFalse(self.release['draft'])
 
     def test_draft_resume_only_uploads_missing_identical_assets(self):
         self.release = self.draft(self.ns['ASSETS'][:3])
         self.main()
-        self.assertNotIn('POST', [item[0] for item in self.operations])
-        upload = next(item[1] for item in self.operations if item[0] == 'upload')
-        self.assertEqual(len(upload[4:-2]), 7)
-        self.assertNotIn('--clobber', upload)
+        self.assertFalse(any(item[:2] == ('POST', self.ns['API'] + '/releases') for item in self.operations))
+        uploads = [item for item in self.operations if item[1].startswith('https://uploads.github.com/')]
+        self.assertEqual(len(uploads), 7)
+        self.assertEqual({item[3].name for item in uploads}, set(self.ns['ASSETS'][3:]))
 
     def test_dirty_build_rejected_before_network(self):
         self.manifest['sourceDirty'] = True
@@ -206,7 +214,7 @@ class PublisherTests(unittest.TestCase):
         self.release['assets'][0]['digest'] = 'sha256:' + '0' * 64
         with self.assertRaisesRegex(RuntimeError, 'differs from local'):
             self.main()
-        self.assertNotIn('upload', [item[0] for item in self.operations])
+        self.assertFalse(any(item[1].startswith('https://uploads.github.com/') for item in self.operations))
 
     def test_upload_mismatch_leaves_release_unpublished(self):
         self.bad_upload = True
@@ -225,6 +233,34 @@ class PublisherTests(unittest.TestCase):
         self.assertIn('github.com', args[0])
         self.assertEqual(json.loads(kwargs['input']), {'draft': False, 'make_latest': 'true'})
         self.assertEqual(result, {'id': 17})
+
+    def test_binary_upload_uses_numeric_draft_id_and_file_body(self):
+        namespace = {}
+        exec(compile(PUBLISH_CODE, 'publish-release.sh', 'exec'), namespace)
+        namespace['DIST'] = self.dist
+        name = 'bacli-linux-arm64'
+        asset = self.asset(name)
+        response = subprocess.CompletedProcess([], 0, 'HTTP/2.0 201 Created\nContent-Type: application/json\n\n' + json.dumps(asset), '')
+        with mock.patch('subprocess.run', return_value=response) as request:
+            namespace['upload_asset'](self.draft(), name, {name: self.ns['digest'](self.dist / name)})
+        args, kwargs = request.call_args
+        command = args[0]
+        self.assertEqual(command[:2], ['gh', 'api'])
+        self.assertEqual(command[command.index('--hostname') + 1], 'github.com')
+        self.assertEqual(command[command.index('--method') + 1], 'POST')
+        self.assertIn('https://uploads.github.com/repos/arizzi74/build-agent-cli/releases/17/assets?name=' + name, command)
+        self.assertEqual(command[command.index('--input') + 1], str(self.dist / name))
+        self.assertIn('Content-Type: application/octet-stream', command)
+        self.assertIn('Content-Length: ' + str((self.dist / name).stat().st_size), command)
+        self.assertIsNone(kwargs['input'])
+        self.assertNotIn('release', command)
+
+    def test_upload_url_must_match_expected_github_draft(self):
+        draft = self.draft()
+        draft['upload_url'] = 'https://other.example/upload{?name,label}'
+        with self.assertRaisesRegex(RuntimeError, 'Unexpected GitHub draft upload URL'):
+            self.ns['upload_asset'](draft, 'install.sh', {})
+        self.assertEqual(self.operations, [])
 
 
 class BuildTests(unittest.TestCase):

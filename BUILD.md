@@ -85,7 +85,7 @@ bacli-windows-arm64.exe
 
 `version.json` is the source of truth for installers and self-update. Production manifests use version-pinned binary URLs such as `https://github.com/arizzi74/build-agent-cli/releases/download/v2026.09.19.4/bacli-linux-arm64`, never moving latest links. This avoids checksum races if a newer release is published between the manifest and binary downloads. SHA-256 checks provide integrity, not a separate digital signature.
 
-Building requires Go, Python 3.9 or newer, and `sha256sum`. Publication additionally requires authenticated GitHub CLI access with permission to create releases (`gh auth login --hostname github.com`). The publisher uses `gh api` and `gh release upload`, including compatibility with GitHub CLI 2.4. Git-over-SSH authentication alone does not authenticate the GitHub Releases API. Installers and updates are public and need neither a token nor `gh`.
+Building requires Go, Python 3.9 or newer, and `sha256sum`. Publication additionally requires authenticated GitHub CLI access with permission to create releases (`gh auth login --hostname github.com`). The publisher uses `gh api` with direct draft-ID asset uploads, including compatibility with GitHub CLI 2.4; it does not rely on finding unpublished drafts by tag. Git-over-SSH authentication alone does not authenticate the GitHub Releases API. Installers and updates are public and need neither a token nor `gh`.
 
 Commit the intended source, documentation, scripts, and installer changes, then build from that clean commit and push it before publishing:
 

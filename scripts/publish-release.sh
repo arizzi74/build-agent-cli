@@ -24,6 +24,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import urllib.parse
 
 REPO = 'arizzi74/build-agent-cli'
 API = 'repos/' + REPO
@@ -106,10 +107,15 @@ def validate_local():
     return version, commit, hashes
 
 
-def api(endpoint, method='GET', payload=None, missing_ok=False):
+def api(endpoint, method='GET', payload=None, missing_ok=False, input_file=None, content_type=None):
     command = ['gh', 'api', '--hostname', 'github.com', '--include', '--method', method,
                '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', endpoint]
-    if payload is not None:
+    if input_file is not None:
+        if payload is not None:
+            fail('Cannot send JSON and a binary asset in the same request')
+        command += ['--input', str(input_file), '-H', 'Content-Type: ' + content_type,
+                    '-H', 'Content-Length: ' + str(input_file.stat().st_size)]
+    elif payload is not None:
         command += ['--input', '-']
     result = subprocess.run(command, input=json.dumps(payload) if payload is not None else None,
                             capture_output=True, text=True, check=False)
@@ -174,6 +180,20 @@ def verify_asset(asset, hashes):
             fail('Remote asset checksum verification failed: ' + name)
 
 
+def upload_asset(release, name, hashes):
+    # Older gh releases cannot find a draft by tag. Upload directly to the numeric
+    # draft ID using GitHub's returned upload URL, never the published-tag endpoint.
+    expected = 'https://uploads.github.com/' + API + '/releases/' + str(release['id']) + '/assets'
+    upload_url = release.get('upload_url', '').split('{', 1)[0]
+    if upload_url != expected:
+        fail('Unexpected GitHub draft upload URL; refusing to send an asset')
+    content_type = {'install.sh': 'text/plain', 'install.ps1': 'text/plain',
+                    'version.json': 'application/json', 'SHA256SUMS': 'text/plain'}.get(name, 'application/octet-stream')
+    asset = api(upload_url + '?' + urllib.parse.urlencode({'name': name}), 'POST',
+                input_file=DIST / name, content_type=content_type)
+    verify_asset(asset, hashes)
+
+
 def verify_draft(release, tag, commit, hashes, complete=False):
     if release.get('tag_name') != tag or release.get('draft') is not True or release.get('prerelease'):
         fail('Refusing to change a published, prerelease, or mismatched release')
@@ -216,10 +236,12 @@ def main():
             'draft': True, 'prerelease': False,
         })
         present = verify_draft(release, tag, commit, hashes)
-    missing = [str(DIST / name) for name in ASSETS if name not in present]
+    missing = [name for name in ASSETS if name not in present]
     if missing:
         print('Uploading ' + str(len(missing)) + ' assets to the draft', flush=True)
-        run('gh', 'release', 'upload', tag, *missing, '--repo', 'github.com/' + REPO)
+        for name in missing:
+            print('Uploading ' + name, flush=True)
+            upload_asset(release, name, hashes)
     release = api(API + '/releases/' + str(release['id']))
     verify_draft(release, tag, commit, hashes, complete=True)
     verify_tag(tag, commit)
