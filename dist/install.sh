@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-BASE_URL=${BACLI_BASE_URL:-https://nowdemo.it/bacli}
+BASE_URL=${BACLI_BASE_URL:-https://github.com/arizzi74/build-agent-cli/releases/latest/download}
+BASE_URL=${BASE_URL%/}
 INSTALL_DIR=${BACLI_INSTALL_DIR:-"$HOME/.local/bin"}
 MANIFEST_URL="$BASE_URL/version.json"
 
@@ -11,7 +12,7 @@ fail() {
 }
 
 command -v curl >/dev/null 2>&1 || fail "curl is required"
-command -v python3 >/dev/null 2>&1 || fail "python3 is required to read the signed-by-checksum release manifest"
+command -v python3 >/dev/null 2>&1 || fail "python3 is required to read the release manifest"
 
 os=$(uname -s)
 arch=$(uname -m)
@@ -26,22 +27,34 @@ esac
 tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t bacli)
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
 
-curl -fsSL "$MANIFEST_URL" -o "$tmpdir/version.json"
-eval "$(python3 - "$tmpdir/version.json" "$target" "$MANIFEST_URL" <<'PY'
-import json, shlex, sys
-from urllib.parse import urljoin
+curl -fsSL "$MANIFEST_URL" -o "$tmpdir/version.json" || fail "could not download release manifest from $MANIFEST_URL"
+manifest_vars=$(python3 - "$tmpdir/version.json" "$target" "$MANIFEST_URL" <<'PY'
+import json, re, shlex, sys
+from urllib.parse import urljoin, urlsplit
 p, target, manifest_url = sys.argv[1:]
-data = json.load(open(p, encoding='utf-8'))
-if data.get('schemaVersion') != 1:
+try:
+    with open(p, encoding='utf-8') as f:
+        data = json.load(f)
+except (OSError, ValueError) as exc:
+    raise SystemExit('invalid bacli release manifest: ' + str(exc))
+if not isinstance(data, dict) or data.get('schemaVersion') != 1:
     raise SystemExit('unsupported bacli release manifest')
-entry = data.get('files', {}).get(target)
-if not entry or not entry.get('url') or len(entry.get('sha256', '')) != 64:
+files = data.get('files')
+entry = files.get(target) if isinstance(files, dict) else None
+if not isinstance(entry, dict) or not isinstance(entry.get('url'), str) or not entry['url']:
     raise SystemExit('release manifest has no artifact for ' + target)
-print('artifact_url=' + shlex.quote(urljoin(manifest_url, entry['url'])))
+if not isinstance(entry.get('sha256'), str) or not re.fullmatch(r'[0-9a-fA-F]{64}', entry['sha256']):
+    raise SystemExit('release manifest has an invalid checksum for ' + target)
+artifact_url = urljoin(manifest_url, entry['url'])
+parsed_url = urlsplit(artifact_url)
+if parsed_url.scheme not in ('https', 'http') or not parsed_url.netloc:
+    raise SystemExit('release manifest has an invalid artifact URL for ' + target)
+print('artifact_url=' + shlex.quote(artifact_url))
 print('artifact_sha256=' + shlex.quote(entry['sha256'].lower()))
 print('release_version=' + shlex.quote(str(data.get('version', 'unknown'))))
 PY
-)"
+) || fail "could not read release manifest"
+eval "$manifest_vars"
 
 curl -fL "$artifact_url" -o "$tmpdir/bacli"
 actual=$(python3 - "$tmpdir/bacli" <<'PY'

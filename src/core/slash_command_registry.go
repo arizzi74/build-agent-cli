@@ -207,9 +207,9 @@ var slashCommandRegistry = []SlashCommandDefinition{
 		Handler: handleRejectCommand,
 	},
 	{
-		Canonical: "/mcp", Description: "show MCP servers advertised to Nirvana/Forge", Category: "Tools", Order: 40,
+		Canonical: "/mcp", Description: "show configured MCP servers and available WDF tool schemas", Category: "Tools", Order: 40,
 		Arguments: SlashCommandRequiredSubcommand, Behavior: SlashCommandTemplate, Runtime: SlashCommandRuntimeNirvana,
-		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/mcp list"},
+		CapturePolicy: SlashCommandCaptureOutput, AvailableWhileProcessing: true, Suggestions: []string{"/mcp list", "/mcp tools"},
 		Handler: func(ctx context.Context, c *Client, args []string) (bool, error) {
 			return true, handleMCPCommand(ctx, c, args)
 		},

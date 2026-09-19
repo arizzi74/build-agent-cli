@@ -39,6 +39,7 @@ type Client struct {
 	forceCredentialPrompt bool
 	sessionCookieHeader   string
 	userToken             string
+	scriptSessionError    string
 	oauthAccessToken      string
 	ambURL                string
 	ambChannel            string
@@ -97,6 +98,10 @@ type Client struct {
 	nirvanaMCPServers               []MCPServer
 	nirvanaMCPServersReady          bool
 	nirvanaToolCalls                map[string]nirvanaToolCall
+	scriptApprovalMu                sync.Mutex
+	scriptApprovals                 map[string]scriptApprovalDecision
+	scriptElicitations              map[string]bool
+	scriptApprovalGeneration        uint64
 	nirvanaToolCallOrder            []string
 	lastUserMessageSysID            string
 	lastUserMessageContent          RichUserContent
@@ -566,6 +571,7 @@ func (c *Client) PrepareConnectionAuthentication(ctx context.Context) error {
 			return err
 		}
 		c.oauthAccessToken = tok.AccessToken
+		c.prepareInstanceScriptSession(ctx, true)
 		c.connectionAuthPrepared = true
 		return nil
 	}
@@ -591,6 +597,7 @@ func (c *Client) PrepareConnectionAuthenticationNonInteractive(ctx context.Conte
 			return fmt.Errorf("saved credentials for profile %q are not usable noninteractively; switch locally once to reauthenticate: %w", c.opts.Profile, err)
 		}
 		c.oauthAccessToken = tok.AccessToken
+		c.prepareInstanceScriptSession(ctx, false)
 		c.connectionAuthPrepared = true
 		return nil
 	}
@@ -821,8 +828,16 @@ func (c *Client) WaitTurn(ctx context.Context) error {
 
 func (c *Client) beginActiveTurn(parent context.Context) context.Context {
 	c.clearPersistentSyncOutcome()
+	c.scriptApprovalMu.Lock()
+	c.scriptApprovals = nil
+	c.scriptElicitations = nil
+	c.scriptApprovalGeneration++
+	c.scriptApprovalMu.Unlock()
 	ctx, cancel := context.WithCancel(parent)
 	c.activeTurnMu.Lock()
+	if c.activeTurnCancel != nil {
+		c.activeTurnCancel()
+	}
 	c.activeTurnCtx = ctx
 	c.activeTurnCancel = cancel
 	c.activeTurnStopping = false
@@ -1688,7 +1703,7 @@ func isValidMCPTransport(transport string) bool {
 
 func isExcludedWDFMCPServerName(name string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(name))
-	return strings.Contains(normalized, "github") || excludedWDFMCPServerGitPattern.MatchString(normalized)
+	return strings.Contains(normalized, "github") || excludedWDFMCPServerGitPattern.MatchString(normalized) || strings.Contains(normalized, "zoom revenue accelerator")
 }
 
 func gliderStaticMCPServers() []MCPServer {
@@ -3874,21 +3889,18 @@ func (c *Client) buildInvokePayload(ctx context.Context, silentAuth bool) (map[s
 		largeModel = c.webAgentConfig.Model
 	}
 	glideAttributes := map[string]interface{}{
-		"instanceUrl":       strings.TrimRight(c.cfg.InstanceURL, "/") + "/",
-		"glideVersion":      "australia",
-		"instanceName":      instanceNameFromURL(c.cfg.InstanceURL),
-		"instanceId":        instanceID,
-		"userId":            userID,
-		"ideVersion":        "4.2.0-alpha.6",
-		"buildAgentVersion": "2.3.3",
+		"instanceUrl":  strings.TrimRight(c.cfg.InstanceURL, "/") + "/",
+		"glideVersion": "australia",
+		"instanceName": instanceNameFromURL(c.cfg.InstanceURL),
+		"instanceId":   instanceID,
+		"userId":       userID,
 	}
 	for k, v := range c.webAgentConfig.GlideAttributes {
 		glideAttributes[k] = v
 	}
-	// The web client sends these extension version fields even when the instance
-	// providerConfig does not include them.
-	glideAttributes["ideVersion"] = "4.2.0-alpha.6"
-	glideAttributes["buildAgentVersion"] = "2.3.3"
+	// Preserve authoritative provider metadata. The IDE application version,
+	// IDE SDK version, and Build Agent extension version are different values;
+	// do not invent or overwrite them with a stale captured version.
 	if instanceURL := stringify(glideAttributes["instanceUrl"]); instanceURL == "" {
 		glideAttributes["instanceUrl"] = strings.TrimRight(c.cfg.InstanceURL, "/") + "/"
 	}
@@ -3959,10 +3971,9 @@ func (c *Client) buildInvokePayload(ctx context.Context, silentAuth bool) (map[s
 
 func (c *Client) clientCapabilities() map[string]interface{} {
 	if c.opts.Nirvana {
-		// Keep this list byte-for-byte equivalent in shape to current Glider Web
-		// UI HAR captures. Advertising extension-only capabilities that the CLI
-		// does not implement can cause Forge to issue unsupported elicitations.
-		return map[string]interface{}{
+		// Advertise implemented client contracts only. Script execution also
+		// requires the interactive instance session used by its processor route.
+		caps := map[string]interface{}{
 			"client_ide":              map[string]interface{}{},
 			"elicitation":             map[string]interface{}{},
 			"fluent_docs":             map[string]interface{}{},
@@ -3977,6 +3988,10 @@ func (c *Client) clientCapabilities() map[string]interface{} {
 			"sub_agents":              map[string]interface{}{},
 			"tools":                   map[string]interface{}{"execute": true},
 		}
+		if c.scriptExecutionSessionAvailable() {
+			caps["script_execution"] = map[string]interface{}{}
+		}
+		return caps
 	}
 	caps := map[string]interface{}{
 		"change_log":              map[string]interface{}{},
@@ -4027,6 +4042,8 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 		result, status, err = c.answerInterview(payload)
 	case "approval", "plan_approval":
 		result, status, err = c.answerApproval(action, payload)
+	case "run_script", "rollback_script":
+		result, status = c.answerInstanceScriptElicitation(turnCtx, elicitationID, action, payload)
 	case "app_picker":
 		result, status, err = c.answerAppPicker(payload)
 	case "create_new_servicenow_app":
@@ -4100,7 +4117,11 @@ func (c *Client) handleElicitation(event map[string]interface{}) error {
 	case "instance_skills_list":
 		ctx, cancel := context.WithTimeout(turnCtx, 30*time.Second)
 		defer cancel()
-		result, status = c.answerInstanceSkillsList(ctx)
+		result, status = c.answerInstanceSkillsList(ctx, payload)
+	case "instance_rules_list":
+		ctx, cancel := context.WithTimeout(turnCtx, 30*time.Second)
+		defer cancel()
+		result, status = c.answerInstanceRulesList(ctx, payload)
 	case "instance_skill_body":
 		ctx, cancel := context.WithTimeout(turnCtx, 30*time.Second)
 		defer cancel()
@@ -4183,6 +4204,11 @@ func (c *Client) answerInterview(payload map[string]interface{}) (map[string]int
 }
 
 func (c *Client) answerApproval(action string, payload map[string]interface{}) (map[string]interface{}, string, error) {
+	if action == "approval" {
+		if result, status, handled, err := c.answerPendingScriptApproval(c.activeTurnContext(), payload); handled {
+			return result, status, err
+		}
+	}
 	if c.opts.AutoApprove || emptyWebUIApproval(action, payload) {
 		return map[string]interface{}{"approved": true}, "complete", nil
 	}
@@ -4335,7 +4361,11 @@ func (c *Client) sendElicitationResponse(elicitationID string, status string, re
 		responseResult[k] = v
 	}
 	if status == "error" {
-		message := stringify(result["error"])
+		errorDetails := asMap(result["error"])
+		message := firstString(errorDetails, "message")
+		if message == "" && errorDetails == nil {
+			message = stringify(result["error"])
+		}
 		if message == "" {
 			message = stringify(result["message"])
 		}
@@ -4343,6 +4373,9 @@ func (c *Client) sendElicitationResponse(elicitationID string, status string, re
 			message = "Unknown error"
 		}
 		code := stringify(result["code"])
+		if code == "" {
+			code = firstString(errorDetails, "code")
+		}
 		if code == "" {
 			code = "UNKNOWN_ERROR"
 		}

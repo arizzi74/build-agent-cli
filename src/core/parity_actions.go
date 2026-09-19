@@ -587,23 +587,10 @@ func (c *Client) answerMCPManagement(ctx context.Context, action string, payload
 
 	servers := c.nirvanaMCPServerPayload(ctx)
 	if action == "list_mcp_servers" {
-		return map[string]interface{}{"available": servers, "connected": []interface{}{}, "connectionState": "unknown-backend-managed", "managedBy": "ServiceNow backend/Nirvana handshake", "message": fmt.Sprintf("%d MCP server configuration(s) are available to Forge; client-side connection state is unavailable.", len(servers))}, "complete"
+		return mcpServerListing(servers), "complete"
 	}
 	if action == "list_mcp_tools" {
-		id := strings.TrimSpace(firstString(payload, "serverId", "server_id"))
-		if id != "" {
-			found := false
-			for _, server := range servers {
-				if server.ServerID == id {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return map[string]interface{}{"error": fmt.Sprintf("No MCP server found with ID: %s", id), "code": "MCP_SERVER_NOT_FOUND"}, "error"
-			}
-		}
-		return map[string]interface{}{"tools": []interface{}{}, "serverId": id, "dynamicTools": true, "managedBy": "ServiceNow backend/Nirvana handshake", "message": "MCP tool schemas are loaded dynamically by Forge from backend-managed servers and are not available for client-side enumeration."}, "complete"
+		return c.answerMCPToolsList(ctx, servers, payload)
 	}
 	return map[string]interface{}{"error": fmt.Sprintf("unsupported MCP management action: %s", action), "code": "UNEXPECTED_CLIENT_ACTION"}, "error"
 }

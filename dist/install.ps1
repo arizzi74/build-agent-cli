@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $baseUrlOverride = [string]$env:BACLI_BASE_URL
-$BaseUrl = if ([string]::IsNullOrWhiteSpace($baseUrlOverride)) { 'https://nowdemo.it/bacli' } else { $baseUrlOverride.TrimEnd('/') }
+$BaseUrl = if ([string]::IsNullOrWhiteSpace($baseUrlOverride)) { 'https://github.com/arizzi74/build-agent-cli/releases/latest/download' } else { $baseUrlOverride.TrimEnd('/') }
 $installDirOverride = [string]$env:BACLI_INSTALL_DIR
 $userHome = [string]$HOME
 if ([string]::IsNullOrWhiteSpace($userHome)) {
@@ -34,12 +34,23 @@ $manifest = Invoke-RestMethod -Uri $manifestUri -UseBasicParsing
 if ($manifest.schemaVersion -ne 1) {
     throw 'Unsupported bacli release manifest'
 }
-$entryProperty = $manifest.files.PSObject.Properties[$target]
+$entryProperty = if ($null -ne $manifest.files) { $manifest.files.PSObject.Properties[$target] } else { $null }
 $entry = if ($entryProperty) { $entryProperty.Value } else { $null }
-if (-not $entry -or -not $entry.url -or -not $entry.sha256) {
+if (-not $entry -or -not ($entry.url -is [string]) -or [string]::IsNullOrWhiteSpace($entry.url)) {
     throw "Release manifest has no artifact for $target"
 }
-$artifactUri = [Uri]::new([Uri]$manifestUri, [string]$entry.url).AbsoluteUri
+if (-not ($entry.sha256 -is [string]) -or $entry.sha256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "Release manifest has an invalid checksum for $target"
+}
+try {
+    $artifact = [Uri]::new([Uri]$manifestUri, [string]$entry.url)
+} catch {
+    throw "Release manifest has an invalid artifact URL for $target"
+}
+if ($artifact.Scheme -notin @('https', 'http') -or [string]::IsNullOrWhiteSpace($artifact.Host)) {
+    throw "Release manifest has an invalid artifact URL for $target"
+}
+$artifactUri = $artifact.AbsoluteUri
 
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("bacli-{0}.exe" -f [Guid]::NewGuid().ToString('N'))

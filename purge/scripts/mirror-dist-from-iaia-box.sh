@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Install this script on m0n0arm. It pulls the bacli release directory from
+# Historical, retired publication workflow. Use scripts/publish-release.sh.
+# Do not install or schedule this script for new releases.
+# This script formerly ran on m0n0arm and pulled the bacli release directory from
 # iaia-box using the already trusted SSH key, validates it, and publishes it.
 REMOTE_HOST=${BACLI_REMOTE_HOST:-ubuntu@iaia-box}
 REMOTE_DIR=${BACLI_REMOTE_DIR:-/home/ubuntu/CODEX/build-agent-go-cli/dist/}

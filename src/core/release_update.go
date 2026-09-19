@@ -21,7 +21,7 @@ import (
 
 var (
 	cliVersion       = "dev"
-	cliUpdateBaseURL = "https://nowdemo.it/bacli"
+	cliUpdateBaseURL = "https://github.com/arizzi74/build-agent-cli/releases/latest/download"
 )
 
 const releaseManifestSchemaVersion = 1
@@ -73,9 +73,7 @@ func checkForSelfUpdate() (bool, string) {
 	if override := strings.TrimSpace(os.Getenv("BACLI_UPDATE_BASE_URL")); override != "" {
 		base = strings.TrimRight(override, "/")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	updated, version, err := selfUpdateFromManifest(ctx, http.DefaultClient, base, current, target)
+	updated, version, err := selfUpdateFromManifest(context.Background(), http.DefaultClient, base, current, target)
 	if err != nil || !updated {
 		return false, ""
 	}
@@ -87,7 +85,11 @@ func selfUpdateFromManifest(ctx context.Context, client *http.Client, baseURL, c
 		client = http.DefaultClient
 	}
 	manifestURL := strings.TrimRight(baseURL, "/") + "/version.json"
-	raw, err := downloadReleaseFile(ctx, client, manifestURL, 1<<20)
+	// Keep offline startup fast, but give a verified release download its own
+	// budget: GitHub assets may redirect to a CDN and exceed five seconds.
+	manifestCtx, cancelManifest := context.WithTimeout(ctx, 5*time.Second)
+	raw, err := downloadReleaseFile(manifestCtx, client, manifestURL, 1<<20)
+	cancelManifest()
 	if err != nil {
 		return false, "", err
 	}
@@ -109,7 +111,9 @@ func selfUpdateFromManifest(ctx context.Context, client *http.Client, baseURL, c
 	if err != nil {
 		return false, "", err
 	}
-	binary, err := downloadReleaseFile(ctx, client, artifactURL, 128<<20)
+	artifactCtx, cancelArtifact := context.WithTimeout(ctx, 2*time.Minute)
+	binary, err := downloadReleaseFile(artifactCtx, client, artifactURL, 128<<20)
+	cancelArtifact()
 	if err != nil {
 		return false, "", err
 	}

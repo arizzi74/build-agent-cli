@@ -7,14 +7,16 @@
 macOS or Linux:
 
 ```bash
-curl -fsSL https://nowdemo.it/bacli/install.sh | sh
+curl -fsSL https://github.com/arizzi74/build-agent-cli/releases/latest/download/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://nowdemo.it/bacli/install.ps1 | iex
+irm https://github.com/arizzi74/build-agent-cli/releases/latest/download/install.ps1 | iex
 ```
+
+Installers and automatic updates are hosted on GitHub Releases. To migrate an older installation, close bacli and rerun the command above; your saved settings and projects are preserved.
 
 Configure an instance, then start the interactive client:
 
@@ -28,6 +30,7 @@ bacli
 - **Workspaces and conversations:** switch Web UI workspaces, apps, and persisted Build Agent conversations.
 - **Multiple instances:** isolate credentials, projects, workspaces, apps, and conversations by profile.
 - **Telegram channel:** pair a private bot for headless or companion Build Agent interactions.
+- **Reviewed instance scripts:** run ServiceNow scripts and request rollback through Build Agent, with explicit review and approval in the terminal or Telegram.
 
 By design, **bacli does not grant the model unrestricted access to local tools or shell commands**. Build Agent exposes only its configured, approved tool catalog; arbitrary shell execution is not advertised as an available tool, so the model cannot request it through the normal tool-calling flow and bacli will not execute it.
 
@@ -62,7 +65,7 @@ Use **bacli --help** for the generated flag help and **/help** in the interactiv
 | **--no-open** | Print the OAuth URL without opening a browser. |
 | **--logout** | Remove saved session, OAuth token, and opt-in stored login for the selected profile. |
 | **--session-status** | Show safe saved-session and stored-login status without revealing secrets. |
-| **--auto-approve** | Accept supported approval/client prompts automatically. |
+| **--auto-approve** | Accept supported approval/client prompts automatically; instance scripts and rollbacks still require explicit review. |
 | **--application-id-list &lt;ids&gt;** | Supply comma-separated app IDs for conversation listing. |
 | **--debug-file &lt;file&gt;**, **-debug &lt;file&gt;**, **--debug &lt;file&gt;** | Write terminal output and a redacted debug trace to a file. |
 | **--advertise-local-tools** | Experimental local-tool advertisement; not for normal operation. |
@@ -87,7 +90,7 @@ Use **bacli --help** for the generated flag help and **/help** in the interactiv
 | **/sync [status\|pull\|push]** | Compare or synchronize the active app's local source with Glide VFS. |
 | **/project &lt;…&gt;**, **/projects** | Manage checkouts: **current**, **list**, **use**, **clone-here**, **primary**, or **forget**. |
 | **/attach**, **/attachments** | Manage next-turn files: **list**, **add &lt;path&gt;**, **paste**, **remove &lt;item&gt;**, **clear**, or **clear-all** (Nirvana). |
-| **/mcp list** | List MCP servers advertised to Nirvana (Nirvana only). |
+| **/mcp list**, **/mcp tools [server-id]** | List advertised MCP servers or inspect configured WDF tool schemas (Nirvana only). |
 | **/status [--json]** | Show offline-safe runtime health. |
 | **/turn [--json]** | Show the active or most recent redacted turn. |
 | **/support-bundle [path] [--json]** | Create a local redacted support archive. |

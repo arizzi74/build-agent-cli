@@ -18,8 +18,16 @@ const (
 // answerInstanceSkillsList mirrors the Forge client-side summary request. It
 // is deliberately remote-read-only: it never creates a checkout, syncs an
 // app, or writes local state.
-func (c *Client) answerInstanceSkillsList(ctx context.Context) (map[string]interface{}, string) {
-	body, statusCode, err := c.getInstanceSkillJSON(ctx, "summary")
+func (c *Client) answerInstanceSkillsList(ctx context.Context, payloads ...map[string]interface{}) (map[string]interface{}, string) {
+	var payload map[string]interface{}
+	if len(payloads) > 0 {
+		payload = payloads[0]
+	}
+	suffix, valid := c.instanceInstructionPath("summary", payload)
+	if !valid {
+		return instanceSkillError("INVALID_PARAM", "Invalid applicationId"), "error"
+	}
+	body, statusCode, err := c.getInstanceSkillJSON(ctx, suffix)
 	if err != nil {
 		if statusCode == http.StatusBadRequest {
 			return map[string]interface{}{
@@ -29,11 +37,45 @@ func (c *Client) answerInstanceSkillsList(ctx context.Context) (map[string]inter
 		}
 		return instanceSkillError("INSTANCE_SKILLS_ERROR", "Failed to fetch instance skills"), "error"
 	}
-	payload, ok := parseInstanceSkillPayload(body)
-	if !ok || !isJSONArray(payload["skills"]) {
+	response, ok := parseInstanceSkillPayload(body)
+	if !ok || !isJSONArray(response["skills"]) {
 		return instanceSkillError("INSTANCE_SKILLS_ERROR", "Invalid instance skills response"), "error"
 	}
-	return map[string]interface{}{"content": string(payload["skills"])}, "complete"
+	return map[string]interface{}{"content": string(response["skills"])}, "complete"
+}
+
+// answerInstanceRulesList fetches the active rules applicable to this turn's
+// application. Rules are intentionally refreshed on every request, matching
+// the web client: cached instructions may no longer be active or in scope.
+func (c *Client) answerInstanceRulesList(ctx context.Context, payload map[string]interface{}) (map[string]interface{}, string) {
+	suffix, valid := c.instanceInstructionPath("rules/summary", payload)
+	if !valid {
+		return instanceSkillError("INVALID_PARAM", "Invalid applicationId"), "error"
+	}
+	body, statusCode, err := c.getInstanceSkillJSON(ctx, suffix)
+	if err != nil {
+		// Rules were added after skills. Older instances may have the skills
+		// API without this route; a missing route is an empty additive ruleset.
+		if statusCode == http.StatusBadRequest || statusCode == http.StatusNotFound {
+			return map[string]interface{}{
+				"content": "[]",
+				"warning": instanceSkillsUnsupportedWarning(c.cfg.InstanceURL),
+			}, "complete"
+		}
+		return instanceSkillError("INSTANCE_RULES_ERROR", "Failed to fetch instance rules"), "error"
+	}
+	response, ok := parseInstanceSkillPayload(body)
+	if !ok {
+		return instanceSkillError("INSTANCE_RULES_ERROR", "Invalid instance rules response"), "error"
+	}
+	rules := response["rules"]
+	if len(rules) == 0 || strings.TrimSpace(string(rules)) == "null" {
+		return map[string]interface{}{"content": "[]"}, "complete"
+	}
+	if !isJSONArray(rules) {
+		return instanceSkillError("INSTANCE_RULES_ERROR", "Invalid instance rules response"), "error"
+	}
+	return map[string]interface{}{"content": string(rules)}, "complete"
 }
 
 // answerInstanceSkillBody retrieves a single named skill body through the
@@ -46,7 +88,11 @@ func (c *Client) answerInstanceSkillBody(ctx context.Context, payload map[string
 	if !valid {
 		return instanceSkillError("INVALID_PARAM", "Invalid skill name"), "error"
 	}
-	body, _, err := c.getInstanceSkillJSON(ctx, url.PathEscape(name))
+	suffix, valid := c.instanceInstructionPath(url.PathEscape(name), payload)
+	if !valid {
+		return instanceSkillError("INVALID_PARAM", "Invalid applicationId"), "error"
+	}
+	body, _, err := c.getInstanceSkillJSON(ctx, suffix)
 	if err != nil {
 		return instanceSkillError("INSTANCE_ERROR", "Failed to fetch skill body: "+name), "error"
 	}
@@ -59,6 +105,33 @@ func (c *Client) answerInstanceSkillBody(ctx context.Context, payload map[string
 		return instanceSkillError("INSTANCE_ERROR", "Failed to fetch skill body: "+name), "error"
 	}
 	return map[string]interface{}{"content": content}, "complete"
+}
+
+// instanceInstructionPath mirrors the current web client's application
+// precedence: an explicit applicationId, then the active scope ID/name. Keep
+// it in the query, never the path, and never fall back to an unscoped request
+// when a caller supplied malformed application context.
+func (c *Client) instanceInstructionPath(path string, payload map[string]interface{}) (string, bool) {
+	applicationID := ""
+	if raw, supplied := payload["applicationId"]; supplied && raw != nil {
+		var valid bool
+		applicationID, valid = safeInstanceSkillName(raw)
+		if !valid {
+			return "", false
+		}
+	}
+	if applicationID == "" {
+		if appScope, ok := c.nirvanaOutboundAppScope(); ok {
+			applicationID = firstString(appScope, "scopeId", "scopeName")
+		}
+	}
+	if applicationID == "" {
+		return path, true
+	}
+	if !safeInstanceSkillText(applicationID) {
+		return "", false
+	}
+	return path + "?" + url.Values{"application_id": []string{applicationID}}.Encode(), true
 }
 
 // answerInstanceSkillResource retrieves a single resource without treating its

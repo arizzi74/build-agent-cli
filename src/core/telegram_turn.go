@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,7 @@ type telegramPendingInteraction struct {
 type telegramRelayItem struct {
 	text         string
 	preformatted bool
+	scriptReview bool
 	ack          chan error
 }
 
@@ -336,14 +338,27 @@ func (r *telegramTurnRelay) enqueue(text string, preformatted bool) {
 }
 
 func (r *telegramTurnRelay) sendRequired(ctx context.Context, text string) error {
+	return r.sendRequiredItem(ctx, text, false)
+}
+
+func (r *telegramTurnRelay) sendRequiredScriptReview(ctx context.Context, review turnScriptReview) error {
+	return r.sendRequiredItem(ctx, formatScriptReview(review), true)
+}
+
+func (r *telegramTurnRelay) sendRequiredItem(ctx context.Context, text string, scriptReview bool) error {
 	if r == nil {
 		return errors.New("Telegram progress relay is unavailable")
 	}
-	text = telegramSafeRemoteText(text, 0)
+	if !scriptReview {
+		text = telegramSafeRemoteText(text, 0)
+	}
 	if text == "" {
 		return errors.New("Telegram interaction message is empty")
 	}
-	item := telegramRelayItem{text: text, ack: make(chan error, 1)}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	item := telegramRelayItem{text: text, scriptReview: scriptReview, ack: make(chan error, 1)}
 	r.mu.Lock()
 	if r.closed || r.stopped {
 		err := r.err
@@ -507,9 +522,15 @@ func (r *telegramTurnRelay) run() {
 			r.queue[len(r.queue)-1] = telegramRelayItem{}
 			r.queue = r.queue[:len(r.queue)-1]
 			r.mu.Unlock()
-			sendCtx, cancel := context.WithTimeout(r.ctx, telegramProgressSendTimeout)
+			timeout := telegramProgressSendTimeout
+			if item.ack != nil {
+				timeout = telegramSendTimeout
+			}
+			sendCtx, cancel := context.WithTimeout(r.ctx, timeout)
 			var err error
-			if item.preformatted {
+			if item.scriptReview {
+				err = r.service.sendScriptReview(sendCtx, r.chatID, item.text)
+			} else if item.preformatted {
 				err = r.service.sendPreformattedText(sendCtx, r.chatID, item.text)
 			} else {
 				err = r.service.sendText(sendCtx, r.chatID, item.text)
@@ -652,6 +673,13 @@ func (s *telegramService) deliverInteractionReply(chatID, userID, text string, m
 	}
 	text = strings.TrimSpace(text)
 	command, argument := telegramCommandParts(text)
+	if pending.kind == "script_approval" && command != "" && command != "/answer" &&
+		(!strings.HasPrefix(command, "/") || command == "/turn_approve" || command == "/turn_reject") {
+		id := pending.id
+		s.turnControlMu.Unlock()
+		s.sendAsyncMirrored(chatID, fmt.Sprintf("For this script request use /answer %s Approve or /answer %s Reject. Use /cancel to cancel the turn.", id, id))
+		return true
+	}
 	switch command {
 	case "":
 		s.turnControlMu.Unlock()
@@ -690,7 +718,7 @@ func (s *telegramService) deliverInteractionReply(chatID, userID, text string, m
 		}
 		return true
 	}
-	if pending.kind == "approval" {
+	if pending.kind == "approval" || pending.kind == "script_approval" {
 		if _, err := parseTurnApprovalAnswer(text); err != nil {
 			s.turnControlMu.Unlock()
 			s.sendAsyncMirrored(chatID, "Reply Approve or Reject for the active request.")
@@ -724,7 +752,17 @@ func (s *telegramService) deleteSecretReply(chatID string, messageID int64) {
 }
 
 func (s *telegramService) requestInteraction(ctx context.Context, chatID, userID string, relay *telegramTurnRelay, request turnInteractionRequest) (string, error) {
-	pending := &telegramPendingInteraction{id: strings.ToUpper(uuidV4Compact()[:6]), chatID: chatID, userID: userID, kind: request.Kind, secret: request.Secret, replies: make(chan string, 1)}
+	if request.Kind == "script_approval" && (request.Review == nil ||
+		(strings.TrimSpace(request.Review.Script) == "" &&
+			!(request.Review.Action == "rollback_script" && strings.TrimSpace(request.Review.RollbackContext) != ""))) {
+		return "", errors.New("script approval requires a complete script review")
+	}
+	id := strings.ToUpper(uuidV4Compact()[:6])
+	if request.Kind == "script_approval" {
+		// Script authorizations must not collide with stale approval messages.
+		id = strings.ToUpper(uuidV4Compact())
+	}
+	pending := &telegramPendingInteraction{id: id, chatID: chatID, userID: userID, kind: request.Kind, secret: request.Secret, replies: make(chan string, 1)}
 	s.turnControlMu.Lock()
 	if s.pendingInteraction != nil {
 		s.turnControlMu.Unlock()
@@ -746,8 +784,15 @@ func (s *telegramService) requestInteraction(ctx context.Context, chatID, userID
 	if client, pinned := s.pinnedClient(); pinned {
 		mirrorTelegramSystemToTerminal(client, requestMessage)
 	}
+	if request.Kind == "script_approval" {
+		if err := relay.sendRequiredScriptReview(ctx, *request.Review); err != nil {
+			return "", fmt.Errorf("Telegram could not deliver the complete script review: %w", err)
+		}
+	}
 	readyMessage := fmt.Sprintf("Input required [%s] is ready. Reply now", pending.id)
-	if request.Kind == "approval" {
+	if request.Kind == "script_approval" {
+		readyMessage = fmt.Sprintf("Input required [%s] is ready. After reading the complete review, use /answer %s Approve or /answer %s Reject. Use /cancel to cancel the turn.", pending.id, pending.id, pending.id)
+	} else if request.Kind == "approval" {
 		readyMessage += " with Approve or Reject."
 	} else if request.Secret {
 		readyMessage += fmt.Sprintf(" directly, or use /answer %s <secret> when it starts with /. The bot will delete the reply after receipt when Telegram permits it.", pending.id)
@@ -767,6 +812,14 @@ func (s *telegramService) requestInteraction(ctx context.Context, chatID, userID
 	s.turnControlMu.Unlock()
 	select {
 	case answer := <-pending.replies:
+		if request.Kind == "script_approval" {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			if err := s.serviceContext().Err(); err != nil {
+				return "", err
+			}
+		}
 		if strings.TrimSpace(answer) == "" {
 			return "", errors.New("Telegram reply cannot be empty")
 		}
@@ -780,6 +833,13 @@ func (s *telegramService) requestInteraction(ctx context.Context, chatID, userID
 
 func (s *telegramService) finishInteractionWait(pending *telegramPendingInteraction, waitErr error) (string, error) {
 	s.turnControlMu.Lock()
+	if pending.kind == "script_approval" {
+		if s.pendingInteraction == pending {
+			s.pendingInteraction = nil
+		}
+		s.turnControlMu.Unlock()
+		return "", waitErr
+	}
 	if s.pendingInteraction == pending {
 		s.pendingInteraction = nil
 		s.turnControlMu.Unlock()
@@ -810,7 +870,10 @@ func formatTelegramInteraction(id string, request turnInteractionRequest) string
 	for i, option := range request.Options {
 		fmt.Fprintf(&out, "\n%d. %s", i+1, telegramSafeRemoteText(option, 0))
 	}
-	if request.Kind == "approval" {
+	if request.Kind == "script_approval" {
+		out.WriteString("\nThe complete script review follows, in fixed-width messages or an attached text document. Read all of it before approving. Replies are disabled until delivery is confirmed. Use /cancel to cancel the turn.")
+		fmt.Fprintf(&out, "\nThis request requires /answer %s Approve or /answer %s Reject; unqualified approval replies are not accepted.", id, id)
+	} else if request.Kind == "approval" {
 		out.WriteString("\nReply Approve or Reject (or /turn_approve / /turn_reject). Use /cancel to cancel the turn.")
 	} else if request.Secret {
 		fmt.Fprintf(&out, "\nSecurity: Telegram bots are not end-to-end encrypted. Your reply will not be mirrored in the TUI and will be deleted after receipt when Telegram permits it. For stronger privacy, cancel and enter it in the local TUI. If it starts with /, use /answer %s <secret>.", id)
@@ -818,6 +881,71 @@ func formatTelegramInteraction(id string, request turnInteractionRequest) string
 		fmt.Fprintf(&out, "\nReply with your answer. If it starts with /, use /answer %s <answer>. Use /cancel to cancel the turn.", id)
 	}
 	return out.String()
+}
+
+// telegramScriptReviewParts accounts for HTML expansion before splitting. No
+// trimming, diagnostic redaction, or progress queue limit may hide script text.
+func telegramScriptReviewParts(text string) []string {
+	const budget = telegramTextChunkUTF16Units - 120
+	var parts []string
+	var part strings.Builder
+	units := 0
+	for _, r := range text {
+		n := telegramUTF16Units([]rune(html.EscapeString(string(r))))
+		if units+n > budget {
+			parts = append(parts, part.String())
+			part.Reset()
+			units = 0
+		}
+		part.WriteRune(r)
+		units += n
+	}
+	if part.Len() > 0 {
+		parts = append(parts, part.String())
+	}
+	return parts
+}
+
+func (s *telegramService) sendScriptReview(ctx context.Context, chatID, review string) error {
+	if s == nil || s.api == nil {
+		return errors.New("Telegram API is unavailable")
+	}
+	s.outboundMu.Lock()
+	defer s.outboundMu.Unlock()
+	parts := telegramScriptReviewParts(review)
+	wait := func() error {
+		if interval := s.api.messageInterval; interval > 0 && !s.outboundLast.IsZero() {
+			if delay := time.Until(s.outboundLast.Add(interval)); delay > 0 {
+				return waitTelegramRetry(ctx, delay)
+			}
+		}
+		return ctx.Err()
+	}
+	if len(parts) > telegramMaxDirectTextMessages {
+		if err := wait(); err != nil {
+			return err
+		}
+		// The script limit is 1 MiB, comfortably below the document limit. A
+		// document avoids hundreds of chat messages without losing any code.
+		err := s.api.callDocument(ctx, chatID, "bacli-script-review.txt", "Complete script review. Read this document before approving the request.", []byte(review))
+		if err == nil {
+			s.outboundLast = time.Now()
+		}
+		return err
+	}
+	for i, part := range parts {
+		if err := wait(); err != nil {
+			return err
+		}
+		text := fmt.Sprintf("Script review %d/%d\n<pre>%s</pre>", i+1, len(parts), html.EscapeString(part))
+		if err := s.api.call(ctx, "sendMessage", map[string]interface{}{
+			"chat_id": chatID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": true,
+		}, nil); err != nil {
+			return fmt.Errorf("script review part %d of %d: %w", i+1, len(parts), err)
+		}
+		s.outboundLast = time.Now()
+	}
+	return nil
 }
 
 func (s *telegramService) runTelegramPrompt(in telegramQueuedCommand, prompt string) string {

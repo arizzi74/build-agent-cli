@@ -147,7 +147,7 @@ func printSlashHelp(c *Client) {
 
 func handleMCPCommand(ctx context.Context, c *Client, args []string) error {
 	if len(args) == 0 || strings.EqualFold(args[0], "help") {
-		slashCommandPrintln("usage: /mcp list")
+		slashCommandPrintln("usage: /mcp list | /mcp tools [server-id]")
 		return nil
 	}
 	if !c.opts.Nirvana {
@@ -169,7 +169,33 @@ func handleMCPCommand(ctx context.Context, c *Client, args []string) error {
 			}
 			slashCommandPrintf("* %s  id=%s transport=%s source=%s%s\n", server.Name, server.ServerID, server.Transport, server.Source, urlSuffix)
 		}
-		slashCommandPrintln("tools: WDF pass-through servers do not expose client-side tool schemas; Forge loads them after the Nirvana handshake, matching the Glider web client.")
+		slashCommandPrintln("Use /mcp tools [server-id] to inspect configured WDF tool schemas. Built-in Build Agent tools are separate from MCP tools.")
+		return nil
+	case "tools":
+		if len(args) > 2 {
+			return errors.New("usage: /mcp tools [server-id]")
+		}
+		payload := map[string]interface{}{}
+		if len(args) == 2 {
+			payload["serverId"] = args[1]
+		}
+		result, status := c.answerMCPManagement(ctx, "list_mcp_tools", payload)
+		slashCommandPrintln(singleLineLabel(stringify(result["message"])))
+		if tools, ok := result["tools"].([]map[string]interface{}); ok {
+			for _, tool := range tools {
+				slashCommandPrintf("* %s  server=%s\n", singleLineLabel(stringify(tool["name"])), singleLineLabel(stringify(tool["serverId"])))
+			}
+		}
+		if servers, ok := result["servers"].([]map[string]interface{}); ok {
+			for _, server := range servers {
+				if message := stringify(server["error"]); message != "" {
+					slashCommandPrintf("warning: %s: %s\n", singleLineLabel(stringify(server["name"])), singleLineLabel(message))
+				}
+			}
+		}
+		if status == "error" {
+			return errors.New(stringify(result["error"]))
+		}
 		return nil
 	default:
 		return fmt.Errorf("unknown /mcp command %q", args[0])

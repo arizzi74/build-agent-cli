@@ -667,11 +667,19 @@ func (s *telegramService) sendPreformattedTextLocked(ctx context.Context, chatID
 // cancelAndRespond takes the outbound sequencing lock before cancelling the
 // exact stored command context. Progress already in flight completes first;
 // the acknowledgement is then guaranteed to precede the command's final
-// cancellation response.
+// cancellation response. An undelivered script review is the exception: cancel
+// its I/O before waiting for the outbound lock, otherwise a stalled review
+// upload can prevent /cancel from taking effect. Its final cancellation response
+// may consequently arrive before the acknowledgement.
 func (s *telegramService) cancelAndRespond(chatID, userID string) {
+	cancelledReview := s.cancelUndeliveredScriptReview(chatID, userID)
 	s.outboundMu.Lock()
 	message := ""
-	if _, pinned := s.pinnedClient(); !pinned {
+	if cancelledReview {
+		// The worker may already have cleared its active turn while cancellation
+		// aborted the upload. Preserve the result of the exact captured cancel.
+		message = "Cancellation requested."
+	} else if _, pinned := s.pinnedClient(); !pinned {
 		message = "The bacli instance changed. Restart bacli before using /cancel."
 	} else if cancelled, ownedByOther := s.cancelOwnedTurn(chatID, userID); ownedByOther {
 		message = "Another authorized user owns the active turn; only its originator can cancel it."
@@ -690,6 +698,24 @@ func (s *telegramService) cancelAndRespond(chatID, userID string) {
 	if err != nil && s.serviceContext().Err() == nil {
 		s.warn("Telegram cancellation acknowledgement failed: " + err.Error())
 	}
+}
+
+func (s *telegramService) cancelUndeliveredScriptReview(chatID, userID string) bool {
+	if _, pinned := s.pinnedClient(); !pinned {
+		return false
+	}
+	s.turnControlMu.Lock()
+	pending, active := s.pendingInteraction, s.activeTurn
+	canCancel := pending != nil && pending.kind == "script_approval" && !pending.ready &&
+		pending.chatID == chatID && pending.userID == userID &&
+		active.chatID == chatID && active.userID == userID && active.cancel != nil
+	s.turnControlMu.Unlock()
+	if !canCancel {
+		return false
+	}
+	// Invoke only the captured owner's context, never a newer active turn.
+	active.cancel()
+	return true
 }
 
 func safeTelegramPairingLabel(label string) string {

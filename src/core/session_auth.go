@@ -356,6 +356,16 @@ func (c *Client) clearWebSession() {
 }
 
 func (c *Client) applyWebSession(session WebSession) {
+	// OAuth refresh and noninteractive startup can restore the browser session
+	// without running configureGatewayAuth. Restore its mode too, so connection
+	// capabilities see the same session state as a fresh login. Do not replace
+	// an explicitly configured auth mode or infer one from untyped cookies.
+	if c.gatewayAuth == "" {
+		switch mode := strings.ToLower(strings.TrimSpace(session.AuthMode)); mode {
+		case authModeForm, authModeCookie:
+			c.gatewayAuth = mode
+		}
+	}
 	c.sessionCookieHeader = normalizeCookieHeader(session.CookieHeader)
 	c.userToken = strings.TrimSpace(session.UserToken)
 	if c.basicUser == "" {
@@ -430,8 +440,11 @@ func (c *Client) loginWithServiceNowForm(ctx context.Context, username, password
 	if err != nil {
 		return WebSession{}, err
 	}
-	getBody, _ := io.ReadAll(getRes.Body)
+	getBody, readErr := io.ReadAll(io.LimitReader(getRes.Body, authResponseLimit+1))
 	_ = getRes.Body.Close()
+	if readErr != nil || len(getBody) > authResponseLimit {
+		return WebSession{}, errors.New("could not read a bounded login page")
+	}
 	if getRes.StatusCode < 200 || getRes.StatusCode >= 400 {
 		return WebSession{}, fmt.Errorf("GET login.do failed (%d): %s", getRes.StatusCode, trimBody(getBody))
 	}
@@ -460,8 +473,11 @@ func (c *Client) loginWithServiceNowForm(ctx context.Context, username, password
 	if err != nil {
 		return WebSession{}, err
 	}
-	postBody, _ := io.ReadAll(postRes.Body)
+	postBody, readErr := io.ReadAll(io.LimitReader(postRes.Body, authResponseLimit+1))
 	_ = postRes.Body.Close()
+	if readErr != nil || len(postBody) > authResponseLimit {
+		return WebSession{}, errors.New("could not read a bounded login response")
+	}
 	if postRes.StatusCode < 200 || postRes.StatusCode >= 400 {
 		return WebSession{}, fmt.Errorf("POST login.do failed (%d): %s", postRes.StatusCode, trimBody(postBody))
 	}

@@ -44,6 +44,7 @@ The CLI must keep credentials and local state private, make remote mutations exp
 | Applications and local projects | `app_*.go`, `project_*.go`, `build_*.go` | App selection/scaffolding, project registry, Node build prerequisites and build/install actions. |
 | Glide VFS synchronization | `glider_fs.go`, `local_sync.go`, `metadata_sync.go` | Canonical checkout identity, remote file access, pull/push/status planning, collision and conflict protection. |
 | Agent turns and tools | `turn_*.go`, `goals_approvals.go`, `parity_actions.go`, `semantic_*.go` | Streaming turns, user approvals, client elicitation, tool pass-through, redacted event history. |
+| Instance scripts and tool discovery | `script_execution.go`, `script_approval.go`, `script_review_ui.go`, `mcp_tools.go`, `instance_skills.go` | Reviewed instance execution/rollback, scoped rules and skills, configured WDF schema discovery. |
 | Terminal presentation | `ui.go`, `terminal_*.go`, `slash_command_registry.go` | Alternate-screen UI, Unicode input, transcript replay, activity/status rendering, modal pickers. |
 | Telegram presentation | `telegram_*.go` | Secure pairing, bot command catalog, progress, approval/cancellation, and TUI-equivalent transcript semantics. |
 | Diagnostics and support | `status.go`, `diagnostics.go`, `support_bundle.go`, `search_export.go`, `telemetry.go` | Safe status, redacted telemetry/journal, deterministic export and support bundle generation. |
@@ -79,6 +80,38 @@ At the moment a prompt is accepted, bacli creates a deep-copied redacted runtime
 
 The turn front end receives streaming text, tool activity, approval/elicitation requests, cancellation, errors, and final results. It feeds an internal semantic-event model and front-end-specific rendering. This seam is what makes the TUI and Telegram channel behaviorally equivalent without coupling bot code to terminal escape sequences.
 
+## Current backend tool integration
+
+Nirvana server tools remain backend-managed: bacli handles tool-start/result events generically rather than restricting tool names to a static catalog. Client-executed actions require explicit implementations. The current client action contract includes filesystem operations, local build/install/dependencies, application selection/creation, documentation and diagnostics, interviews/plans, instance skills/rules, `run_script`, and `rollback_script`.
+
+### Run Script and rollback
+
+When an authenticated form/cookie session and CSRF token are available, bacli advertises `script_execution`. This lets the backend offer its built-in Run Script tool; it is separate from any configured MCP Script Runner. These scripts execute on the ServiceNow instance, never as local shell commands.
+
+Restoring a matching saved browser session restores its form/cookie authentication mode along with cookies and CSRF, including after OAuth refresh and noninteractive Telegram startup. Explicitly configured authentication modes are preserved. Capabilities are advertised at connection establishment, so reconnecting is required after upgrading a connection affected by missing script advertisement; existing conversations can be reused.
+
+Browser authentication is checked independently of OAuth during connection preparation. A valid bearer token can keep chat available while Run Script is disabled with an explicit browser-session warning. Script-session checks use a bounded, same-origin GET with exactly the cookie/CSRF snapshot used for execution, no bearer/basic credentials, no extra jar cookies, and no redirects. Definitively expired/missing sessions can be renewed using explicitly saved form credentials, or through the owning TUI/Telegram credential interaction; noninteractive startup never reads stdin. Renewal uses an isolated browser-only client, preserves the OAuth token, and replaces saved session state only after validation. Unknown network, malformed-response, or service failures fail closed without triggering renewal. Cookie-auth profiles retain the fresh-cookie/CSRF workflow rather than silently switching to password login.
+
+Session renewal happens before full script review. Immediately before POST, the same exact-session check runs again without renewal; expiry or cancellation during a long review prevents submission. Once a script POST has been attempted, neither authentication recovery nor a transport/processor error can replay it. Missing/null/nonboolean execution flags report an unknown outcome; explicit `ran:false` retains bounded safe processor diagnostics, including session/permission guidance for inner HTTP 401/403, without claiming that the user declined approval.
+
+The client correlates script approvals with pending tool arguments and requires review of the full script, intent, scope, and target instance. Rollback review identifies the target instance and exact rollback context. A direct script elicitation without a preceding approval also requires review. `--auto-approve` does not bypass either operation. Non-interactive invocations without an interaction provider fail closed. Ambiguous pending script calls, changed payloads, stale turns/instances, missing session/CSRF, rejection, and cancellation all prevent submission.
+
+The TUI uses a full-code, scrollable review screen; reaching its final page enables explicit `y` approval, while Enter/Esc rejects. Telegram sends all review content in escaped fixed-width messages or a complete text document before enabling responses. Script approval requires `/answer <request-id> Approve` or `/answer <request-id> Reject`, using a full random request ID to prevent stale replies from approving a different request. A failed or incomplete delivery cannot authorize execution. Review text is not subjected to diagnostic truncation/redaction; control/format characters are made visible. Telegram receives the reviewed code when it owns the turn and is not an end-to-end-encrypted channel.
+
+Authorizations are ephemeral and bound to an exact-payload digest, host-accepted turn generation, active context, instance, and correlated tool/request ID. Authorization is consumed once before submission, including when the HTTP response is lost or reports an error. Server tracking resets cannot make a submitted script replayable. A fresh host turn starts a new authorization scope.
+
+Execution uses a session-authenticated JSON POST to `/api/sn_build_agent/build_agent_api/runScript` with `script`, `intent`, and optional `scope`. Rollback uses `/rollbackScript` with `rollback_context`. The processor's strict `ran`/`rolled_back` flags determine success. Results retain execution history, rollback context, output, and scope in the current Web UI's `success`/JSON-string `content` response shape. Neither operation follows redirects, retries automatically, refreshes auth and replays, or sends bearer/basic credentials. Limits are 1 MiB of script, 16 KiB of intent, 1 KiB of scope/rollback context, and a 4 MiB response. Cancellation stops waiting/submission where possible but cannot promise to undo or stop code already executing on the instance; an uncertain outcome requires inspection, not automatic resubmission.
+
+### Instance instructions and MCP discovery
+
+`instance_rules_list` reads `/skills_api/rules/summary`; skills and rules lists and skill bodies use `application_id` derived from the explicit request or active app. These are fresh, read-only requests. Older instances without the rules route yield an explicit compatibility warning and empty rules; authentication failures and malformed responses remain errors.
+
+Configured WDF MCP servers are discovered with `connected=true`, pagination, and the current Web UI's transport and server-name exclusions (Git/GitHub and Zoom Revenue Accelerator). `list_mcp_tools` and `/mcp tools [server-id]` fetch schemas from the fixed instance API `/api/sn_wdf_mcp_client/mcp/servers/{server-id}/tools`, never from arbitrary supplied URLs. Unknown IDs cannot trigger schema requests. Schema fields are retained, and mixed failures/static-server limitations are reported explicitly as partial results. `/mcp list` lists advertised server configurations; it does not list built-in tools such as Run Script.
+
+### Terminal-specific boundaries
+
+This is backend tool-contract integration, not a browser or VSCode replacement. `ui_diagnostics` cannot open a browser preview or collect its DOM/console/network state and reports unavailable. `open_app` selects the application without providing an IDE pane; TypeScript diagnostics use the supported local compiler path rather than VSCode's language-service UI. MCP transport connection state is owned by the backend; bacli does not create arbitrary local MCP connections. Static/backend-managed MCP schemas may be unavailable through WDF. Server-side persistence must not be enabled merely to match a capability list while bacli's existing rich-message persistence remains active. Provider-supplied IDE/Build Agent version metadata is preserved; stale captured version values are no longer forced over it.
+
 ## Local project scaffolding, builds, and installation
 
 For an active application, bacli creates or reuses the canonical local checkout. It can scaffold project content, assess the Node/npm environment required by the application build, run the supported build workflow, and install/package results through ServiceNow APIs. Missing required build dependencies generate OS-specific warning and installation guidance rather than silently attempting an incomplete build.
@@ -113,7 +146,7 @@ Telegram may operate alongside the terminal or in Telegram-only mode. Tool start
 
 ## Build, release, and validation
 
-`scripts/build-release.sh` produces Linux arm64/amd64, macOS amd64/arm64, and Windows amd64/arm64 binaries in `dist/`. It passes release version and update-base URL through linker variables in `src/core`, creates a SHA-256 integrity manifest, and leaves the committed installer scripts in place. `BUILD.md` defines the release version convention, artifact upload order, and validation commands.
+`scripts/build-release.sh` produces Linux arm64/amd64, macOS amd64/arm64, and Windows amd64/arm64 binaries in `dist/`. It passes release version and update-base URL through linker variables in `src/core`, creates a SHA-256 integrity manifest, and leaves the committed installer scripts in place. `scripts/publish-release.sh` uploads the complete validated release to a GitHub draft and only then publishes it as latest. `BUILD.md` defines the release version convention, publication checks, and validation commands.
 
 The normal verification baseline is:
 
@@ -134,7 +167,9 @@ This material was moved from `README.md` so the README remains a concise install
 
 The installer selects the correct published binary, verifies its SHA-256 checksum, creates `~/.local/bin` when needed, installs the executable as `bacli` (`bacli.exe` on Windows), and adds that directory to the user's PATH without duplicating existing entries. Open a new terminal if the installer reports that PATH was changed.
 
-Every released `bacli` checks `https://nowdemo.it/bacli/version.json` at startup. If a newer version exists, it downloads and verifies the matching platform binary, installs/stages the update, exits, and prints a message asking you to relaunch `bacli`. Update-check failures are non-fatal; set `BACLI_NO_UPDATE=1` to disable the check temporarily.
+Every released `bacli` checks `https://github.com/arizzi74/build-agent-cli/releases/latest/download/version.json` at startup, with a five-second manifest timeout. If a newer version exists, it downloads the matching platform binary with a separate two-minute timeout, verifies its SHA-256, installs/stages the update, exits, and prints a message asking you to relaunch `bacli`. The manifest pins binary URLs to its versioned GitHub release (`releases/download/v<version>/...`), so a concurrent newer release cannot change the selected artifact. Update-check failures are non-fatal; set `BACLI_NO_UPDATE=1` to disable the check temporarily. Public installation and update downloads require neither GitHub credentials nor the GitHub CLI; GitHub's asset CDN redirects are followed normally.
+
+The installers are also GitHub release assets at the same latest-download base. No separate web host, rsync mirror, or cron publication job is needed. Older executables retain their previous embedded update endpoint: close bacli and rerun the GitHub installer once to migrate without changing saved profiles or local projects. Remove any previously configured `BACLI_BASE_URL` or `BACLI_UPDATE_BASE_URL` override to use the GitHub defaults. For staging only, these overrides continue to select an alternative installer or updater base URL.
 
 Supported release platforms are Linux arm64, Linux amd64, macOS Intel, macOS Apple Silicon, Windows amd64, and Windows ARM64. See [BUILD.md](BUILD.md) for artifact names, publication ordering, release commands, and update-manifest details.
 
@@ -357,6 +392,7 @@ Profiles stay command-line-only. The interactive slash-command picker exposes th
 /exit | /quit
 /conversation
 /mcp list
+/mcp tools [server-id]
 /workspace
 /app
 /attach

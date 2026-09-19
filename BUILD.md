@@ -1,6 +1,6 @@
 # Build and release
 
-Build Agent Go CLI releases are cross-compiled as six pure-Go, stripped binaries. All public release files live under `./dist` and the installed executable is always named `bacli` (`bacli.exe` on Windows).
+Build Agent CLI releases are cross-compiled as six pure-Go, stripped binaries. All public release files are assembled under `./dist` and published as GitHub Release assets. The installed executable is always named `bacli` (`bacli.exe` on Windows).
 
 ## Supported targets
 
@@ -33,13 +33,13 @@ Numbered releases use `YYYY.MM.DD.N` based on the UTC date. Start `N` at `1` on 
 Run from the repository root:
 
 ```bash
-VERSION=2026.09.14.1 ./scripts/build-release.sh
+VERSION=2026.09.19.4 ./scripts/build-release.sh
 ```
 
-If `VERSION` is omitted, the script uses `YYYY.MM.DD.<short-git-sha>`. Override the publication root only when staging:
+If `VERSION` is omitted, the script uses today's UTC date and increments the highest daily number found in local release tags or `dist/version.json` (starting at `1`). Fetch release tags before building on another machine; the publisher also refuses a version at or below GitHub's current latest release. Override the publication root only when staging:
 
 ```bash
-VERSION=2026.09.14.1 BASE_URL=https://staging.example/bacli ./scripts/build-release.sh
+VERSION=2026.09.19.4 BASE_URL=https://staging.example/bacli ./scripts/build-release.sh
 ```
 
 The script creates:
@@ -62,27 +62,43 @@ Do not build or publish dynamic/non-stripped binaries for normal releases. A non
 
 ## Publication layout
 
-Publish the complete contents of `dist/` at:
+GitHub Releases is the only production distribution host. The stable latest-release base is:
 
 ```text
-https://nowdemo.it/bacli/
+https://github.com/arizzi74/build-agent-cli/releases/latest/download
 ```
 
-The following URLs must therefore work:
+The following assets are available below that base:
 
 ```text
-https://nowdemo.it/bacli/install.sh
-https://nowdemo.it/bacli/install.ps1
-https://nowdemo.it/bacli/version.json
-https://nowdemo.it/bacli/bacli-linux-arm64
-https://nowdemo.it/bacli/bacli-linux-amd64
-https://nowdemo.it/bacli/bacli-darwin-amd64
-https://nowdemo.it/bacli/bacli-darwin-arm64
-https://nowdemo.it/bacli/bacli-windows-amd64.exe
-https://nowdemo.it/bacli/bacli-windows-arm64.exe
+install.sh
+install.ps1
+version.json
+SHA256SUMS
+bacli-linux-arm64
+bacli-linux-amd64
+bacli-darwin-amd64
+bacli-darwin-arm64
+bacli-windows-amd64.exe
+bacli-windows-arm64.exe
 ```
 
-`version.json` is the source of truth for installers and self-update. Never publish a new manifest before every referenced binary has finished uploading; upload binaries first and `version.json` last.
+`version.json` is the source of truth for installers and self-update. Production manifests use version-pinned binary URLs such as `https://github.com/arizzi74/build-agent-cli/releases/download/v2026.09.19.4/bacli-linux-arm64`, never moving latest links. This avoids checksum races if a newer release is published between the manifest and binary downloads. SHA-256 checks provide integrity, not a separate digital signature.
+
+Building requires Go, Python 3.9 or newer, and `sha256sum`. Publication additionally requires authenticated GitHub CLI access with permission to create releases (`gh auth login --hostname github.com`). The publisher uses `gh api` and `gh release upload`, including compatibility with GitHub CLI 2.4. Git-over-SSH authentication alone does not authenticate the GitHub Releases API. Installers and updates are public and need neither a token nor `gh`.
+
+Commit the intended source, documentation, scripts, and installer changes, then build from that clean commit and push it before publishing:
+
+```bash
+VERSION=2026.09.19.4 ./scripts/build-release.sh
+git push origin master
+./scripts/publish-release.sh --check
+./scripts/publish-release.sh
+```
+
+The publisher validates local checksums, all six targets, version-pinned URLs, and build provenance (`sourceCommit`, `sourceDirty`, and `updateBaseURL` in the manifest) against the clean source commit. `--check` performs only local validation. Publication checks that the source commit exists on GitHub, creates a draft for tag `v<version>`, uploads and verifies all ten assets, then publishes the complete release as latest. It refuses to overwrite an already published release; corrections require a new version. An interrupted draft can be resumed safely. No separate web server, rsync transfer, or mirror cron job participates in publication. The retired mirror script is archived under `purge/scripts/`; remove its old cron entry on any legacy mirror host when retiring that infrastructure.
+
+Older installed binaries cannot discover a changed embedded update URL automatically. Close bacli and rerun the GitHub installer once to migrate; configuration and app projects are preserved. Remove any old `BACLI_BASE_URL` or `BACLI_UPDATE_BASE_URL` override. The new release has no fallback to the previous distribution host.
 
 ## Installer behavior
 
@@ -100,12 +116,12 @@ BACLI_NO_UPDATE=1
 
 ## Startup update protocol
 
-Every versioned `bacli` startup requests `https://nowdemo.it/bacli/version.json` with a five-second timeout. Failures are non-fatal so an offline user can continue working.
+Every versioned `bacli` startup requests `https://github.com/arizzi74/build-agent-cli/releases/latest/download/version.json` with a five-second timeout. Failures are non-fatal so an offline user can continue working.
 
 When the manifest version is newer, the CLI:
 
 1. Selects its current OS/architecture artifact.
-2. Downloads it with a 128 MiB bound.
+2. Downloads its version-pinned URL with a 128 MiB bound and a separate two-minute timeout, allowing time for GitHub CDN redirects and transfers.
 3. Verifies the manifest SHA-256.
 4. Replaces the current Unix executable atomically, or stages a Windows replacement helper because a running `.exe` cannot overwrite itself.
 5. Exits with a message asking the user to relaunch `bacli`.
@@ -120,8 +136,9 @@ Before release:
 go test -race -count=1 ./...
 go test -count=1 ./...
 go vet ./...
+python3 scripts/test-release.py
 git diff --check
-VERSION=2026.09.14.1 ./scripts/build-release.sh
+VERSION=2026.09.19.4 ./scripts/build-release.sh
 ```
 
 Inspect artifacts:

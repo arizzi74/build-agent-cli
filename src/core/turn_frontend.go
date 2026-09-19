@@ -38,6 +38,18 @@ type turnInteractionRequest struct {
 	Options []string
 	Rows    [][2]string
 	Secret  bool
+	Review  *turnScriptReview
+}
+
+// turnScriptReview is ephemeral approval content, not a capped tool summary.
+// Front ends must deliver every line before accepting an approving answer.
+type turnScriptReview struct {
+	Script          string
+	Intent          string
+	Scope           string
+	RollbackContext string
+	Instance        string
+	Action          string
 }
 
 type turnPresentationSink func(turnPresentationEvent)
